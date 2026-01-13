@@ -72,6 +72,8 @@ name: my-skill-name
 description: One-line description shown in skill listings
 version: 1.0.0
 tags: [rust, cli, deployment]
+requires: [core-cli-basics, logging-standards]
+provides: [rust-cli-patterns]
 ---
 
 # Skill Title
@@ -219,6 +221,9 @@ This provides ~80-90% of neural embedding quality with zero dependencies, instan
 **Why ms adopts this:** Skills benefit from both:
 - **SQLite:** Fast search, usage tracking, quality scores
 - **Git:** Version history, collaborative editing, sync across machines
+
+**Two-Phase Commit (2PC):** To prevent drift between SQLite and Git, ms uses a
+lightweight two-phase commit for all write operations.
 
 **File reservation pattern:** When an agent wants to edit a file, it requests a reservation:
 ```bash
@@ -797,6 +802,50 @@ pub struct Skill {
     pub evidence: SkillEvidenceIndex,
 }
 
+/// Deterministic source-of-truth for skill content
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillSpec {
+    /// Spec format version (for migrations)
+    pub format_version: String,
+
+    /// Stable skill id
+    pub id: String,
+
+    /// Frontmatter metadata
+    pub metadata: SkillMetadata,
+
+    /// Structured sections and blocks
+    pub sections: Vec<SkillSectionSpec>,
+
+    /// Associated files
+    pub assets: SkillAssets,
+
+    /// Evidence index (rule provenance)
+    pub evidence: SkillEvidenceIndex,
+
+    /// When spec was generated or updated
+    pub generated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillSectionSpec {
+    pub title: String,
+    pub level: u8,
+    pub blocks: Vec<SkillBlockSpec>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum SkillBlockSpec {
+    Rule { id: String, text: String },
+    Command { command: String, description: Option<String> },
+    Example { language: String, code: String, description: Option<String> },
+    Checklist { items: Vec<String> },
+    Table { headers: Vec<String>, rows: Vec<Vec<String>> },
+    Prompt { prompt: String },
+    Pitfall { bad: String, risk: String, fix: String },
+    Note { text: String },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillMetadata {
     pub name: String,
@@ -815,6 +864,9 @@ pub struct SkillMetadata {
     pub requires: Vec<String>,  // Dependencies on other skills
 
     #[serde(default)]
+    pub provides: Vec<String>,  // Capabilities exposed by this skill
+
+    #[serde(default)]
     pub triggers: Vec<SkillTrigger>,  // When to suggest this skill
 
     #[serde(default)]
@@ -822,6 +874,9 @@ pub struct SkillMetadata {
 
     #[serde(default)]
     pub deprecated: Option<DeprecationInfo>,
+
+    #[serde(default)]
+    pub toolchains: Vec<ToolchainConstraint>,  // Compatibility constraints
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -835,6 +890,21 @@ pub struct SkillTrigger {
     /// Priority boost when triggered (0.0 - 1.0)
     #[serde(default = "default_boost")]
     pub boost: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolchainConstraint {
+    /// Tool or framework name (e.g., "node", "rust", "nextjs")
+    pub name: String,
+
+    /// Minimum compatible version (semver)
+    pub min_version: Option<String>,
+
+    /// Maximum compatible version (semver)
+    pub max_version: Option<String>,
+
+    /// Human-readable notes about compatibility
+    pub notes: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -854,6 +924,9 @@ pub struct SkillSource {
     /// Where the skill was found
     pub path: PathBuf,
 
+    /// Layer for conflict resolution (base, org, project, user)
+    pub layer: SkillLayer,
+
     /// Git remote if available
     pub git_remote: Option<String>,
 
@@ -865,6 +938,14 @@ pub struct SkillSource {
 
     /// Content hash for change detection
     pub content_hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum SkillLayer {
+    Base,
+    Org,
+    Project,
+    User,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -967,6 +1048,25 @@ pub struct EvidenceCoverage {
     /// Average evidence confidence across linked rules
     pub avg_confidence: f32,
 }
+
+/// Queue item for low-confidence generalizations
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UncertaintyItem {
+    pub id: String,
+    pub pattern_candidate: ExtractedPattern,
+    pub reason: String,
+    pub confidence: f32,
+    pub suggested_queries: Vec<String>,
+    pub status: UncertaintyStatus,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum UncertaintyStatus {
+    Pending,
+    Resolved,
+    Discarded,
+}
 ```
 
 ### 3.2 SQLite Schema
@@ -982,6 +1082,7 @@ CREATE TABLE skills (
 
     -- Source tracking
     source_path TEXT NOT NULL,
+    source_layer TEXT NOT NULL,  -- base | org | project | user
     git_remote TEXT,
     git_commit TEXT,
     content_hash TEXT NOT NULL,
@@ -1048,6 +1149,19 @@ CREATE TABLE skill_evidence (
 
 CREATE INDEX idx_evidence_skill ON skill_evidence(skill_id);
 
+-- Uncertainty queue for low-confidence generalizations
+CREATE TABLE uncertainty_queue (
+    id TEXT PRIMARY KEY,
+    pattern_json TEXT NOT NULL,     -- ExtractedPattern
+    reason TEXT NOT NULL,
+    confidence REAL NOT NULL,
+    suggested_queries TEXT NOT NULL, -- JSON array
+    status TEXT NOT NULL,            -- pending | resolved | discarded
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX idx_uncertainty_status ON uncertainty_queue(status);
+
 -- Redaction reports for privacy and secret-scrubbing
 CREATE TABLE redaction_reports (
     id INTEGER PRIMARY KEY,
@@ -1066,7 +1180,33 @@ CREATE TABLE skill_usage (
     used_at TEXT NOT NULL,
     disclosure_level INTEGER NOT NULL,
     context_keywords TEXT,  -- JSON array
-    success_signal INTEGER  -- 1 = worked well, 0 = didn't help, NULL = unknown
+    success_signal INTEGER,  -- 1 = worked well, 0 = didn't help, NULL = unknown
+    experiment_id TEXT,
+    variant_id TEXT
+);
+
+-- Skill usage events (full detail for effectiveness analysis)
+CREATE TABLE skill_usage_events (
+    id TEXT PRIMARY KEY,
+    skill_id TEXT NOT NULL REFERENCES skills(id),
+    session_id TEXT NOT NULL,
+    loaded_at TEXT NOT NULL,
+    disclosure_level TEXT NOT NULL,   -- JSON
+    discovery_method TEXT NOT NULL,   -- JSON
+    experiment_id TEXT,
+    variant_id TEXT,
+    outcome TEXT,                     -- JSON
+    feedback TEXT                     -- JSON
+);
+
+-- A/B experiments for skill variants
+CREATE TABLE skill_experiments (
+    id TEXT PRIMARY KEY,
+    skill_id TEXT NOT NULL REFERENCES skills(id),
+    variants_json TEXT NOT NULL,      -- Vec<ExperimentVariant>
+    allocation_json TEXT NOT NULL,    -- AllocationStrategy
+    status TEXT NOT NULL,
+    started_at TEXT NOT NULL
 );
 
 -- Skill relationships
@@ -1074,6 +1214,13 @@ CREATE TABLE skill_dependencies (
     skill_id TEXT NOT NULL REFERENCES skills(id),
     depends_on TEXT NOT NULL REFERENCES skills(id),
     PRIMARY KEY (skill_id, depends_on)
+);
+
+-- Capability index (for "provides")
+CREATE TABLE skill_capabilities (
+    capability TEXT NOT NULL,
+    skill_id TEXT NOT NULL REFERENCES skills(id),
+    PRIMARY KEY (capability, skill_id)
 );
 
 -- Build sessions (CASS integration)
@@ -1091,6 +1238,9 @@ CREATE TABLE build_sessions (
     -- Generated skill (in progress or complete)
     draft_skill_json TEXT,
 
+    -- Deterministic source-of-truth
+    skill_spec_json TEXT,   -- SkillSpec (structured parts)
+
     -- Iteration tracking
     iteration_count INTEGER NOT NULL DEFAULT 0,
     last_feedback TEXT,
@@ -1105,6 +1255,16 @@ CREATE TABLE config (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL,
     updated_at TEXT NOT NULL
+);
+
+-- Two-phase commit transactions
+CREATE TABLE tx_log (
+    id TEXT PRIMARY KEY,
+    entity_type TEXT NOT NULL,   -- skill | usage | config | build
+    entity_id TEXT NOT NULL,
+    phase TEXT NOT NULL,         -- prepare | commit | complete
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
 );
 
 -- Indexes
@@ -1124,12 +1284,14 @@ CREATE INDEX idx_usage_time ON skill_usage(used_at);
 │   ├── by-id/
 │   │   ├── ntm/
 │   │   │   ├── metadata.yaml
+│   │   │   ├── skill.spec.json
 │   │   │   ├── SKILL.md
 │   │   │   ├── evidence.json
 │   │   │   ├── slices.json
 │   │   │   └── usage-log.jsonl
 │   │   └── planning-workflow/
 │   │       ├── metadata.yaml
+│   │       ├── skill.spec.json
 │   │       ├── SKILL.md
 │   │       ├── evidence.json
 │   │       ├── slices.json
@@ -1143,6 +1305,7 @@ CREATE INDEX idx_usage_time ON skill_usage(used_at);
 │   │   ├── patterns.md
 │   │   ├── evidence.json
 │   │   ├── redaction-report.json
+│   │   ├── skill.spec.json
 │   │   ├── draft-v1.md
 │   │   ├── draft-v2.md
 │   │   └── final.md
@@ -1153,6 +1316,247 @@ CREATE INDEX idx_usage_time ON skill_usage(used_at);
 │       └── ...
 └── README.md
 ```
+
+### 3.4 Dependency Graph and Resolution
+
+Skills declare dependencies (`requires`) and capabilities (`provides`) in metadata.
+ms builds a dependency graph to resolve load order, detect cycles, and auto-load prerequisites.
+
+```rust
+#[derive(Debug, Clone)]
+pub struct DependencyGraph {
+    pub nodes: HashSet<String>,           // skill ids
+    pub edges: Vec<DependencyEdge>,       // skill -> depends_on
+}
+
+#[derive(Debug, Clone)]
+pub struct DependencyEdge {
+    pub skill_id: String,
+    pub depends_on: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedDependencyPlan {
+    pub ordered: Vec<SkillLoadPlan>,      // topo-sorted load order
+    pub missing: Vec<String>,             // missing dependencies
+    pub cycles: Vec<Vec<String>>,         // cycle groups
+}
+
+#[derive(Debug, Clone)]
+pub struct SkillLoadPlan {
+    pub skill_id: String,
+    pub disclosure: DisclosurePlan,
+    pub reason: String,
+}
+
+pub enum DependencyLoadMode {
+    Off,
+    Auto,
+    Full,       // dependencies at full disclosure
+    Overview,   // dependencies at overview/minimal
+}
+
+pub struct DependencyResolver {
+    registry: SkillRegistry,
+    max_depth: usize,
+}
+
+impl DependencyResolver {
+    pub fn resolve(&self, root: &str, mode: DependencyLoadMode) -> ResolvedDependencyPlan {
+        // 1) expand dependency closure (BFS with depth limit)
+        // 2) detect missing skills
+        // 3) detect cycles (Tarjan / DFS back-edge)
+        // 4) topologically sort and assign disclosure levels
+        unimplemented!()
+    }
+}
+```
+
+Default behavior: `ms load` uses `DependencyLoadMode::Auto` (load dependencies
+at `overview` disclosure, root skill at the requested level).
+
+### 3.5 Layering and Conflict Resolution
+
+Skills can exist in multiple layers. Higher layers override lower layers when
+conflicts occur.
+
+Layer order (default):
+```
+base < org < project < user
+```
+
+**Layered Skill Registry:**
+
+```rust
+pub struct LayeredRegistry {
+    pub layers: Vec<SkillLayer>, // ordered by precedence
+    pub registries: HashMap<SkillLayer, SkillRegistry>,
+}
+
+impl LayeredRegistry {
+    /// Return the effective skill, resolving conflicts by layer
+    pub fn effective(&self, skill_id: &str) -> Result<ResolvedSkill> {
+        let mut candidates = Vec::new();
+        for layer in &self.layers {
+            if let Some(skill) = self.registries.get(layer).and_then(|r| r.get(skill_id).ok()) {
+                candidates.push(skill);
+            }
+        }
+
+        resolve_conflicts(candidates, ConflictStrategy::PreferHigher)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedSkill {
+    pub skill: Skill,
+    pub conflicts: Vec<ConflictDetail>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ConflictDetail {
+    pub section: String,
+    pub higher_layer: SkillLayer,
+    pub lower_layer: SkillLayer,
+    pub resolution: ConflictResolution,
+}
+
+pub enum ConflictStrategy {
+    PreferHigher,
+    PreferLower,
+    Interactive,
+}
+
+pub enum ConflictResolution {
+    UseHigher,
+    UseLower,
+    Merge(String), // merged section content
+}
+```
+
+**Resolution Rules:**
+- If only one layer provides a skill, use it directly.
+- If multiple layers provide the same skill id:
+  - Prefer higher layer by default
+  - If both edit the same section, record a conflict detail
+  - If conflict strategy is `interactive`, require explicit choice
+
+**Conflict Auto-Diff and Merge Policies:**
+
+To reduce manual resolution, ms computes section-level diffs and applies a
+merge policy before falling back to interactive mode.
+
+```rust
+pub struct ConflictMerger;
+
+impl ConflictMerger {
+    pub fn resolve(
+        &self,
+        higher: &SkillSpec,
+        lower: &SkillSpec,
+        strategy: ConflictStrategy,
+    ) -> Result<ResolvedSkill> {
+        let diffs = section_diff(higher, lower);
+
+        // Auto-merge if changes are non-overlapping
+        if diffs.non_overlapping() {
+            return Ok(ResolvedSkill {
+                skill: merge_sections(higher, lower)?,
+                conflicts: vec![],
+            });
+        }
+
+        match strategy {
+            ConflictStrategy::PreferHigher => Ok(ResolvedSkill {
+                skill: higher.to_skill(),
+                conflicts: diffs.to_conflicts(SkillLayer::User, SkillLayer::Project),
+            }),
+            ConflictStrategy::PreferLower => Ok(ResolvedSkill {
+                skill: lower.to_skill(),
+                conflicts: diffs.to_conflicts(SkillLayer::Project, SkillLayer::User),
+            }),
+            ConflictStrategy::Interactive => Err(anyhow!("Interactive resolution required")),
+        }
+    }
+}
+
+fn section_diff(higher: &SkillSpec, lower: &SkillSpec) -> SectionDiff { unimplemented!() }
+fn merge_sections(higher: &SkillSpec, lower: &SkillSpec) -> Result<Skill> { unimplemented!() }
+```
+
+When conflicts remain, ms surfaces a guided diff in `ms resolve` showing the
+exact section differences and suggested merges.
+
+### 3.6 Skill Spec and Deterministic Compilation
+
+SKILL.md is a rendered artifact. The source-of-truth is a structured `SkillSpec`
+that can be deterministically compiled into SKILL.md. This ensures reproducible
+output, stable diffs, and safe automated edits.
+
+```rust
+pub struct SkillCompiler;
+
+impl SkillCompiler {
+    /// Compile SkillSpec into SKILL.md (deterministic ordering)
+    pub fn compile(spec: &SkillSpec) -> Result<String> {
+        // 1) render frontmatter
+        // 2) render sections in order
+        // 3) render blocks with stable formatting
+        unimplemented!()
+    }
+
+    /// Validate spec schema and required sections
+    pub fn validate(spec: &SkillSpec) -> Result<()> {
+        // Ensure required fields, unique rule ids, no empty sections
+        unimplemented!()
+    }
+}
+```
+
+By default, `ms build` outputs `skill.spec.json`, then compiles it to SKILL.md.
+Manual edits should update the spec, not the rendered artifact.
+
+### 3.7 Two-Phase Commit for Dual Persistence
+
+All writes that touch both SQLite and Git are wrapped in a lightweight two-phase
+commit to avoid split-brain states.
+
+```rust
+pub struct TxManager {
+    db: Connection,
+    git: GitArchive,
+    tx_dir: PathBuf, // .ms/tx/
+}
+
+impl TxManager {
+    pub fn write_skill(&self, skill: &SkillSpec) -> Result<()> {
+        let tx = TxRecord::prepare("skill", &skill.id, skill)?;
+
+        // Phase 1: prepare
+        self.write_tx_record(&tx)?;
+        self.db_write_pending(&tx)?;
+
+        // Phase 2: commit
+        self.git_commit(&tx)?;
+        self.db_mark_committed(&tx)?;
+        self.cleanup_tx(&tx)?;
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TxRecord {
+    pub id: String,
+    pub entity_type: String,
+    pub entity_id: String,
+    pub phase: String,
+    pub payload_json: String,
+    pub created_at: DateTime<Utc>,
+}
+```
+
+Recovery is automatic on startup and via `ms doctor --fix`.
 
 ---
 
@@ -1176,6 +1580,7 @@ ms search "git workflow"
 ms search "git workflow" --limit 10
 ms search "error handling" --tags rust,cli
 ms search "testing" --min-quality 0.7
+ms search "logging" --layer project  # restrict to a layer
 
 # Load a skill (progressive disclosure)
 ms load ntm
@@ -1185,6 +1590,9 @@ ms load ntm --level 3  # Full content
 ms load ntm --full     # Everything including assets
 ms load ntm --pack 800 # Token-budgeted slice pack
 ms load ntm --pack 800 --mode coverage_first  # Bias toward rule coverage
+ms load ntm --deps auto      # Load prerequisites at overview
+ms load ntm --deps off       # Disable dependency auto-load
+ms load ntm --deps full      # Load prerequisites at full disclosure
 ms load ntm --robot    # JSON output for automation
 
 # Suggest skills for current context
@@ -1193,11 +1601,22 @@ ms suggest --cwd /data/projects/my-rust-project
 ms suggest --file src/main.rs
 ms suggest --query "how to handle async errors"
 ms suggest --pack 800  # Suggest packed slices within token budget
+ms suggest --explain   # Include signal breakdown
 
 # Show skill details
 ms show ntm
 ms show ntm --usage  # Include usage stats
 ms show ntm --deps   # Show dependency graph
+ms show ntm --layer user  # show a specific layer
+
+# Resolve dependency order
+ms deps ntm
+ms deps ntm --graph --format json
+
+# Resolve conflicts across layers
+ms resolve ntm
+ms resolve ntm --strategy interactive
+ms resolve ntm --diff  # show section-level diffs
 
 # Inspect rule-level evidence and provenance
 ms evidence ntm
@@ -1217,6 +1636,8 @@ ms build --from-cass "error handling in rust"
 ms build --from-cass "how I implemented auth" --sessions 20
 ms build --from-cass "auth tokens" --redaction-report  # emit redaction report
 ms build --from-cass "api keys" --no-redact  # only if you explicitly accept risk
+ms build --from-cass "auth mistakes" --no-antipatterns  # skip counter-examples
+ms build --from-cass "error handling" --output-spec skill.spec.json
 
 # Resume existing build session
 ms build --resume session-abc123
@@ -1224,11 +1645,21 @@ ms build --resume session-abc123
 # Non-interactive build (fully automated)
 ms build --auto --from-cass "testing patterns" --min-confidence 0.8
 
+# Compile a spec to SKILL.md (deterministic)
+ms compile skill.spec.json --out SKILL.md
+ms spec validate skill.spec.json
+
+# Resolve low-confidence patterns
+ms build --resolve-uncertainties
+ms uncertainties list
+ms uncertainties resolve UNK-123 --mine "error handling in rust"
+
 # Build commands within interactive session
 # (These become subcommands in interactive mode)
 #   /mine <query>     - Mine more sessions
 #   /patterns         - Show extracted patterns
 #   /draft            - Generate skill draft
+#   /spec             - Show or export SkillSpec
 #   /refine           - Iterate on current draft
 #   /preview          - Preview rendered skill
 #   /save             - Save current state
@@ -1269,6 +1700,7 @@ ms update  # Install update if available
 # Health check
 ms doctor
 ms doctor --fix  # Attempt auto-fixes
+ms doctor --check=transactions
 
 # Configuration
 ms config show
@@ -1280,6 +1712,11 @@ ms config paths list
 ms stats
 ms stats --skill ntm  # Usage stats for specific skill
 ms stats --period week
+
+# Staleness and drift checks
+ms stale
+ms stale --project /data/projects/my-rust-project
+ms stale --min-severity medium
 ```
 
 ### 4.5 Robot Mode (Comprehensive Specification)
@@ -1388,6 +1825,7 @@ pub struct RegistryStatus {
 pub struct SuggestResponse {
     pub context: SuggestionContext,
     pub suggestions: Vec<SuggestionItem>,
+    pub explain: Option<SuggestionExplain>,
 }
 
 #[derive(Serialize)]
@@ -1401,6 +1839,43 @@ pub struct SuggestionItem {
     pub pack_budget: Option<usize>,
     pub packed_token_estimate: Option<usize>,
     pub slice_count: Option<usize>,
+    pub dependencies: Vec<String>,
+    pub layer: Option<String>,
+    pub conflicts: Vec<String>,
+    pub explanation: Option<SuggestionExplanation>,
+}
+
+#[derive(Serialize)]
+pub struct SuggestionExplain {
+    pub enabled: bool,
+    pub signals: Vec<SuggestionSignalExplain>,
+}
+
+#[derive(Serialize)]
+pub struct SuggestionExplanation {
+    pub matched_triggers: Vec<String>,
+    pub signal_scores: Vec<SignalScore>,
+    pub rrf_components: RrfBreakdown,
+}
+
+#[derive(Serialize)]
+pub struct SuggestionSignalExplain {
+    pub signal_type: String,
+    pub value: String,
+    pub weight: f32,
+}
+
+#[derive(Serialize)]
+pub struct SignalScore {
+    pub signal: String,
+    pub contribution: f32,
+}
+
+#[derive(Serialize)]
+pub struct RrfBreakdown {
+    pub bm25_rank: Option<usize>,
+    pub vector_rank: Option<usize>,
+    pub rrf_score: f32,
 }
 
 /// --robot-build-status response
@@ -1409,6 +1884,7 @@ pub struct BuildStatusResponse {
     pub active_sessions: Vec<BuildSessionDetail>,
     pub recent_completed: Vec<BuildSessionSummary>,
     pub queued_patterns: usize,
+    pub queued_uncertainties: usize,
 }
 
 #[derive(Serialize)]
@@ -1500,6 +1976,10 @@ pub enum CheckCategory {
     Configuration,
     CassIntegration,
     Redaction,
+    Toolchain,
+    Dependencies,
+    Layers,
+    Transactions,
     GitArchive,
     FileSystem,
     Permissions,
@@ -1539,6 +2019,25 @@ pub enum HealthStatus {
 │  ☐ All configured paths exist                                              │
 │  ☐ No deprecated config keys                                               │
 │  ☐ Reasonable defaults for missing values                                  │
+│                                                                             │
+│ TOOLCHAIN                                                                   │
+│  ☐ Project toolchain detected (node/cargo/go/etc.)                         │
+│  ☐ Skill compatibility constraints parsed                                  │
+│  ☐ Drift check completed (skill ranges vs project versions)                │
+│                                                                             │
+│ DEPENDENCIES                                                                │
+│  ☐ Dependency graph builds without errors                                  │
+│  ☐ No cycles detected                                                      │
+│  ☐ All required skills are present                                         │
+│                                                                             │
+│ LAYERS                                                                      │
+│  ☐ Layer paths exist (base/org/project/user)                                │
+│  ☐ No conflicting skill ids without resolution                             │
+│  ☐ Layer precedence order valid                                             │
+│                                                                             │
+│ TRANSACTIONS                                                                │
+│  ☐ No pending tx_log entries                                               │
+│  ☐ Orphaned tx records resolved                                            │
 │                                                                             │
 │ CASS INTEGRATION                                                            │
 │  ☐ CASS binary found in PATH                                               │
@@ -1785,6 +2284,7 @@ compdef _ms ms
 │  │  - Error patterns and resolutions                                     │ │
 │  │  - "THE EXACT PROMPT" candidates                                      │ │
 │  │  - Evidence refs (session_id, message range, snippet hash)            │ │
+│  │  - Anti-patterns and counter-examples                                 │ │
 │  └───────────────────────────────────────────────────────────────────────┘ │
 │                                      │                                      │
 │                                      ▼                                      │
@@ -1804,6 +2304,7 @@ compdef _ms ms
 │  │  - Core content from clustered insights                               │ │
 │  │  - Examples from actual session excerpts                              │ │
 │  │  - Scripts from extracted code patterns                               │ │
+│  │  - SkillSpec (structured source-of-truth)                             │ │
 │  └───────────────────────────────────────────────────────────────────────┘ │
 │                                      │                                      │
 │                                      ▼                                      │
@@ -1813,6 +2314,7 @@ compdef _ms ms
 │  │  - User marks good/bad sections                                       │ │
 │  │  - Mine more sessions if gaps identified                              │ │
 │  │  - Regenerate with feedback incorporated                              │ │
+│  │  - Recompile SKILL.md from SkillSpec                                  │ │
 │  │  - Repeat until steady state                                          │ │
 │  └───────────────────────────────────────────────────────────────────────┘ │
 │                                                                             │
@@ -1874,6 +2376,14 @@ pub enum PatternType {
         prompt: String,
         context: String,
         effectiveness_score: f32,
+        frequency: usize,
+    },
+
+    /// What NOT to do (counter-example)
+    AntiPattern {
+        bad_practice: String,
+        risk: String,
+        safer_alternative: String,
         frequency: usize,
     },
 }
@@ -2037,6 +2547,7 @@ This is a **killer feature**: ms can run autonomously for hours, systematically 
 │  ├── For each approved opportunity:                                        │
 │  │   ├── Deep mine all related sessions                                    │
 │  │   ├── Extract patterns (see 5.6 algorithm)                             │
+│  │   ├── Queue low-confidence patterns (see 5.15)                          │
 │  │   ├── Generate draft skill                                              │
 │  │   ├── Self-critique against quality rubric                              │
 │  │   ├── Refine until steady-state (typically 3-6 iterations)             │
@@ -2165,6 +2676,7 @@ ms build --guided --dry-run --duration 1h
 ### 5.6 Specific-to-General Transformation Algorithm
 
 This is the core intellectual innovation: extracting universal patterns ("inner truths") from specific instances.
+The same pipeline is applied to counter-examples to produce "Avoid / When NOT to use" rules.
 
 **The Transformation Pipeline:**
 
@@ -2230,6 +2742,7 @@ This is the core intellectual innovation: extracting universal patterns ("inner 
 pub struct SpecificToGeneralTransformer {
     cass: CassClient,
     embedder: HashEmbedder,
+    uncertainty_queue: UncertaintyQueue,
     min_instances: usize,       // Minimum instances to generalize (default: 3)
     confidence_threshold: f32,  // Minimum generalization confidence (default: 0.7)
 }
@@ -2259,6 +2772,7 @@ impl SpecificToGeneralTransformer {
         let validation = self.validate_generalization(&common, &primary_cluster)?;
 
         if validation.confidence < self.confidence_threshold {
+            self.queue_uncertainty(instance, &validation, &primary_cluster).ok();
             return Err(anyhow!("Generalization confidence too low: {}", validation.confidence));
         }
 
@@ -2335,6 +2849,26 @@ impl SpecificToGeneralTransformer {
             abstracted_description: self.synthesize_description(&inner_truth)?,
             context_conditions: self.infer_conditions(&sometimes_present, cluster.instances.len())?,
         })
+    }
+
+    fn queue_uncertainty(
+        &self,
+        instance: &SpecificInstance,
+        validation: &GeneralizationValidation,
+        cluster: &InstanceCluster,
+    ) -> Result<()> {
+        let suggested_queries = self.suggest_queries(instance, cluster)?;
+        let item = UncertaintyItem {
+            id: uuid::Uuid::new_v4().to_string(),
+            pattern_candidate: instance.to_pattern_candidate(),
+            reason: format!("Low confidence: {:.2}", validation.confidence),
+            confidence: validation.confidence,
+            suggested_queries,
+            status: UncertaintyStatus::Pending,
+            created_at: Utc::now(),
+        };
+
+        self.uncertainty_queue.enqueue(item)
     }
 }
 ```
@@ -2629,6 +3163,73 @@ impl TechStackDetector {
 }
 ```
 
+**Toolchain Detection and Drift:**
+
+```rust
+#[derive(Debug, Clone)]
+pub struct ProjectToolchain {
+    pub node: Option<String>,
+    pub rust: Option<String>,
+    pub go: Option<String>,
+    pub nextjs: Option<String>,
+    pub react: Option<String>,
+}
+
+pub struct ToolchainDetector;
+
+impl ToolchainDetector {
+    pub fn detect(&self, project_path: &Path) -> Result<ProjectToolchain> {
+        Ok(ProjectToolchain {
+            node: read_node_version(project_path),
+            rust: read_cargo_version(project_path),
+            go: read_go_version(project_path),
+            nextjs: read_package_version(project_path, "next"),
+            react: read_package_version(project_path, "react"),
+        })
+    }
+}
+
+pub struct ToolchainMismatch {
+    pub tool: String,
+    pub skill_range: String,
+    pub project_version: String,
+}
+
+pub fn detect_toolchain_mismatches(
+    skill: &Skill,
+    toolchain: &ProjectToolchain,
+) -> Vec<ToolchainMismatch> {
+    let mut mismatches = Vec::new();
+
+    for constraint in &skill.metadata.toolchains {
+        let project_version = match constraint.name.as_str() {
+            "node" => toolchain.node.clone(),
+            "rust" => toolchain.rust.clone(),
+            "go" => toolchain.go.clone(),
+            "nextjs" => toolchain.nextjs.clone(),
+            "react" => toolchain.react.clone(),
+            _ => None,
+        };
+
+        if let Some(version) = project_version {
+            if !version_in_range(&version, &constraint.min_version, &constraint.max_version) {
+                mismatches.push(ToolchainMismatch {
+                    tool: constraint.name.clone(),
+                    skill_range: format!(
+                        "{}..{}",
+                        constraint.min_version.clone().unwrap_or_else(|| "*".into()),
+                        constraint.max_version.clone().unwrap_or_else(|| "*".into())
+                    ),
+                    project_version: version,
+                });
+            }
+        }
+    }
+
+    mismatches
+}
+```
+
 **Stack-Specific Mining:**
 
 ```bash
@@ -2726,7 +3327,8 @@ After `ms build` generates a draft:
 1. **Review** the draft skill critically
 2. **Test** by using the skill in a real session
 3. **Iterate** with `ms refine <skill-name>` based on usage
-4. **Validate** with `ms validate <skill-name>` for best practices
+4. **Compile** from `skill.spec.json` to ensure deterministic output
+5. **Validate** with `ms validate <skill-name>` for best practices
 
 ### 4. Integration Phase
 
@@ -3645,6 +4247,9 @@ Ignored sessions (1):
   xyz789 - "Too much trial and error, not exemplary"
 ```
 
+Anti-pattern markings are treated as counter-examples and flow into a dedicated
+"Avoid / When NOT to use" section during draft generation.
+
 ### 5.12 Evidence and Provenance Graph
 
 Evidence links are first-class: every rule in a generated skill should be traceable back
@@ -3784,6 +4389,93 @@ ms doctor --check=redaction
 
 # Emit redaction report for a build
 ms build --from-cass "auth tokens" --redaction-report
+```
+
+### 5.14 Anti-Pattern Mining and Counter-Examples
+
+Great skills include what *not* to do. ms extracts anti-patterns from failure
+signals, marked anti-pattern sessions, and explicit “wrong” fixes in transcripts.
+These are presented as a dedicated "Avoid / When NOT to use" section and sliced
+as `Pitfall` blocks for token packing.
+
+**Anti-Pattern Extraction Sources:**
+- Session marks with `MarkType::AntiPattern`
+- Failure outcomes from the effectiveness loop
+- Phrases indicating incorrect or insecure approaches
+
+**Draft Integration (example):**
+
+```
+## Avoid / When NOT to Use
+
+- ❌ Store tokens in localStorage (risk: XSS exfiltration)
+  ✅ Use httpOnly cookies and rotate on logout
+
+- ❌ Re-run migrations on every startup (risk: production locks)
+  ✅ Gate migrations behind explicit deploy step
+```
+
+### 5.15 Active-Learning Uncertainty Queue
+
+When generalization confidence is too low, ms does not discard the pattern. Instead,
+it queues the candidate for targeted evidence gathering. This turns "maybe" patterns
+into high-quality rules with minimal extra effort.
+
+**Uncertainty Queue Flow:**
+
+```
+Low confidence pattern → Queue → Suggested CASS queries → Review/resolve → Promote or discard
+```
+
+**Queue Interface:**
+
+```rust
+pub struct UncertaintyQueue {
+    db: Connection,
+}
+
+impl UncertaintyQueue {
+    pub fn enqueue(&self, item: UncertaintyItem) -> Result<()> {
+        self.db.execute(
+            "INSERT INTO uncertainty_queue VALUES (?, ?, ?, ?, ?, ?, ?)",
+            params![
+                item.id,
+                serde_json::to_string(&item.pattern_candidate)?,
+                item.reason,
+                item.confidence,
+                serde_json::to_string(&item.suggested_queries)?,
+                "pending",
+                item.created_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_pending(&self, limit: usize) -> Result<Vec<UncertaintyItem>> {
+        self.db.query("SELECT * FROM uncertainty_queue WHERE status = 'pending' LIMIT ?", [limit])
+    }
+
+    pub fn resolve(&self, id: &str, outcome: UncertaintyStatus) -> Result<()> {
+        self.db.execute(
+            "UPDATE uncertainty_queue SET status = ? WHERE id = ?",
+            params![format!("{:?}", outcome).to_lowercase(), id],
+        )?;
+        Ok(())
+    }
+}
+```
+
+**CLI Examples:**
+
+```bash
+# List pending uncertain patterns
+ms uncertainties list
+
+# Resolve one by mining more evidence
+ms uncertainties resolve UNK-123 --mine "react mount state sync"
+
+# Resolve in batch (guided)
+ms build --resolve-uncertainties
 ```
 
 ---
@@ -3977,7 +4669,7 @@ that fit within a token budget.
 
 **Slice Generation Heuristics:**
 
-- One slice per rule, command block, example, checklist, or pitfall
+- One slice per rule, command block, example, checklist, or pitfall (including anti-patterns)
 - Preserve section headings by attaching them to the first slice in the section
 - Estimate tokens per slice using a fast tokenizer heuristic
 - Assign utility score from quality signals + usage frequency + evidence coverage
@@ -4146,10 +4838,21 @@ impl Suggester {
         let mut results = self.searcher.search(&query, &SearchFilters::default(), 20).await?;
 
         let pack_budget = context.pack_budget;
+        let explain = context.explain;
 
         for result in &mut results {
-            if let Some(skill) = self.registry.get(&result.skill_id)? {
-                result.score *= self.trigger_boost(&skill, &signals);
+            if let Some(resolved) = self.registry.effective(&result.skill_id).ok() {
+                let skill = &resolved.skill;
+                result.score *= self.trigger_boost(skill, &signals);
+                result.dependencies = skill.metadata.requires.clone();
+                result.layer = Some(format!("{:?}", skill.source.layer).to_lowercase());
+                result.conflicts = resolved.conflicts.iter()
+                    .map(|c| c.section.clone())
+                    .collect();
+
+                if explain {
+                    result.explanation = Some(self.explain_result(skill, &signals, result.score));
+                }
 
                 if let Some(budget) = pack_budget {
                     result.disclosure_level = "pack".into();
@@ -4179,6 +4882,33 @@ impl Suggester {
 
         boost
     }
+
+    fn explain_result(
+        &self,
+        skill: &Skill,
+        signals: &[SuggestionSignal],
+        final_score: f32,
+    ) -> SuggestionExplanation {
+        let matched_triggers = skill.metadata.triggers.iter()
+            .filter(|t| signals.iter().any(|s| self.matches_trigger(t, s)))
+            .map(|t| format!("{}:{}", t.trigger_type, t.pattern))
+            .collect::<Vec<_>>();
+
+        let signal_scores = signals.iter().map(|s| SignalScore {
+            signal: format!("{:?}", s),
+            contribution: 0.0, // populated from search logs
+        }).collect();
+
+        SuggestionExplanation {
+            matched_triggers,
+            signal_scores,
+            rrf_components: RrfBreakdown {
+                bm25_rank: None,
+                vector_rank: None,
+                rrf_score: final_score,
+            },
+        }
+    }
 }
 ```
 
@@ -4191,6 +4921,7 @@ pub struct SuggestionContext {
     pub recent_commands: Vec<String>,
     pub query: Option<String>,
     pub pack_budget: Option<usize>,
+    pub explain: bool,
 }
 ```
 
@@ -4256,6 +4987,8 @@ Quality scoring determines which skills are most worth surfacing to agents. This
 pub struct QualityScorer {
     weights: QualityWeights,
     usage_tracker: UsageTracker,
+    toolchain_detector: ToolchainDetector,
+    project_path: Option<PathBuf>,
 }
 
 /// Configurable weights for quality factors
@@ -4499,8 +5232,8 @@ impl QualityScorer {
     /// Score freshness and relevance
     fn score_freshness(&self, skill: &Skill) -> FactorResult {
         let mut score = 1.0;
-        let issues = vec![];
-        let suggestions = vec![];
+        let mut issues = vec![];
+        let mut suggestions = vec![];
 
         let now = Utc::now();
         let age = now - skill.metadata.updated_at;
@@ -4514,6 +5247,25 @@ impl QualityScorer {
         // Check for deprecated patterns (version-specific content)
         let deprecated = check_deprecated_patterns(&skill.body);
         score -= 0.1 * deprecated.len() as f32;
+
+        // Toolchain mismatch penalty (if project context available)
+        if let Some(path) = &self.project_path {
+            if let Ok(toolchain) = self.toolchain_detector.detect(path) {
+                let mismatches = detect_toolchain_mismatches(skill, &toolchain);
+                for mismatch in mismatches {
+                    score -= 0.1;
+                    issues.push(QualityIssue::ToolchainMismatch {
+                        tool: mismatch.tool,
+                        skill_range: mismatch.skill_range,
+                        project_version: mismatch.project_version,
+                    });
+                }
+
+                if !mismatches.is_empty() {
+                    suggestions.push("Update skill for current toolchain versions".into());
+                }
+            }
+        }
 
         FactorResult { score: score.clamp(0.0, 1.0), issues, suggestions }
     }
@@ -4570,6 +5322,9 @@ pub enum QualityIssue {
 
     /// Evidence coverage too low
     LowEvidenceCoverage(f32),
+
+    /// Skill is incompatible with the project's toolchain versions
+    ToolchainMismatch { tool: String, skill_range: String, project_version: String },
 }
 ```
 
@@ -4592,6 +5347,10 @@ ms quality --all --min=0.5
 # Quality gate for CI
 ms quality --check --min=0.7
 # → Exit 1 if any skill below threshold
+
+# Staleness / toolchain drift report
+ms quality --stale
+ms quality --stale --project /data/projects/my-rust-project
 
 # Quality as JSON
 ms quality --robot ntm
@@ -5904,6 +6663,42 @@ default_pack_budget = 800
 # Packing mode: balanced | utility_first | coverage_first
 default_pack_mode = "balanced"
 
+[dependencies]
+# Auto-load prerequisites on ms load (auto resolves order)
+auto_load = true
+
+# Default dependency load mode: auto | off | full | overview
+default_mode = "auto"
+
+# Default disclosure level for dependencies
+default_level = "overview"
+
+# Max dependency expansion depth
+max_depth = 5
+
+[layers]
+# Layer precedence for conflict resolution: base < org < project < user
+order = ["base", "org", "project", "user"]
+
+# Conflict strategy: prefer_higher | prefer_lower | interactive
+conflict_strategy = "prefer_higher"
+
+# If true, conflict details are emitted in --robot responses
+emit_conflicts = true
+
+[toolchain]
+# Enable project toolchain detection for freshness scoring
+detect_toolchain = true
+
+# Projects to scan for toolchain info (first match wins)
+project_roots = [
+    ".",
+    "..",
+]
+
+# Max allowed version drift (major version difference) before warning
+max_major_drift = 1
+
 [paths]
 # Directories to scan for skills
 skill_paths = [
@@ -5911,6 +6706,13 @@ skill_paths = [
     "~/.claude/skills",
     "/data/projects/agent_flywheel_clawdbot_skills_and_integrations/skills",
 ]
+
+# Layered paths (override or augment skill_paths)
+[paths.layers]
+base = ["~/.config/ms/skills/base"]
+org = ["~/.config/ms/skills/org"]
+project = ["./.ms/skills"]
+user = ["~/.config/ms/skills/user"]
 
 # Exclude patterns
 exclude_patterns = [
@@ -5939,6 +6741,16 @@ default_session_limit = 50
 # Minimum confidence for pattern extraction
 min_pattern_confidence = 0.6
 
+[uncertainty]
+# Enable uncertainty queue for low-confidence generalizations
+enabled = true
+
+# Confidence threshold below which patterns are queued
+min_confidence = 0.7
+
+# Max pending items before throttling
+max_pending = 500
+
 [privacy]
 # Redaction enabled for all CASS ingestion
 redaction_enabled = true
@@ -5964,6 +6776,9 @@ auto_save_interval = 60
 
 # Maximum iterations before prompting for decision
 max_iterations = 10
+
+# Include anti-patterns/counter-examples in drafts
+include_anti_patterns = true
 
 [github]
 # Default visibility for published bundles
@@ -6249,6 +7064,28 @@ The hash embedding approach from xf provides 80-90% of ML embedding quality for 
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
+
+**Two-Phase Commit for Consistency**
+
+To avoid partial writes (SQLite updated but Git not, or vice versa), ms wraps every
+write in a two-phase commit (2PC) protocol with a durable write-ahead record.
+
+```
+Phase 1 (Prepare)
+  1) Write pending change to .ms/tx/<txid>.json
+  2) Write to SQLite in a "pending" state
+
+Phase 2 (Commit)
+  3) Write to Git archive (commit)
+  4) Mark SQLite row as "committed"
+  5) Remove tx record
+
+Recovery
+  - If tx exists without Git commit: resume commit
+  - If Git commit exists but SQLite pending: finalize SQLite
+```
+
+This makes dual persistence crash-safe and idempotent.
 
 ### 13.3 Why Interactive Build Over Fully Automated
 
@@ -7239,6 +8076,11 @@ description: {{description}}
 | Issue | Cause | Solution |
 |-------|-------|----------|
 | {{issue_1}} | {{cause_1}} | {{solution_1}} |
+
+## Anti-Patterns (Avoid)
+
+- ❌ {{anti_pattern_1}} → ✅ {{anti_pattern_1_fix}}
+- ❌ {{anti_pattern_2}} → ✅ {{anti_pattern_2_fix}}
 
 ## Completion Criteria
 
@@ -8575,6 +9417,7 @@ impl LiveDraftGenerator {
 ### 22.1 Overview
 
 Track whether skills actually help agents accomplish their tasks. This data improves skill quality scores and informs future skill generation.
+When multiple variants exist, ms can run A/B experiments to select the most effective version.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -8613,6 +9456,37 @@ pub struct EffectivenessTracker {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillExperiment {
+    pub id: String,
+    pub skill_id: String,
+    pub variants: Vec<ExperimentVariant>,
+    pub allocation: AllocationStrategy,
+    pub started_at: DateTime<Utc>,
+    pub status: ExperimentStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExperimentVariant {
+    pub variant_id: String,
+    pub version: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum AllocationStrategy {
+    Uniform,
+    Weighted(Vec<(String, f32)>),
+    ThompsonSampling,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ExperimentStatus {
+    Running,
+    Paused,
+    Completed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillUsageEvent {
     /// Unique event ID
     pub id: String,
@@ -8631,6 +9505,12 @@ pub struct SkillUsageEvent {
 
     /// How skill was discovered
     pub discovery_method: DiscoveryMethod,
+
+    /// Experiment id if this usage is part of an A/B test
+    pub experiment_id: Option<String>,
+
+    /// Variant id if in an experiment
+    pub variant_id: Option<String>,
 
     /// Outcome of the session
     pub outcome: Option<SessionOutcome>,
@@ -8720,6 +9600,7 @@ impl EffectivenessTracker {
         session_id: &str,
         level: DisclosureLevel,
         method: DiscoveryMethod,
+        experiment: Option<(String, String)>, // (experiment_id, variant_id)
     ) -> Result<String> {
         let event = SkillUsageEvent {
             id: uuid::Uuid::new_v4().to_string(),
@@ -8728,12 +9609,14 @@ impl EffectivenessTracker {
             loaded_at: Utc::now(),
             disclosure_level: level,
             discovery_method: method,
+            experiment_id: experiment.as_ref().map(|(id, _)| id.clone()),
+            variant_id: experiment.as_ref().map(|(_, v)| v.clone()),
             outcome: None,
             feedback: None,
         };
 
         self.db.execute(
-            "INSERT INTO skill_usage_events VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO skill_usage_events VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 event.id,
                 event.skill_id,
@@ -8741,6 +9624,8 @@ impl EffectivenessTracker {
                 event.loaded_at.to_rfc3339(),
                 serde_json::to_string(&event.disclosure_level)?,
                 serde_json::to_string(&event.discovery_method)?,
+                event.experiment_id.clone(),
+                event.variant_id.clone(),
                 None::<String>,  // outcome
                 None::<String>,  // feedback
             ],
@@ -8978,6 +9863,79 @@ impl QualityUpdater {
 }
 ```
 
+### 22.4.1 A/B Skill Experiments
+
+When multiple versions of a skill exist (e.g., different wording, structure, or
+examples), ms can run A/B experiments to empirically determine the more effective
+variant. Results feed back into quality scoring and can automatically promote the
+winning version.
+
+```rust
+pub struct ExperimentRunner {
+    tracker: EffectivenessTracker,
+    db: Connection,
+}
+
+impl ExperimentRunner {
+    /// Create a new experiment for a skill
+    pub fn create_experiment(
+        &self,
+        skill_id: &str,
+        variants: Vec<ExperimentVariant>,
+        allocation: AllocationStrategy,
+    ) -> Result<SkillExperiment> {
+        let experiment = SkillExperiment {
+            id: uuid::Uuid::new_v4().to_string(),
+            skill_id: skill_id.to_string(),
+            variants,
+            allocation,
+            started_at: Utc::now(),
+            status: ExperimentStatus::Running,
+        };
+
+        self.db.execute(
+            "INSERT INTO skill_experiments VALUES (?, ?, ?, ?, ?, ?)",
+            params![
+                experiment.id,
+                experiment.skill_id,
+                serde_json::to_string(&experiment.variants)?,
+                serde_json::to_string(&experiment.allocation)?,
+                "running",
+                experiment.started_at.to_rfc3339(),
+            ],
+        )?;
+
+        Ok(experiment)
+    }
+
+    /// Assign a variant for a given load event
+    pub fn assign_variant(&self, experiment: &SkillExperiment) -> Result<(String, String)> {
+        let variant = select_variant(&experiment.variants, &experiment.allocation);
+        Ok((experiment.id.clone(), variant.variant_id.clone()))
+    }
+
+    /// Evaluate experiment and recommend winner
+    pub fn evaluate(&self, experiment_id: &str) -> Result<ExperimentResult> {
+        let stats = self.tracker.get_experiment_stats(experiment_id)?;
+        Ok(ExperimentResult::from_stats(stats))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ExperimentResult {
+    pub winner_variant: Option<String>,
+    pub confidence: f32,
+    pub stats: HashMap<String, VariantStats>,
+}
+
+#[derive(Debug, Clone)]
+pub struct VariantStats {
+    pub uses: usize,
+    pub success_rate: f32,
+    pub avg_rating: f32,
+}
+```
+
 ### 22.5 CLI Commands for Effectiveness
 
 ```bash
@@ -9007,6 +9965,14 @@ ms improvements rust-patterns
 # Update quality scores with latest data
 ms quality update --all
 ms quality update rust-patterns
+
+# Start an A/B experiment with two variants
+ms experiment start rust-patterns \
+  --variant v1 --desc "Concise rules-first layout" \
+  --variant v2 --desc "Examples-first layout"
+
+# View experiment results
+ms experiment results rust-patterns
 ```
 
 ---
@@ -10847,7 +11813,214 @@ F: CALIBRATION → documented limitations
 
 ---
 
-*Plan version: 1.4.0*
+## Section 29: APR Iterative Refinement Patterns
+
+*CASS Mining Deep Dive: automated_plan_reviser_pro methodology (P1 bead: meta_skill-hzg)*
+
+### 29.1 The Numerical Optimizer Analogy
+
+The APR project reveals a powerful insight: **iterative specification refinement follows the same dynamics as numerical optimization**.
+
+> "It very much reminds me of a numerical optimizer gradually converging on a steady state after wild swings in the initial iterations."
+
+**Application to meta_skill:** When building skills through CASS mining, expect early iterations to produce wild swings (major restructures, foundational changes). Later iterations converge on stable formulations. Don't judge early work—judge the convergence trajectory.
+
+### 29.2 The Convergence Pattern
+
+Refinement progresses through predictable phases:
+
+```
+┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+│   Round 1-3     │────▶│   Round 4-7     │────▶│   Round 8-12    │────▶ ...
+│   Major fixes   │     │  Architecture   │     │  Refinements    │
+│   Security gaps │     │  improvements   │     │  Optimizations  │
+└─────────────────┘     └─────────────────┘     └─────────────────┘
+        │                       │                       │
+        ▼                       ▼                       ▼
+   Wild swings            Dampening              Converging
+   in design              oscillations           on optimal
+```
+
+| Phase | Rounds | Focus |
+|-------|--------|-------|
+| **Major Fixes** | 1-3 | Security gaps, architectural flaws, fundamental issues |
+| **Architecture** | 4-7 | Interface improvements, component boundaries |
+| **Refinement** | 8-12 | Edge cases, optimizations, nuanced handling |
+| **Polishing** | 13+ | Final abstractions, converging on steady state |
+
+**Key insight:** In early rounds, reviewers focus on "putting out fires." Once major issues are addressed, they can apply "considerable intellectual energies on nuanced particulars."
+
+### 29.3 Convergence Analytics Algorithm
+
+APR implements a quantitative convergence detector using three weighted signals:
+
+```
+Convergence Score = (0.35 × output_trend) + (0.35 × change_velocity) + (0.30 × similarity_trend)
+```
+
+| Signal | Weight | What It Measures |
+|--------|--------|------------------|
+| **Output Size Trend** | 35% | Are responses getting shorter? Early rounds produce lengthy analyses; convergence shows as more focused, briefer feedback |
+| **Change Velocity** | 35% | Is the rate of change slowing? Measured by comparing delta sizes between consecutive rounds |
+| **Content Similarity** | 30% | Are successive rounds becoming more similar? Uses word-level overlap to detect stabilization |
+
+**Interpretation:**
+- **Score ≥ 0.75**: High confidence of convergence. The specification is stabilizing.
+- **Score 0.50-0.74**: Moderate convergence. Significant work remains but progress is visible.
+- **Score < 0.50**: Low convergence. Still in early iteration phase with major changes likely.
+
+**Application to meta_skill:** When refining skills through CASS mining, track these metrics:
+1. Are extracted patterns getting shorter/tighter?
+2. Is the rate of changes to skill definitions slowing?
+3. Are multi-model extractions converging on similar formulations?
+
+### 29.4 Grounded Abstraction Principle
+
+> "Every few rounds, including the implementation document keeps abstract specifications grounded in concrete reality."
+
+**Pattern:** Every 3-4 rounds of abstract refinement, ground the work in concrete implementation:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  GROUNDED ABSTRACTION CYCLE                                              │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  Round 1 ──▶ Round 2 ──▶ Round 3 ──▶ [INCLUDE IMPL] ──▶ Round 4 ──▶ ... │
+│    │            │            │              │               │            │
+│    └────────────┴────────────┴──────────────┤               │            │
+│           Abstract Refinement               │               │            │
+│                                             ▼               │            │
+│                                   Surface Assumptions       │            │
+│                                   Validate Feasibility      │            │
+│                                                             │            │
+│                          ┌──────────────────────────────────┘            │
+│                          │                                               │
+│                          ▼                                               │
+│                   Feedback Loop: Faulty assumptions                      │
+│                   surface earlier when ideas meet code                   │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+**Application to meta_skill:** When extracting skills from CASS sessions, periodically test them:
+- Can the skill actually be loaded and executed?
+- Does the skill produce expected outputs?
+- Do agents understand and apply the skill correctly?
+
+### 29.5 Reliability Features for Long Operations
+
+APR implements several reliability patterns for expensive operations:
+
+#### Pre-Flight Validation
+Check all preconditions before starting expensive work:
+```
+Pre-flight checks:
+- Required files exist
+- Previous dependencies satisfied
+- Resources available
+- Configuration valid
+```
+
+**Application to meta_skill:** Before running expensive CASS operations:
+- Verify index is up-to-date
+- Check disk space for embeddings
+- Validate query parameters
+- Confirm output paths writable
+
+#### Auto-Retry with Exponential Backoff
+```
+Attempt 1 → fail → wait 10s
+Attempt 2 → fail → wait 30s  (10s × 3)
+Attempt 3 → fail → wait 90s  (30s × 3)
+Attempt 4 → success (or final failure)
+```
+
+**Application to meta_skill:** Retry transient failures (network, rate limits) with increasing delays.
+
+#### Session Locking
+Prevent concurrent operations that could cause corruption:
+- File-based locks with timestamp
+- Automatic stale lock cleanup
+- Clear error messages on lock conflict
+
+### 29.6 Dual Interface Pattern
+
+APR serves two audiences with the same codebase:
+
+| Audience | Interface | Features |
+|----------|-----------|----------|
+| **Humans** | Beautiful TUI | gum styling, interactive wizards, progress indicators, notifications |
+| **Machines** | Robot Mode JSON | Structured output, semantic error codes, pre-flight validation |
+
+```rust
+// meta_skill application: --robot flag
+pub struct OutputMode {
+    human: bool,  // Pretty TUI output
+    robot: bool,  // Structured JSON output
+}
+
+// Robot mode JSON envelope
+{
+    "ok": true,
+    "code": "ok",
+    "data": { ... },
+    "hint": "Optional debugging message",
+    "meta": { "v": "1.0.0", "ts": "2026-01-13T00:00:00Z" }
+}
+```
+
+**Semantic Error Codes:**
+- `ok` - Success
+- `not_configured` - No configuration found
+- `not_found` - Resource doesn't exist
+- `validation_failed` - Preconditions not met
+- `dependency_missing` - Required dependency unavailable
+
+### 29.7 Audit Trail Principle
+
+Every operation creates artifacts:
+- Output files saved to versioned directories
+- Git integration for history
+- Logs for debugging
+- Metrics for analysis
+
+**Application to meta_skill:**
+- Every CASS mining session produces artifacts in `.ms_cache/`
+- Extracted skills tracked in Git
+- Operation logs preserved for debugging
+- Convergence metrics stored for analysis
+
+### 29.8 Design Principles Summary
+
+| Principle | Description |
+|-----------|-------------|
+| **Iterative Convergence** | Like numerical optimization—expect wild swings early, convergence late |
+| **Grounded Abstraction** | Periodically ground abstract work in concrete implementation |
+| **Audit Trail** | Every operation creates artifacts; history is preserved |
+| **Graceful Degradation** | Fallbacks for missing dependencies (gum → ANSI, global → npx) |
+| **Dual Interface** | Beautiful for humans, structured for machines |
+| **Secure by Default** | No credential storage, checksum verification, atomic operations |
+
+### 29.9 Updated Beads Table
+
+| Bead | P | Topic | Status |
+|------|---|-------|--------|
+| meta_skill-4d7 | P0 | Inner Truth/Abstract Principles | ✓ Complete |
+| meta_skill-hzg | P1 | APR Iterative Refinement | ✓ Complete |
+| meta_skill-897 | P1 | Optimization Patterns | Pending |
+| meta_skill-z2r | P1 | Performance Profiling | Pending |
+| meta_skill-aku | P1 | Security Vulnerability Assessment | Pending |
+| meta_skill-dag | P2 | Error Handling | Pending |
+| meta_skill-f8s | P2 | CI/CD Automation | Pending |
+| meta_skill-hax | P2 | Caching/Memoization | Pending |
+| meta_skill-36x | P2 | Debugging Workflows | Pending |
+| meta_skill-avs | P2 | Refactoring Patterns | Pending |
+| meta_skill-cbx | P2 | Testing Patterns | Pending |
+| meta_skill-6st | P2 | REST API Design | Pending |
+
+---
+
+*Plan version: 1.5.0*
 *Created: 2026-01-13*
 *Updated: 2026-01-13*
 *Author: Claude Opus 4.5*
