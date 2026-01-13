@@ -792,6 +792,9 @@ pub struct Skill {
 
     /// Computed fields
     pub computed: SkillComputed,
+
+    /// Rule-level evidence and provenance
+    pub evidence: SkillEvidenceIndex,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -877,6 +880,92 @@ pub struct SkillComputed {
 
     /// Embedding vector for similarity search
     pub embedding: Vec<f32>,
+
+    /// Pre-sliced content blocks for token packing
+    pub slices: SkillSliceIndex,
+}
+
+/// A sliceable unit of a skill for token-aware packing
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillSlice {
+    /// Stable slice id (rule-1, example-2, etc.)
+    pub id: String,
+
+    /// Slice type for packing heuristics
+    pub slice_type: SliceType,
+
+    /// Estimated tokens for this slice
+    pub token_estimate: usize,
+
+    /// Utility score (0.0 - 1.0), computed from usage + quality
+    pub utility_score: f32,
+
+    /// Optional dependencies on other slices (by id)
+    pub requires: Vec<String>,
+
+    /// Content payload (markdown)
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum SliceType {
+    Rule,
+    Command,
+    Example,
+    Checklist,
+    Pitfall,
+    Overview,
+    Reference,
+}
+
+/// Index of slices for packing
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillSliceIndex {
+    pub slices: Vec<SkillSlice>,
+    pub generated_at: DateTime<Utc>,
+}
+
+/// Rule-level evidence index for provenance and auditing
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillEvidenceIndex {
+    /// Rule id -> evidence references
+    pub rules: HashMap<String, Vec<EvidenceRef>>,
+
+    /// Aggregate coverage metrics
+    pub coverage: EvidenceCoverage,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvidenceRef {
+    /// CASS session id
+    pub session_id: String,
+
+    /// Inclusive message range within the session (start, end)
+    pub message_range: (u32, u32),
+
+    /// Stable hash of the source snippet (after redaction)
+    pub snippet_hash: String,
+
+    /// Optional short excerpt for humans (redacted)
+    pub excerpt: Option<String>,
+
+    /// Confidence for this evidence link (0.0 - 1.0)
+    pub confidence: f32,
+
+    /// When this evidence was captured
+    pub captured_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvidenceCoverage {
+    /// Total rules in the skill
+    pub total_rules: usize,
+
+    /// Rules with at least one evidence link
+    pub rules_with_evidence: usize,
+
+    /// Average evidence confidence across linked rules
+    pub avg_confidence: f32,
 }
 ```
 
@@ -938,6 +1027,36 @@ CREATE TABLE skill_embeddings (
     embedding BLOB NOT NULL,  -- f16 quantized, 384 dimensions
     created_at TEXT NOT NULL
 );
+
+-- Pre-sliced content blocks for token packing
+CREATE TABLE skill_slices (
+    skill_id TEXT NOT NULL REFERENCES skills(id),
+    slices_json TEXT NOT NULL,  -- SkillSliceIndex
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (skill_id)
+);
+
+-- Rule-level evidence and provenance
+CREATE TABLE skill_evidence (
+    skill_id TEXT NOT NULL REFERENCES skills(id),
+    rule_id TEXT NOT NULL,
+    evidence_json TEXT NOT NULL,   -- JSON array of EvidenceRef
+    coverage_json TEXT NOT NULL,   -- EvidenceCoverage snapshot
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (skill_id, rule_id)
+);
+
+CREATE INDEX idx_evidence_skill ON skill_evidence(skill_id);
+
+-- Redaction reports for privacy and secret-scrubbing
+CREATE TABLE redaction_reports (
+    id INTEGER PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    report_json TEXT NOT NULL,   -- RedactionReport
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX idx_redaction_session ON redaction_reports(session_id);
 
 -- Skill usage tracking
 CREATE TABLE skill_usage (
@@ -1006,10 +1125,14 @@ CREATE INDEX idx_usage_time ON skill_usage(used_at);
 │   │   ├── ntm/
 │   │   │   ├── metadata.yaml
 │   │   │   ├── SKILL.md
+│   │   │   ├── evidence.json
+│   │   │   ├── slices.json
 │   │   │   └── usage-log.jsonl
 │   │   └── planning-workflow/
 │   │       ├── metadata.yaml
 │   │       ├── SKILL.md
+│   │       ├── evidence.json
+│   │       ├── slices.json
 │   │       └── usage-log.jsonl
 │   └── by-source/
 │       └── agent_flywheel_clawdbot_skills_and_integrations/
@@ -1018,6 +1141,8 @@ CREATE INDEX idx_usage_time ON skill_usage(used_at);
 │   ├── session-abc123/
 │   │   ├── manifest.yaml
 │   │   ├── patterns.md
+│   │   ├── evidence.json
+│   │   ├── redaction-report.json
 │   │   ├── draft-v1.md
 │   │   ├── draft-v2.md
 │   │   └── final.md
@@ -1058,6 +1183,8 @@ ms load ntm --level 1  # Just overview
 ms load ntm --level 2  # Include key sections
 ms load ntm --level 3  # Full content
 ms load ntm --full     # Everything including assets
+ms load ntm --pack 800 # Token-budgeted slice pack
+ms load ntm --pack 800 --mode coverage_first  # Bias toward rule coverage
 ms load ntm --robot    # JSON output for automation
 
 # Suggest skills for current context
@@ -1065,11 +1192,17 @@ ms suggest
 ms suggest --cwd /data/projects/my-rust-project
 ms suggest --file src/main.rs
 ms suggest --query "how to handle async errors"
+ms suggest --pack 800  # Suggest packed slices within token budget
 
 # Show skill details
 ms show ntm
 ms show ntm --usage  # Include usage stats
 ms show ntm --deps   # Show dependency graph
+
+# Inspect rule-level evidence and provenance
+ms evidence ntm
+ms evidence ntm --rule "rule-3"
+ms evidence ntm --graph  # Export provenance graph (JSON)
 ```
 
 ### 4.2 Build Commands (CASS Integration)
@@ -1082,6 +1215,8 @@ ms build --name "rust-error-handling"
 # Build from specific CASS query
 ms build --from-cass "error handling in rust"
 ms build --from-cass "how I implemented auth" --sessions 20
+ms build --from-cass "auth tokens" --redaction-report  # emit redaction report
+ms build --from-cass "api keys" --no-redact  # only if you explicitly accept risk
 
 # Resume existing build session
 ms build --resume session-abc123
@@ -1263,6 +1398,9 @@ pub struct SuggestionItem {
     pub reason: String,
     pub disclosure_level: String,
     pub token_estimate: usize,
+    pub pack_budget: Option<usize>,
+    pub packed_token_estimate: Option<usize>,
+    pub slice_count: Option<usize>,
 }
 
 /// --robot-build-status response
@@ -1361,6 +1499,7 @@ pub enum CheckCategory {
     SearchIndex,
     Configuration,
     CassIntegration,
+    Redaction,
     GitArchive,
     FileSystem,
     Permissions,
@@ -1406,6 +1545,12 @@ pub enum HealthStatus {
 │  ☐ CASS is responsive (cass health)                                        │
 │  ☐ CASS has indexed sessions                                               │
 │  ☐ Can execute CASS queries                                                │
+│                                                                             │
+│ REDACTION                                                                   │
+│  ☐ Redaction enabled in config                                             │
+│  ☐ Redaction rules loaded (built-in + custom)                              │
+│  ☐ Recent redaction report available                                       │
+│  ☐ No high-risk secrets leaked in last N builds                            │
 │                                                                             │
 │ GIT ARCHIVE                                                                 │
 │  ☐ Archive directory exists                                                │
@@ -1625,6 +1770,7 @@ compdef _ms ms
 │  ┌───────────────────────────────────────────────────────────────────────┐ │
 │  │  For each relevant session:                                           │ │
 │  │  - Read full transcript from CASS                                     │ │
+│  │  - Redact secrets/PII (emit redaction report)                          │ │
 │  │  - Extract tool calls, code blocks, user feedback                     │ │
 │  │  - Identify success/failure signals                                   │ │
 │  └───────────────────────────────────────────────────────────────────────┘ │
@@ -1638,6 +1784,7 @@ compdef _ms ms
 │  │  - Recurring explanations/justifications                              │ │
 │  │  - Error patterns and resolutions                                     │ │
 │  │  - "THE EXACT PROMPT" candidates                                      │ │
+│  │  - Evidence refs (session_id, message range, snippet hash)            │ │
 │  └───────────────────────────────────────────────────────────────────────┘ │
 │                                      │                                      │
 │                                      ▼                                      │
@@ -1729,6 +1876,22 @@ pub enum PatternType {
         effectiveness_score: f32,
         frequency: usize,
     },
+}
+
+/// Extracted pattern with provenance
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExtractedPattern {
+    /// Stable id for deduplication and cross-referencing
+    pub id: String,
+
+    /// The classified pattern type
+    pub pattern_type: PatternType,
+
+    /// Evidence references supporting this pattern
+    pub evidence: Vec<EvidenceRef>,
+
+    /// Confidence of the pattern extraction (0.0 - 1.0)
+    pub confidence: f32,
 }
 ```
 
@@ -3482,6 +3645,147 @@ Ignored sessions (1):
   xyz789 - "Too much trial and error, not exemplary"
 ```
 
+### 5.12 Evidence and Provenance Graph
+
+Evidence links are first-class: every rule in a generated skill should be traceable back
+to concrete session evidence. ms builds a lightweight provenance graph that connects:
+
+```
+Rule → Pattern → Session → Messages
+```
+
+This makes skills auditable, merge-safe, and self-correcting.
+
+**Provenance Graph Model:**
+
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProvenanceGraph {
+    pub nodes: Vec<ProvNode>,
+    pub edges: Vec<ProvEdge>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProvNode {
+    pub id: String,
+    pub node_type: ProvNodeType,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ProvNodeType {
+    Skill,
+    Rule,
+    Pattern,
+    Session,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProvEdge {
+    pub from: String,
+    pub to: String,
+    pub weight: f32,     // evidence confidence
+    pub reason: String,  // short description
+}
+```
+
+**CLI Examples:**
+
+```bash
+# Show evidence for a skill (rule-level summary)
+ms evidence nextjs-accessibility
+
+# Inspect a specific rule's evidence
+ms evidence nextjs-accessibility --rule "rule-7"
+
+# Export the provenance graph
+ms evidence nextjs-accessibility --graph --format json
+```
+
+### 5.13 Redaction and Privacy Guard
+
+All CASS transcripts pass through a redaction pipeline before pattern extraction.
+This prevents secrets, tokens, and PII from ever entering generated skills,
+evidence excerpts, or provenance graphs.
+
+**Redaction Report Model:**
+
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RedactionReport {
+    pub session_id: String,
+    pub findings: Vec<RedactionFinding>,
+    pub redacted_tokens: usize,
+    pub risk_level: RedactionRisk,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RedactionFinding {
+    pub kind: RedactionKind,
+    pub matched_pattern: String,
+    pub snippet_hash: String,
+    pub location: RedactionLocation,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum RedactionKind {
+    ApiKey,
+    Secret,
+    AccessToken,
+    Password,
+    PiiEmail,
+    PiiPhone,
+    PiiIp,
+    HighEntropy,
+    CustomPattern,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RedactionLocation {
+    pub message_index: u32,
+    pub byte_start: u32,
+    pub byte_end: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum RedactionRisk {
+    Low,
+    Medium,
+    High,
+}
+```
+
+**Redactor Interface:**
+
+```rust
+pub struct Redactor {
+    pub rules: Vec<Regex>,
+    pub allowlist: Vec<Regex>,
+    pub min_entropy: f32,
+}
+
+impl Redactor {
+    pub fn redact(&self, input: &str) -> (String, RedactionReport) {
+        // 1) apply allowlist exemptions
+        // 2) regex-based redactions
+        // 3) entropy-based redactions
+        // 4) emit report with findings + risk
+        unimplemented!()
+    }
+}
+```
+
+**CLI Examples:**
+
+```bash
+# Validate redaction health
+ms doctor --check=redaction
+
+# Emit redaction report for a build
+ms build --from-cass "auth tokens" --redaction-report
+```
+
 ---
 
 ## 6. Progressive Disclosure System
@@ -3512,6 +3816,9 @@ pub enum DisclosureLevel {
     Complete,
 }
 
+// Budget-driven alternative:
+// Use TokenBudget + packer when an explicit token budget is provided
+
 impl DisclosureLevel {
     pub fn token_budget(&self) -> Option<usize> {
         match self {
@@ -3528,8 +3835,16 @@ impl DisclosureLevel {
 ### 6.2 Disclosure Logic
 
 ```rust
+/// Generate content at a specified disclosure plan
+pub fn disclose(skill: &Skill, plan: DisclosurePlan) -> DisclosedContent {
+    match plan {
+        DisclosurePlan::Pack(budget) => disclose_packed(skill, budget),
+        DisclosurePlan::Level(level) => disclose_level(skill, level),
+    }
+}
+
 /// Generate content at specified disclosure level
-pub fn disclose(skill: &Skill, level: DisclosureLevel) -> DisclosedContent {
+fn disclose_level(skill: &Skill, level: DisclosureLevel) -> DisclosedContent {
     match level {
         DisclosureLevel::Minimal => DisclosedContent {
             frontmatter: minimal_frontmatter(skill),
@@ -3567,6 +3882,37 @@ pub fn disclose(skill: &Skill, level: DisclosureLevel) -> DisclosedContent {
         },
     }
 }
+
+/// Budget-driven disclosure using pre-sliced content
+fn disclose_packed(skill: &Skill, budget: TokenBudget) -> DisclosedContent {
+    let packed = pack_slices(&skill.computed.slices, budget);
+
+    DisclosedContent {
+        frontmatter: minimal_frontmatter(skill),
+        body: Some(packed.join("\n\n")),
+        scripts: vec![],
+        references: vec![],
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum DisclosurePlan {
+    Level(DisclosureLevel),
+    Pack(TokenBudget),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct TokenBudget {
+    pub tokens: usize,
+    pub mode: PackMode,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum PackMode {
+    Balanced,
+    UtilityFirst,
+    CoverageFirst,
+}
 ```
 
 ### 6.3 Context-Aware Disclosure
@@ -3576,30 +3922,132 @@ pub fn disclose(skill: &Skill, level: DisclosureLevel) -> DisclosedContent {
 pub fn optimal_disclosure(
     skill: &Skill,
     context: &DisclosureContext,
-) -> DisclosureLevel {
+) -> DisclosurePlan {
     // If explicitly requested full, give full
     if context.explicit_level.is_some() {
-        return context.explicit_level.unwrap();
+        return DisclosurePlan::Level(context.explicit_level.unwrap());
+    }
+
+    // If a token budget is specified, use packing
+    if let Some(tokens) = context.pack_budget {
+        return DisclosurePlan::Pack(TokenBudget {
+            tokens,
+            mode: context.pack_mode.unwrap_or(PackMode::Balanced),
+        });
     }
 
     // If agent has used this skill before successfully, give standard
     if context.usage_history.successful_uses > 0 {
-        return DisclosureLevel::Standard;
+        return DisclosurePlan::Level(DisclosureLevel::Standard);
     }
 
     // If remaining context budget is low, give minimal
     if context.remaining_tokens < 1000 {
-        return DisclosureLevel::Minimal;
+        return DisclosurePlan::Level(DisclosureLevel::Minimal);
     }
 
     // If this is a direct request for the skill, give full
     if context.request_type == RequestType::Direct {
-        return DisclosureLevel::Full;
+        return DisclosurePlan::Level(DisclosureLevel::Full);
     }
 
     // Default to overview for suggestions
-    DisclosureLevel::Overview
+    DisclosurePlan::Level(DisclosureLevel::Overview)
 }
+```
+
+**Disclosure Context (partial):**
+
+```rust
+pub struct DisclosureContext {
+    pub explicit_level: Option<DisclosureLevel>,
+    pub pack_budget: Option<usize>,
+    pub pack_mode: Option<PackMode>,
+    pub remaining_tokens: usize,
+    pub usage_history: UsageHistory,
+    pub request_type: RequestType,
+}
+```
+
+### 6.4 Micro-Slicing and Token Packing
+
+To maximize signal per token, ms pre-slices skills into atomic blocks (rules,
+commands, examples, pitfalls). A packer then selects the highest-utility slices
+that fit within a token budget.
+
+**Slice Generation Heuristics:**
+
+- One slice per rule, command block, example, checklist, or pitfall
+- Preserve section headings by attaching them to the first slice in the section
+- Estimate tokens per slice using a fast tokenizer heuristic
+- Assign utility score from quality signals + usage frequency + evidence coverage
+
+**Token Packer (Greedy + Coverage):**
+
+```rust
+pub fn pack_slices(index: &SkillSliceIndex, budget: TokenBudget) -> Vec<String> {
+    let mut remaining = budget.tokens;
+    let mut selected: Vec<&SkillSlice> = Vec::new();
+
+    // Always include Overview slice if it fits
+    if let Some(overview) = index.slices.iter()
+        .find(|s| matches!(s.slice_type, SliceType::Overview)) {
+        if overview.token_estimate <= remaining {
+            selected.push(overview);
+            remaining -= overview.token_estimate;
+        }
+    }
+
+    // Score slices for the selected mode
+    let mut scored: Vec<(&SkillSlice, f32)> = index.slices.iter()
+        .filter(|s| !selected.iter().any(|x| x.id == s.id))
+        .map(|s| (s, score_slice(s, budget.mode)))
+        .collect();
+
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+    for (slice, _score) in scored {
+        if slice.token_estimate > remaining {
+            continue;
+        }
+
+        // Ensure dependencies are included first
+        if !slice.requires.is_empty() {
+            let deps_ok = slice.requires.iter()
+                .all(|id| selected.iter().any(|s| &s.id == id));
+            if !deps_ok {
+                continue;
+            }
+        }
+
+        selected.push(slice);
+        remaining -= slice.token_estimate;
+        if remaining == 0 {
+            break;
+        }
+    }
+
+    selected.into_iter().map(|s| s.content.clone()).collect()
+}
+
+fn score_slice(slice: &SkillSlice, mode: PackMode) -> f32 {
+    match mode {
+        PackMode::UtilityFirst => slice.utility_score,
+        PackMode::CoverageFirst => match slice.slice_type {
+            SliceType::Rule => slice.utility_score + 0.2,
+            SliceType::Command => slice.utility_score + 0.15,
+            SliceType::Example => slice.utility_score + 0.1,
+            _ => slice.utility_score,
+        },
+        PackMode::Balanced => slice.utility_score,
+    }
+}
+```
+
+**CLI Example:**
+
+```bash
+ms load ntm --pack 800
 ```
 
 ---
@@ -3697,9 +4145,19 @@ impl Suggester {
         // Search and boost by trigger matches
         let mut results = self.searcher.search(&query, &SearchFilters::default(), 20).await?;
 
+        let pack_budget = context.pack_budget;
+
         for result in &mut results {
             if let Some(skill) = self.registry.get(&result.skill_id)? {
                 result.score *= self.trigger_boost(&skill, &signals);
+
+                if let Some(budget) = pack_budget {
+                    result.disclosure_level = "pack".into();
+                    result.pack_budget = Some(budget);
+                    result.packed_token_estimate = Some(
+                        estimate_packed_tokens(&skill.computed.slices, budget)
+                    );
+                }
             }
         }
 
@@ -3721,6 +4179,18 @@ impl Suggester {
 
         boost
     }
+}
+```
+
+**Suggestion Context (partial):**
+
+```rust
+pub struct SuggestionContext {
+    pub cwd: Option<PathBuf>,
+    pub current_file: Option<PathBuf>,
+    pub recent_commands: Vec<String>,
+    pub query: Option<String>,
+    pub pack_budget: Option<usize>,
 }
 ```
 
@@ -3779,7 +4249,7 @@ pub fn hash_embedding(text: &str, dimensions: usize) -> Vec<f32> {
 
 ### 7.4 Skill Quality Scoring Algorithm
 
-Quality scoring determines which skills are most worth surfacing to agents. This section details the multi-factor scoring algorithm.
+Quality scoring determines which skills are most worth surfacing to agents. This section details the multi-factor scoring algorithm, including provenance (evidence coverage and confidence).
 
 ```rust
 /// Comprehensive skill quality scorer
@@ -3791,21 +4261,23 @@ pub struct QualityScorer {
 /// Configurable weights for quality factors
 #[derive(Debug, Clone)]
 pub struct QualityWeights {
-    pub structure_weight: f32,      // Default: 0.20
-    pub content_weight: f32,        // Default: 0.25
-    pub effectiveness_weight: f32,  // Default: 0.30
+    pub structure_weight: f32,      // Default: 0.18
+    pub content_weight: f32,        // Default: 0.22
+    pub effectiveness_weight: f32,  // Default: 0.25
+    pub provenance_weight: f32,     // Default: 0.15
     pub freshness_weight: f32,      // Default: 0.10
-    pub popularity_weight: f32,     // Default: 0.15
+    pub popularity_weight: f32,     // Default: 0.10
 }
 
 impl Default for QualityWeights {
     fn default() -> Self {
         Self {
-            structure_weight: 0.20,
-            content_weight: 0.25,
-            effectiveness_weight: 0.30,
+            structure_weight: 0.18,
+            content_weight: 0.22,
+            effectiveness_weight: 0.25,
+            provenance_weight: 0.15,
             freshness_weight: 0.10,
-            popularity_weight: 0.15,
+            popularity_weight: 0.10,
         }
     }
 }
@@ -3837,6 +4309,9 @@ pub struct QualityFactors {
     /// Effectiveness: usage success rate, agent feedback
     pub effectiveness: f32,
 
+    /// Provenance: evidence coverage and confidence
+    pub provenance: f32,
+
     /// Freshness: recency of updates, relevance to current tools
     pub freshness: f32,
 
@@ -3850,12 +4325,14 @@ impl QualityScorer {
         let structure = self.score_structure(skill);
         let content = self.score_content(skill);
         let effectiveness = self.score_effectiveness(skill);
+        let provenance = self.score_provenance(skill);
         let freshness = self.score_freshness(skill);
         let popularity = self.score_popularity(skill);
 
         let overall = self.weights.structure_weight * structure.score
             + self.weights.content_weight * content.score
             + self.weights.effectiveness_weight * effectiveness.score
+            + self.weights.provenance_weight * provenance.score
             + self.weights.freshness_weight * freshness.score
             + self.weights.popularity_weight * popularity.score;
 
@@ -3874,6 +4351,7 @@ impl QualityScorer {
                 structure: structure.score,
                 content: content.score,
                 effectiveness: effectiveness.score,
+                provenance: provenance.score,
                 freshness: freshness.score,
                 popularity: popularity.score,
             },
@@ -3995,6 +4473,29 @@ impl QualityScorer {
         FactorResult { score: score.clamp(0.0, 1.0), issues, suggestions }
     }
 
+    /// Score provenance based on evidence coverage and confidence
+    fn score_provenance(&self, skill: &Skill) -> FactorResult {
+        let mut score = 0.5;  // Neutral if no evidence yet
+        let mut issues = vec![];
+        let mut suggestions = vec![];
+
+        let coverage = &skill.evidence.coverage;
+        if coverage.total_rules > 0 {
+            let coverage_ratio =
+                coverage.rules_with_evidence as f32 / coverage.total_rules as f32;
+            score = (0.7 * coverage_ratio) + (0.3 * coverage.avg_confidence);
+
+            if coverage_ratio < 0.7 {
+                issues.push(QualityIssue::LowEvidenceCoverage(coverage_ratio));
+                suggestions.push("Add evidence links for more rules".into());
+            }
+        } else {
+            suggestions.push("Add rule-level evidence to improve provenance".into());
+        }
+
+        FactorResult { score: score.clamp(0.0, 1.0), issues, suggestions }
+    }
+
     /// Score freshness and relevance
     fn score_freshness(&self, skill: &Skill) -> FactorResult {
         let mut score = 1.0;
@@ -4066,6 +4567,9 @@ pub enum QualityIssue {
 
     /// Conflicting guidance
     InternalConflict { section1: String, section2: String },
+
+    /// Evidence coverage too low
+    LowEvidenceCoverage(f32),
 }
 ```
 
@@ -4075,7 +4579,7 @@ pub enum QualityIssue {
 # Show quality score for a skill
 ms quality ntm
 # → Overall: 0.87 (A)
-# → Structure: 0.95 | Content: 0.90 | Effectiveness: 0.82 | Fresh: 0.85 | Popular: 0.75
+# → Structure: 0.95 | Content: 0.90 | Effectiveness: 0.82 | Provenance: 0.88 | Fresh: 0.85 | Popular: 0.75
 
 # Quality report with suggestions
 ms quality ntm --verbose
@@ -5393,6 +5897,13 @@ min_quality_score = 0.5
 # Maximum skills to suggest at once
 max_suggestions = 5
 
+[disclosure]
+# Default token budget for packed disclosure (0 = disabled)
+default_pack_budget = 800
+
+# Packing mode: balanced | utility_first | coverage_first
+default_pack_mode = "balanced"
+
 [paths]
 # Directories to scan for skills
 skill_paths = [
@@ -5427,6 +5938,25 @@ default_session_limit = 50
 
 # Minimum confidence for pattern extraction
 min_pattern_confidence = 0.6
+
+[privacy]
+# Redaction enabled for all CASS ingestion
+redaction_enabled = true
+
+# Minimum entropy for secret-like tokens
+redaction_min_entropy = 4.0
+
+# Extra regex patterns to redact (in addition to built-ins)
+redaction_patterns = [
+    "(?i)api[_-]?key\\s*[:=]\\s*[A-Za-z0-9_-]{16,}",
+    "(?i)secret\\s*[:=]\\s*[^\\s]+",
+]
+
+# Allowlist patterns that should not be redacted
+redaction_allowlist = [
+    "EXAMPLE_API_KEY",
+    "TEST_TOKEN",
+]
 
 [build]
 # Auto-save interval during interactive builds (seconds)
@@ -10251,7 +10781,73 @@ className="focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offse
 
 ---
 
-*Plan version: 1.3.0*
+## Section 28: The Brenner Method for Skill Extraction
+
+*CASS Mining Deep Dive: brenner_bot methodology (P0 bead: meta_skill-4d7)*
+
+### 28.1 Core Insight: Reverse-Engineering Cognitive Architectures
+
+The brenner_bot project provides a methodology for extracting **actionable skills** from CASS sessions. Key insight: **don't summarize—extract the generative grammar**.
+
+> "This is not a summary... It is an attempt to **reverse-engineer the cognitive architecture** that generated those contributions—to find the generative grammar of his thinking."
+
+**Application to meta_skill:** We're not looking for "what happened"—we're looking for **repeatable cognitive moves** that made work successful. These become skills.
+
+### 28.2 The Two Axioms for Skill Extraction
+
+#### Axiom 1: Effective Coding Has a Generative Grammar
+Code changes are *generated* by cognitive moves that can be identified and formalized.
+
+#### Axiom 2: Understanding = Ability to Reproduce
+A skill is valid only if you can **execute it on new problems**.
+
+### 28.3 The Brenner Loop for Skill Extraction
+
+```
+SKILL EXTRACTION LOOP (30-60 min)
+─────────────────────────────────
+A: SESSION SELECTION → 5-10 candidate sessions
+B: COGNITIVE MOVE EXTRACTION → 8-12 moves with evidence
+C: THIRD-ALTERNATIVE GUARD → filtered list with confidence
+D: SKILL FORMALIZATION → candidate SKILL.md
+E: MATERIALIZATION TEST → empirical validation
+F: CALIBRATION → documented limitations
+```
+
+### 28.4 Skill Tags (Operator Algebra)
+
+| Tag | Description |
+|-----|-------------|
+| ProblemSelection | How to pick what to work on |
+| HypothesisSlate | Explicit enumeration of approaches |
+| ThirdAlternative | Both approaches could be wrong |
+| IterativeRefinement | Multi-round improvement |
+| RuthlessKill | Abandoning failing approaches |
+| Quickie | Pilot experiments to de-risk |
+| MaterializationInstinct | "What would I see if true?" |
+| InnerTruth | The generalizable principle |
+
+### 28.5 Key Methodological Insights
+
+1. **Seven-Cycle Log Paper Test**: If improvement isn't obvious, skill needs refinement
+2. **Multi-Model Triangulation**: Extract from multiple angles, keep convergent patterns
+3. **Don't Worry Hypothesis**: Document gaps, don't block on secondary concerns
+4. **Exception Quarantine**: Collect failures first, look for patterns before patching
+
+### 28.6 Beads for Further CASS Mining
+
+| Bead | P | Topic |
+|------|---|-------|
+| meta_skill-4d7 | P0 | Inner Truth/Abstract Principles ✓ |
+| meta_skill-hzg | P1 | APR Iterative Refinement |
+| meta_skill-897 | P1 | Optimization Patterns |
+| meta_skill-z2r | P1 | Performance Profiling |
+| meta_skill-dag | P2 | Error Handling |
+| meta_skill-f8s | P2 | CI/CD Automation |
+
+---
+
+*Plan version: 1.4.0*
 *Created: 2026-01-13*
 *Updated: 2026-01-13*
 *Author: Claude Opus 4.5*
