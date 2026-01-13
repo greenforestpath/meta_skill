@@ -60,6 +60,8 @@ my-skill/
 │   └── deploy.py
 ├── references/        # Reference documents (optional)
 │   └── api-spec.yaml
+├── tests/             # Skill tests (optional)
+│   └── basic.yaml
 └── assets/            # Images, templates (optional)
     └── architecture.png
 ```
@@ -732,7 +734,8 @@ meta_skill/
 │   ├── search/
 │   │   ├── mod.rs
 │   │   ├── tantivy.rs             # Full-text indexing
-│   │   ├── embeddings.rs          # Hash-based embeddings
+│   │   ├── embeddings.rs          # Embedder trait + hash embedder
+│   │   ├── embeddings_local.rs    # Optional local ML embedder
 │   │   ├── hybrid.rs              # RRF fusion
 │   │   └── context.rs             # Context-aware ranking
 │   ├── cass/
@@ -915,8 +918,17 @@ pub struct SkillAssets {
     /// Reference documents in references/ directory
     pub references: Vec<ReferenceFile>,
 
+    /// Skill tests in tests/ directory
+    pub tests: Vec<TestFile>,
+
     /// Other assets (images, templates, etc.)
     pub assets: Vec<AssetFile>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TestFile {
+    pub path: PathBuf,
+    pub test_type: String, // yaml | json | md
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -981,6 +993,9 @@ pub struct SkillSlice {
     /// Utility score (0.0 - 1.0), computed from usage + quality
     pub utility_score: f32,
 
+    /// Coverage group id (e.g., "critical-rules", "workflow", "pitfalls")
+    pub coverage_group: Option<String>,
+
     /// Optional dependencies on other slices (by id)
     pub requires: Vec<String>,
 
@@ -1029,6 +1044,9 @@ pub struct EvidenceRef {
 
     /// Optional short excerpt for humans (redacted)
     pub excerpt: Option<String>,
+
+    /// Optional pointer to archived excerpt file
+    pub excerpt_path: Option<PathBuf>,
 
     /// Confidence for this evidence link (0.0 - 1.0)
     pub confidence: f32,
@@ -1287,7 +1305,12 @@ CREATE INDEX idx_usage_time ON skill_usage(used_at);
 │   │   │   ├── skill.spec.json
 │   │   │   ├── SKILL.md
 │   │   │   ├── evidence.json
+│   │   │   ├── evidence/
+│   │   │   │   ├── rule-1.md
+│   │   │   │   └── rule-3.md
 │   │   │   ├── slices.json
+│   │   │   ├── tests/
+│   │   │   │   └── basic.yaml
 │   │   │   └── usage-log.jsonl
 │   │   └── planning-workflow/
 │   │       ├── metadata.yaml
@@ -1590,6 +1613,7 @@ ms load ntm --level 3  # Full content
 ms load ntm --full     # Everything including assets
 ms load ntm --pack 800 # Token-budgeted slice pack
 ms load ntm --pack 800 --mode coverage_first  # Bias toward rule coverage
+ms load ntm --pack 800 --mode pitfall_safe --max-per-group 2
 ms load ntm --deps auto      # Load prerequisites at overview
 ms load ntm --deps off       # Disable dependency auto-load
 ms load ntm --deps full      # Load prerequisites at full disclosure
@@ -1602,6 +1626,7 @@ ms suggest --file src/main.rs
 ms suggest --query "how to handle async errors"
 ms suggest --pack 800  # Suggest packed slices within token budget
 ms suggest --explain   # Include signal breakdown
+ms suggest --pack 800 --mode pitfall_safe --max-per-group 2
 
 # Show skill details
 ms show ntm
@@ -1622,6 +1647,8 @@ ms resolve ntm --diff  # show section-level diffs
 ms evidence ntm
 ms evidence ntm --rule "rule-3"
 ms evidence ntm --graph  # Export provenance graph (JSON)
+ms evidence ntm --timeline  # Evidence by session chronology
+ms evidence ntm --open  # Open source excerpts (redacted)
 ```
 
 ### 4.2 Build Commands (CASS Integration)
@@ -1638,6 +1665,7 @@ ms build --from-cass "auth tokens" --redaction-report  # emit redaction report
 ms build --from-cass "api keys" --no-redact  # only if you explicitly accept risk
 ms build --from-cass "auth mistakes" --no-antipatterns  # skip counter-examples
 ms build --from-cass "error handling" --output-spec skill.spec.json
+ms build --from-cass "error handling" --min-session-quality 0.6
 
 # Resume existing build session
 ms build --resume session-abc123
@@ -1717,6 +1745,11 @@ ms stats --period week
 ms stale
 ms stale --project /data/projects/my-rust-project
 ms stale --min-severity medium
+
+# Skill tests
+ms test ntm
+ms test ntm --report junit
+ms test --all
 ```
 
 ### 4.5 Robot Mode (Comprehensive Specification)
@@ -2272,6 +2305,7 @@ compdef _ms ms
 │  │  - Redact secrets/PII (emit redaction report)                          │ │
 │  │  - Extract tool calls, code blocks, user feedback                     │ │
 │  │  - Identify success/failure signals                                   │ │
+│  │  - Score session quality and drop low-signal sessions                  │ │
 │  └───────────────────────────────────────────────────────────────────────┘ │
 │                                      │                                      │
 │                                      ▼                                      │
@@ -2415,6 +2449,9 @@ pub struct CassClient {
 
     /// CASS data directory
     data_dir: PathBuf,
+
+    /// Session fingerprint cache
+    fingerprint_cache: FingerprintCache,
 }
 
 impl CassClient {
@@ -2439,6 +2476,25 @@ impl CassClient {
         serde_json::from_slice(&output.stdout).map_err(Into::into)
     }
 
+    /// Incremental scan: only return sessions not seen or changed
+    pub async fn incremental_sessions(&self) -> Result<Vec<SessionMatch>> {
+        let output = Command::new(&self.cass_bin)
+            .args(["search", "*", "--robot", "--limit", "10000"])
+            .output()
+            .await?;
+
+        let results: CassSearchResults = serde_json::from_slice(&output.stdout)?;
+        let mut delta = Vec::new();
+
+        for m in results.matches {
+            if self.fingerprint_cache.is_new_or_changed(&m.session_id, &m.content_hash) {
+                delta.push(m);
+            }
+        }
+
+        Ok(delta)
+    }
+
     /// Get capabilities and schema
     pub async fn capabilities(&self) -> Result<CassCapabilities> {
         let output = Command::new(&self.cass_bin)
@@ -2447,6 +2503,22 @@ impl CassClient {
             .await?;
 
         serde_json::from_slice(&output.stdout).map_err(Into::into)
+    }
+}
+
+/// Cache of session fingerprints to avoid reprocessing
+pub struct FingerprintCache {
+    db: Connection,
+}
+
+impl FingerprintCache {
+    pub fn is_new_or_changed(&self, session_id: &str, hash: &str) -> bool {
+        // Compare against cached hash
+        unimplemented!()
+    }
+
+    pub fn update(&self, session_id: &str, hash: &str) -> Result<()> {
+        unimplemented!()
     }
 }
 ```
@@ -4292,6 +4364,20 @@ pub struct ProvEdge {
     pub weight: f32,     // evidence confidence
     pub reason: String,  // short description
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvidenceTimeline {
+    pub rule_id: String,
+    pub items: Vec<TimelineItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimelineItem {
+    pub session_id: String,
+    pub occurred_at: DateTime<Utc>,
+    pub excerpt_path: Option<PathBuf>,
+    pub confidence: f32,
+}
 ```
 
 **CLI Examples:**
@@ -4305,6 +4391,8 @@ ms evidence nextjs-accessibility --rule "rule-7"
 
 # Export the provenance graph
 ms evidence nextjs-accessibility --graph --format json
+ms evidence nextjs-accessibility --timeline
+ms evidence nextjs-accessibility --open
 ```
 
 ### 5.13 Redaction and Privacy Guard
@@ -4478,6 +4566,59 @@ ms uncertainties resolve UNK-123 --mine "react mount state sync"
 ms build --resolve-uncertainties
 ```
 
+### 5.16 Session Quality Scoring
+
+Not all sessions are equally useful. ms scores sessions for signal quality and
+filters out low-quality transcripts before pattern extraction.
+
+**Session Quality Model:**
+
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionQuality {
+    pub session_id: String,
+    pub score: f32,
+    pub signals: Vec<String>,
+}
+
+impl SessionQuality {
+    /// Compute a quality score from observed signals
+    pub fn compute(session: &Session) -> Self {
+        let mut score = 0.0;
+        let mut signals = Vec::new();
+
+        // Positive signals
+        if session.has_tests_passed() {
+            score += 0.25; signals.push("tests_passed".into());
+        }
+        if session.has_clear_resolution() {
+            score += 0.25; signals.push("clear_resolution".into());
+        }
+        if session.has_code_changes() {
+            score += 0.15; signals.push("code_changes".into());
+        }
+        if session.has_user_confirmation() {
+            score += 0.15; signals.push("user_confirmed".into());
+        }
+
+        // Negative signals
+        if session.has_backtracking() {
+            score -= 0.10; signals.push("backtracking".into());
+        }
+        if session.is_abandoned() {
+            score -= 0.20; signals.push("abandoned".into());
+        }
+
+        Self { session_id: session.id.clone(), score: score.clamp(0.0, 1.0), signals }
+    }
+}
+```
+
+**Usage:**
+- Default threshold: `cass.min_session_quality`
+- Use `--min-session-quality` to override per build
+- Marked sessions (exemplary) get a quality bonus
+
 ---
 
 ## 6. Progressive Disclosure System
@@ -4597,6 +4738,7 @@ pub enum DisclosurePlan {
 pub struct TokenBudget {
     pub tokens: usize,
     pub mode: PackMode,
+    pub max_per_group: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -4604,6 +4746,7 @@ pub enum PackMode {
     Balanced,
     UtilityFirst,
     CoverageFirst,
+    PitfallSafe,
 }
 ```
 
@@ -4625,6 +4768,7 @@ pub fn optimal_disclosure(
         return DisclosurePlan::Pack(TokenBudget {
             tokens,
             mode: context.pack_mode.unwrap_or(PackMode::Balanced),
+            max_per_group: context.max_per_group.unwrap_or(2),
         });
     }
 
@@ -4655,6 +4799,7 @@ pub struct DisclosureContext {
     pub explicit_level: Option<DisclosureLevel>,
     pub pack_budget: Option<usize>,
     pub pack_mode: Option<PackMode>,
+    pub max_per_group: Option<usize>,
     pub remaining_tokens: usize,
     pub usage_history: UsageHistory,
     pub request_type: RequestType,
@@ -4680,6 +4825,7 @@ that fit within a token budget.
 pub fn pack_slices(index: &SkillSliceIndex, budget: TokenBudget) -> Vec<String> {
     let mut remaining = budget.tokens;
     let mut selected: Vec<&SkillSlice> = Vec::new();
+    let mut group_counts: HashMap<String, usize> = HashMap::new();
 
     // Always include Overview slice if it fits
     if let Some(overview) = index.slices.iter()
@@ -4703,6 +4849,13 @@ pub fn pack_slices(index: &SkillSliceIndex, budget: TokenBudget) -> Vec<String> 
             continue;
         }
 
+        if let Some(group) = &slice.coverage_group {
+            let count = *group_counts.get(group).unwrap_or(&0);
+            if count >= budget.max_per_group {
+                continue;
+            }
+        }
+
         // Ensure dependencies are included first
         if !slice.requires.is_empty() {
             let deps_ok = slice.requires.iter()
@@ -4714,12 +4867,29 @@ pub fn pack_slices(index: &SkillSliceIndex, budget: TokenBudget) -> Vec<String> 
 
         selected.push(slice);
         remaining -= slice.token_estimate;
+        if let Some(group) = &slice.coverage_group {
+            *group_counts.entry(group.clone()).or_insert(0) += 1;
+        }
         if remaining == 0 {
             break;
         }
     }
 
     selected.into_iter().map(|s| s.content.clone()).collect()
+}
+
+fn estimate_packed_tokens_with_constraints(
+    index: &SkillSliceIndex,
+    budget: usize,
+    mode: PackMode,
+    max_per_group: usize,
+) -> usize {
+    let packed = pack_slices(index, TokenBudget {
+        tokens: budget,
+        mode,
+        max_per_group,
+    });
+    packed.iter().map(|s| estimate_tokens(s)).sum()
 }
 
 fn score_slice(slice: &SkillSlice, mode: PackMode) -> f32 {
@@ -4729,6 +4899,11 @@ fn score_slice(slice: &SkillSlice, mode: PackMode) -> f32 {
             SliceType::Rule => slice.utility_score + 0.2,
             SliceType::Command => slice.utility_score + 0.15,
             SliceType::Example => slice.utility_score + 0.1,
+            _ => slice.utility_score,
+        },
+        PackMode::PitfallSafe => match slice.slice_type {
+            SliceType::Pitfall => slice.utility_score + 0.25,
+            SliceType::Rule => slice.utility_score + 0.1,
             _ => slice.utility_score,
         },
         PackMode::Balanced => slice.utility_score,
@@ -4838,6 +5013,8 @@ impl Suggester {
         let mut results = self.searcher.search(&query, &SearchFilters::default(), 20).await?;
 
         let pack_budget = context.pack_budget;
+        let pack_mode = context.pack_mode;
+        let max_per_group = context.max_per_group;
         let explain = context.explain;
 
         for result in &mut results {
@@ -4858,7 +5035,12 @@ impl Suggester {
                     result.disclosure_level = "pack".into();
                     result.pack_budget = Some(budget);
                     result.packed_token_estimate = Some(
-                        estimate_packed_tokens(&skill.computed.slices, budget)
+                        estimate_packed_tokens_with_constraints(
+                            &skill.computed.slices,
+                            budget,
+                            pack_mode.unwrap_or(PackMode::Balanced),
+                            max_per_group.unwrap_or(2),
+                        )
                     );
                 }
             }
@@ -4922,6 +5104,8 @@ pub struct SuggestionContext {
     pub query: Option<String>,
     pub pack_budget: Option<usize>,
     pub explain: bool,
+    pub pack_mode: Option<PackMode>,
+    pub max_per_group: Option<usize>,
 }
 ```
 
@@ -4978,6 +5162,44 @@ pub fn hash_embedding(text: &str, dimensions: usize) -> Vec<f32> {
 }
 ```
 
+### 7.3.1 Pluggable Embedding Backends
+
+Hash embeddings are the default (fast, deterministic, zero dependencies). For
+higher semantic fidelity, ms supports an optional local ML embedder.
+
+```rust
+pub trait Embedder {
+    fn embed(&self, text: &str) -> Vec<f32>;
+    fn dims(&self) -> usize;
+}
+
+pub struct HashEmbedder {
+    pub dims: usize,
+}
+
+impl Embedder for HashEmbedder {
+    fn embed(&self, text: &str) -> Vec<f32> {
+        hash_embedding(text, self.dims)
+    }
+    fn dims(&self) -> usize { self.dims }
+}
+
+pub struct LocalMlEmbedder;
+
+impl Embedder for LocalMlEmbedder {
+    fn embed(&self, text: &str) -> Vec<f32> {
+        // Optional feature: local model inference
+        unimplemented!()
+    }
+    fn dims(&self) -> usize { 384 }
+}
+```
+
+**Selection Rules:**
+- Default: `HashEmbedder`
+- If `embeddings.backend = "local"` and model available → `LocalMlEmbedder`
+- Fallback to hash if local model missing
+
 ### 7.4 Skill Quality Scoring Algorithm
 
 Quality scoring determines which skills are most worth surfacing to agents. This section details the multi-factor scoring algorithm, including provenance (evidence coverage and confidence).
@@ -4998,6 +5220,7 @@ pub struct QualityWeights {
     pub content_weight: f32,        // Default: 0.22
     pub effectiveness_weight: f32,  // Default: 0.25
     pub provenance_weight: f32,     // Default: 0.15
+    pub safety_weight: f32,         // Default: 0.05
     pub freshness_weight: f32,      // Default: 0.10
     pub popularity_weight: f32,     // Default: 0.10
 }
@@ -5009,8 +5232,9 @@ impl Default for QualityWeights {
             content_weight: 0.22,
             effectiveness_weight: 0.25,
             provenance_weight: 0.15,
+            safety_weight: 0.05,
             freshness_weight: 0.10,
-            popularity_weight: 0.10,
+            popularity_weight: 0.05,
         }
     }
 }
@@ -5045,6 +5269,9 @@ pub struct QualityFactors {
     /// Provenance: evidence coverage and confidence
     pub provenance: f32,
 
+    /// Safety: presence and coverage of anti-patterns and pitfalls
+    pub safety: f32,
+
     /// Freshness: recency of updates, relevance to current tools
     pub freshness: f32,
 
@@ -5059,6 +5286,7 @@ impl QualityScorer {
         let content = self.score_content(skill);
         let effectiveness = self.score_effectiveness(skill);
         let provenance = self.score_provenance(skill);
+        let safety = self.score_safety(skill);
         let freshness = self.score_freshness(skill);
         let popularity = self.score_popularity(skill);
 
@@ -5066,6 +5294,7 @@ impl QualityScorer {
             + self.weights.content_weight * content.score
             + self.weights.effectiveness_weight * effectiveness.score
             + self.weights.provenance_weight * provenance.score
+            + self.weights.safety_weight * safety.score
             + self.weights.freshness_weight * freshness.score
             + self.weights.popularity_weight * popularity.score;
 
@@ -5085,6 +5314,7 @@ impl QualityScorer {
                 content: content.score,
                 effectiveness: effectiveness.score,
                 provenance: provenance.score,
+                safety: safety.score,
                 freshness: freshness.score,
                 popularity: popularity.score,
             },
@@ -5229,6 +5459,24 @@ impl QualityScorer {
         FactorResult { score: score.clamp(0.0, 1.0), issues, suggestions }
     }
 
+    /// Score safety based on anti-pattern and pitfall coverage
+    fn score_safety(&self, skill: &Skill) -> FactorResult {
+        let mut score = 0.5;  // Neutral if no data
+        let mut issues = vec![];
+        let mut suggestions = vec![];
+
+        let pitfall_count = count_pitfalls(&skill.body);
+        if pitfall_count == 0 {
+            score -= 0.2;
+            issues.push(QualityIssue::MissingAntiPatterns);
+            suggestions.push("Add an 'Avoid / When NOT to use' section".into());
+        } else if pitfall_count >= 2 {
+            score += 0.2;
+        }
+
+        FactorResult { score: score.clamp(0.0, 1.0), issues, suggestions }
+    }
+
     /// Score freshness and relevance
     fn score_freshness(&self, skill: &Skill) -> FactorResult {
         let mut score = 1.0;
@@ -5325,6 +5573,9 @@ pub enum QualityIssue {
 
     /// Skill is incompatible with the project's toolchain versions
     ToolchainMismatch { tool: String, skill_range: String, project_version: String },
+
+    /// No anti-patterns/pitfalls present
+    MissingAntiPatterns,
 }
 ```
 
@@ -5334,7 +5585,7 @@ pub enum QualityIssue {
 # Show quality score for a skill
 ms quality ntm
 # → Overall: 0.87 (A)
-# → Structure: 0.95 | Content: 0.90 | Effectiveness: 0.82 | Provenance: 0.88 | Fresh: 0.85 | Popular: 0.75
+# → Structure: 0.95 | Content: 0.90 | Effectiveness: 0.82 | Provenance: 0.88 | Safety: 0.70 | Fresh: 0.85 | Popular: 0.75
 
 # Quality report with suggestions
 ms quality ntm --verbose
@@ -6660,8 +6911,11 @@ max_suggestions = 5
 # Default token budget for packed disclosure (0 = disabled)
 default_pack_budget = 800
 
-# Packing mode: balanced | utility_first | coverage_first
+# Packing mode: balanced | utility_first | coverage_first | pitfall_safe
 default_pack_mode = "balanced"
+
+# Max slices per coverage group (anti-bloat)
+default_max_per_group = 2
 
 [dependencies]
 # Auto-load prerequisites on ms load (auto resolves order)
@@ -6731,6 +6985,13 @@ rrf_k = 60.0
 # Embedding dimensions
 embedding_dims = 384
 
+[embeddings]
+# Backend: hash | local
+backend = "hash"
+
+# Optional local model path (if backend=local)
+model_path = "~/.local/share/ms/models/embeddings.onnx"
+
 [cass]
 # Path to CASS binary
 binary = "cass"
@@ -6740,6 +7001,9 @@ default_session_limit = 50
 
 # Minimum confidence for pattern extraction
 min_pattern_confidence = 0.6
+
+# Minimum session quality score (0.0 - 1.0)
+min_session_quality = 0.5
 
 [uncertainty]
 # Enable uncertainty queue for low-confidence generalizations
@@ -7042,6 +7306,8 @@ panic = "abort"
 | Black box | Transparent algorithm |
 
 The hash embedding approach from xf provides 80-90% of ML embedding quality for skill matching, with none of the operational complexity.
+For teams that need higher semantic fidelity, ms supports an **optional local ML embedder**
+that is still offline and fully opt-in.
 
 ### 13.2 Why SQLite + Git Dual Persistence
 
@@ -7113,6 +7379,7 @@ Fully automated mode (`--auto`) is available for pipelines, but interactive is t
 | **Multi-agent coordination** | Skill assignment to agent swarms | P2 |
 | **Semantic versioning** | Track skill changes, migrations | P3 |
 | **Skill testing** | Validate skills against example scenarios | P3 |
+| **Skill bounties** | Prioritize requests with credits/bounties | P3 |
 
 ### 14.2 Integration Points
 
@@ -7960,6 +8227,36 @@ jobs:
         run: cargo insta test --check
 ```
 
+### 18.9 Skill Tests
+
+Skills can include executable tests to validate correctness. Tests are stored
+under `tests/` and run via `ms test`.
+
+**Test Format (YAML):**
+
+```yaml
+# tests/basic.yaml
+name: "basic"
+skill: "rust-error-handling"
+steps:
+  - load_skill: { level: "standard" }
+  - run: "cargo test -q"
+  - assert:
+      contains: ["error context"]
+```
+
+**Runner Contract:**
+- `load_skill` injects the selected disclosure
+- `run` executes a command or script
+- `assert` checks stdout/stderr patterns or file outputs
+
+**CLI:**
+
+```bash
+ms test rust-error-handling
+ms test --all --report junit
+```
+
 ---
 
 ## 19. Skill Templates Library
@@ -8691,6 +8988,23 @@ impl AgentMailClient {
         ).await
     }
 
+    /// Announce a bounty for a requested skill
+    pub async fn announce_bounty(
+        &self,
+        topic: &str,
+        bounty: SkillRequestBounty,
+    ) -> Result<()> {
+        self.broadcast_message(
+            "skill-bounty",
+            json!({
+                "topic": topic,
+                "bounty": bounty.amount,
+                "currency": bounty.currency,
+                "requester": self.agent_name,
+            }),
+        ).await
+    }
+
     /// Announce skill completion
     pub async fn announce_skill_ready(
         &self,
@@ -8786,6 +9100,13 @@ pub enum SkillRequestUrgency {
     Critical,
 }
 
+/// Optional bounty for skill requests
+#[derive(Debug, Clone)]
+pub struct SkillRequestBounty {
+    pub amount: u32,
+    pub currency: String, // e.g., "credits"
+}
+
 impl SkillRequestUrgency {
     fn to_importance(&self) -> &'static str {
         match self {
@@ -8850,6 +9171,9 @@ ms build --guided --topic "error handling" --no-coordinate
 ms request "database migration patterns" --urgency blocking
 # → Request sent to 5 agents
 # → Waiting for responses...
+
+# Request with bounty (prioritize & reward)
+ms request "deployment workflow" --urgency blocking --bounty 200
 
 # Check skill requests from other agents
 ms inbox --requests
@@ -10172,6 +10496,44 @@ pub struct CoverageAnalyzer {
     search: HybridSearcher,
 }
 
+/// Knowledge graph for patterns and skills
+pub struct KnowledgeGraph {
+    pub nodes: Vec<GraphNode>,
+    pub edges: Vec<GraphEdge>,
+}
+
+#[derive(Debug, Clone)]
+pub struct GraphNode {
+    pub id: String,
+    pub node_type: NodeType,
+    pub label: String,
+    pub tags: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub enum NodeType {
+    Skill,
+    Pattern,
+    Topic,
+    TechStack,
+}
+
+#[derive(Debug, Clone)]
+pub struct GraphEdge {
+    pub from: String,
+    pub to: String,
+    pub relation: EdgeRelation,
+    pub weight: f32,
+}
+
+#[derive(Debug, Clone)]
+pub enum EdgeRelation {
+    AppliesTo,
+    DerivedFrom,
+    ConflictsWith,
+    SimilarTo,
+}
+
 impl CoverageAnalyzer {
     /// Find topics with sessions but no skills
     pub async fn find_gaps(&self) -> Result<Vec<CoverageGap>> {
@@ -10258,6 +10620,47 @@ impl CoverageAnalyzer {
 
         priority.clamp(0.0, 1.0)
     }
+
+    /// Build knowledge graph for coverage and discovery
+    pub async fn build_graph(&self) -> Result<KnowledgeGraph> {
+        let mut graph = KnowledgeGraph { nodes: vec![], edges: vec![] };
+
+        // Add skills as nodes
+        for skill in self.skill_registry.all_skills()? {
+            graph.nodes.push(GraphNode {
+                id: skill.id.clone(),
+                node_type: NodeType::Skill,
+                label: skill.metadata.name.clone(),
+                tags: skill.metadata.tags.clone(),
+            });
+        }
+
+        // Add edges from skills to topics (from tags)
+        let skills: Vec<_> = graph.nodes.iter()
+            .filter(|n| matches!(n.node_type, NodeType::Skill))
+            .cloned()
+            .collect();
+
+        for node in skills {
+            for tag in &node.tags {
+                let topic_id = format!("topic:{}", tag);
+                graph.nodes.push(GraphNode {
+                    id: topic_id.clone(),
+                    node_type: NodeType::Topic,
+                    label: tag.clone(),
+                    tags: vec![],
+                });
+                graph.edges.push(GraphEdge {
+                    from: node.id.clone(),
+                    to: topic_id,
+                    relation: EdgeRelation::AppliesTo,
+                    weight: 0.5,
+                });
+            }
+        }
+
+        Ok(graph)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -10324,6 +10727,10 @@ ms analyze cross-project --min-projects 3
 
 # Build skill from cross-project patterns
 ms build --from-universal "error handling"
+
+# Build or export knowledge graph
+ms graph build
+ms graph export --format json
 ```
 
 ---
@@ -12008,7 +12415,7 @@ Every operation creates artifacts:
 | meta_skill-4d7 | P0 | Inner Truth/Abstract Principles | ✓ Complete |
 | meta_skill-hzg | P1 | APR Iterative Refinement | ✓ Complete |
 | meta_skill-897 | P1 | Optimization Patterns | Pending |
-| meta_skill-z2r | P1 | Performance Profiling | Pending |
+| meta_skill-z2r | P1 | Performance Profiling | ✓ Complete |
 | meta_skill-aku | P1 | Security Vulnerability Assessment | Pending |
 | meta_skill-dag | P2 | Error Handling | Pending |
 | meta_skill-f8s | P2 | CI/CD Automation | Pending |
@@ -12018,9 +12425,407 @@ Every operation creates artifacts:
 | meta_skill-cbx | P2 | Testing Patterns | Pending |
 | meta_skill-6st | P2 | REST API Design | Pending |
 
+## Section 30: Performance Profiling Patterns
+
+*Source: CASS mining of local coding agent sessions - performance analysis workflows*
+
+### 30.1 Introduction
+
+Performance profiling is critical for building efficient CLI tools. This section synthesizes patterns from real-world performance optimization sessions, covering methodology, tooling, benchmarking, and specific optimization techniques.
+
+### 30.2 Performance Analysis Methodology
+
+A comprehensive performance analysis examines multiple dimensions:
+
+#### Hot Path Identification
+Focus analysis on the most frequently executed code:
+- Query execution and caching
+- Vector/similarity search operations
+- Full-text index operations
+- I/O pipelines (indexing, storage)
+- Database operations
+- Parser/connector code
+
+#### Inefficiency Pattern Checklist
+
+| Pattern | Description | Detection |
+|---------|-------------|-----------|
+| **N+1 Queries** | Fetching in loops | Profile shows repeated DB calls |
+| **Unnecessary Allocations** | `String::new()`, `Vec::new()` in hot loops | Heap profiling |
+| **Repeated Serialization** | serde overhead in loops | CPU profiling |
+| **Linear Scans** | O(n) where hash/binary search works | Code review |
+| **Lock Contention** | Mutex/RwLock blocking | Contention profiling |
+| **Unbounded Collections** | Growing without limits | Memory profiling |
+| **Missing Early Termination** | No short-circuiting | Code review |
+| **Redundant Computation** | Same calculation repeated | Memoization analysis |
+| **String Operations** | Could use interning | Allocation profiling |
+| **Iterator Overhead** | Intermediate collections | Inspect `.collect()` calls |
+| **Cache Misses** | Poor memory locality | `perf stat` cache metrics |
+
+### 30.3 Algorithm and Data Structure Opportunities
+
+#### Data Structure Upgrades
+
+| Current | Opportunity | Use Case |
+|---------|-------------|----------|
+| HashMap | Trie | Prefix operations, autocomplete |
+| Linear scan | Bloom filter | Fast negative lookups |
+| Range queries | Interval tree | Time-range filtering |
+| LRU cache | ARC/LFU | Frequency-biased caching |
+| Deduplication | Union-find | Graph-based dedup |
+| Cumulative ops | Prefix sums | Running totals |
+| Sorting | Priority queue | Top-K selection |
+
+#### Top-K Selection Strategies
+
+```rust
+// For small K relative to N, use a min-heap
+use std::collections::BinaryHeap;
+
+// For larger K, consider quickselect (O(n) average)
+// Rust's select_nth_unstable is quickselect-based
+let mut data = vec![...];
+data.select_nth_unstable_by(k, |a, b| b.cmp(a));
+let top_k = &data[..k];
+```
+
+### 30.4 SIMD and Vectorization
+
+#### Memory Layout Considerations
+
+| Layout | Description | SIMD Friendly |
+|--------|-------------|---------------|
+| **AoS** | Array of Structs: `[{x,y,z}, {x,y,z}]` | ❌ Poor |
+| **SoA** | Struct of Arrays: `{xs: [], ys: [], zs: []}` | ✅ Excellent |
+
+```rust
+// SoA for SIMD-friendly vector operations
+struct VectorIndex {
+    xs: Vec<f32>,  // Contiguous x components
+    ys: Vec<f32>,  // Contiguous y components
+    zs: Vec<f32>,  // Contiguous z components
+}
+```
+
+#### SIMD Dot Product Pattern
+
+```rust
+use wide::f32x8;
+
+pub fn dot_product_simd(a: &[f32], b: &[f32]) -> f32 {
+    let chunks = a.len() / 8;
+    let mut sum = f32x8::ZERO;
+    
+    for i in 0..chunks {
+        let va = f32x8::from(&a[i * 8..][..8]);
+        let vb = f32x8::from(&b[i * 8..][..8]);
+        sum += va * vb;
+    }
+    
+    let mut result: f32 = sum.reduce_add();
+    
+    // Handle remainder
+    for i in (chunks * 8)..a.len() {
+        result += a[i] * b[i];
+    }
+    
+    result
+}
+```
+
+#### Quantization (F16 Storage)
+
+```rust
+use half::f16;
+
+// Store as F16 for 50% memory reduction
+fn quantize_vector(v: &[f32]) -> Vec<f16> {
+    v.iter().map(|&x| f16::from_f32(x)).collect()
+}
+
+// Dequantize for computation
+fn dequantize_vector(v: &[f16]) -> Vec<f32> {
+    v.iter().map(|x| x.to_f32()).collect()
+}
+```
+
+### 30.5 Criterion Benchmark Patterns
+
+#### Basic Benchmark Structure
+
+```rust
+use criterion::{black_box, criterion_group, criterion_main, Criterion, BatchSize};
+
+fn bench_operation(c: &mut Criterion) {
+    // Setup that runs once
+    let data = setup_test_data();
+    
+    c.bench_function("operation_name", |b| {
+        b.iter(|| {
+            // black_box prevents compiler from optimizing away the result
+            black_box(expensive_operation(black_box(&data)))
+        })
+    });
+}
+
+criterion_group!(benches, bench_operation);
+criterion_main!(benches);
+```
+
+#### Batched Benchmarks (Setup/Teardown Separation)
+
+```rust
+c.bench_function("operation_with_setup", |b| {
+    b.iter_batched(
+        || {
+            // Setup: runs before each batch
+            create_fresh_state()
+        },
+        |state| {
+            // Benchmark: only this is measured
+            operate_on_state(state)
+        },
+        BatchSize::SmallInput,  // or LargeInput for expensive setup
+    );
+});
+```
+
+#### Benchmark Groups for Comparison
+
+```rust
+fn bench_scaling(c: &mut Criterion) {
+    let mut group = c.benchmark_group("search_scaling");
+    group.sample_size(20);  // Fewer samples for expensive operations
+    
+    for size in [100, 500, 1000, 5000] {
+        let data = setup_data(size);
+        group.bench_with_input(
+            format!("size_{}", size),
+            &data,
+            |b, d| b.iter(|| search(black_box(d)))
+        );
+    }
+    
+    group.finish();
+}
+```
+
+#### Parallel vs Sequential Comparison
+
+```rust
+use rayon::prelude::*;
+
+fn bench_parallelization(c: &mut Criterion) {
+    let mut group = c.benchmark_group("parallel_vs_sequential");
+    let data = setup_data();
+    
+    group.bench_function("sequential", |b| {
+        b.iter(|| {
+            let result: Vec<_> = data.iter()
+                .map(|x| process(x))
+                .collect();
+            black_box(result)
+        })
+    });
+    
+    group.bench_function("parallel", |b| {
+        b.iter(|| {
+            let result: Vec<_> = data.par_iter()
+                .map(|x| process(x))
+                .collect();
+            black_box(result)
+        })
+    });
+    
+    group.finish();
+}
+```
+
+### 30.6 Profiling Build Configuration
+
+#### Cargo Profile for Profiling
+
+```toml
+# Cargo.toml - optimized build with debug symbols for profilers
+[profile.profiling]
+inherits = "release"
+debug = true        # Keep debug symbols
+strip = false       # Don't strip symbols
+
+# Build with frame pointers for accurate flamegraphs
+# RUSTFLAGS="-C force-frame-pointers=yes" cargo build --profile profiling
+```
+
+#### Profiling Workflow
+
+```bash
+# 1. Build with profiling profile
+RUSTFLAGS="-C force-frame-pointers=yes" cargo build --profile profiling
+
+# 2. Run with perf (Linux)
+perf record -g ./target/profiling/mybinary --some-args
+
+# 3. Generate flamegraph
+perf script | stackcollapse-perf.pl | flamegraph.pl > flame.svg
+
+# 4. Or use cargo-flamegraph
+cargo flamegraph --profile profiling -- --some-args
+```
+
+### 30.7 I/O and Serialization Optimization
+
+#### Memory-Mapped Files
+
+```rust
+use memmap2::Mmap;
+use std::fs::File;
+
+fn mmap_read(path: &Path) -> Result<Mmap> {
+    let file = File::open(path)?;
+    // SAFETY: file is read-only, no concurrent modifications
+    unsafe { Mmap::map(&file) }
+}
+
+// Benefits:
+// - OS handles caching
+// - Zero-copy access
+// - Lazy loading (only touched pages loaded)
+```
+
+#### JSON Parsing Optimization
+
+```rust
+// Avoid: parsing entire file upfront
+let data: Vec<Record> = serde_json::from_reader(file)?;
+
+// Better: streaming/lazy parsing
+use serde_json::Deserializer;
+let stream = Deserializer::from_reader(file).into_iter::<Record>();
+for record in stream {
+    process(record?);
+}
+```
+
+### 30.8 Cache Design Patterns
+
+#### LRU Cache with TTL
+
+```rust
+use lru::LruCache;
+use std::time::{Duration, Instant};
+
+struct TtlCache<K, V> {
+    cache: LruCache<K, (V, Instant)>,
+    ttl: Duration,
+}
+
+impl<K: Hash + Eq, V: Clone> TtlCache<K, V> {
+    fn get(&mut self, key: &K) -> Option<V> {
+        if let Some((value, inserted)) = self.cache.get(key) {
+            if inserted.elapsed() < self.ttl {
+                return Some(value.clone());
+            }
+            // Expired - will be evicted on next insert
+        }
+        None
+    }
+    
+    fn insert(&mut self, key: K, value: V) {
+        self.cache.put(key, (value, Instant::now()));
+    }
+}
+```
+
+#### Fast Hash for Cache Keys
+
+```rust
+use fxhash::FxHashMap;
+
+// FxHash is faster than std HashMap for small keys
+// Good for cache keys, NOT for untrusted input (no DoS protection)
+let cache: FxHashMap<String, Vec<u8>> = FxHashMap::default();
+```
+
+### 30.9 Parallel Processing Patterns
+
+#### Rayon Work-Stealing
+
+```rust
+use rayon::prelude::*;
+
+// Automatic work-stealing parallel iterator
+let results: Vec<_> = items
+    .par_iter()
+    .filter(|x| expensive_filter(x))
+    .map(|x| expensive_transform(x))
+    .collect();
+
+// Control thread pool size
+rayon::ThreadPoolBuilder::new()
+    .num_threads(4)
+    .build_global()
+    .unwrap();
+```
+
+#### Chunked Processing
+
+```rust
+// Process in chunks to balance parallelism overhead
+const CHUNK_SIZE: usize = 1000;
+
+let results: Vec<_> = items
+    .par_chunks(CHUNK_SIZE)
+    .flat_map(|chunk| {
+        chunk.iter()
+            .map(|x| process(x))
+            .collect::<Vec<_>>()
+    })
+    .collect();
+```
+
+### 30.10 Application to meta_skill
+
+| Pattern | Application |
+|---------|-------------|
+| **Hot Path Analysis** | Profile skill extraction, template rendering, search operations |
+| **SIMD** | Vectorize embedding comparisons for semantic skill matching |
+| **Criterion Benchmarks** | Measure extraction throughput, template performance |
+| **Memory-Mapped Files** | Large session file processing |
+| **LRU Cache** | Cache parsed sessions, rendered templates |
+| **Parallel Processing** | Batch skill extraction across multiple sessions |
+| **Profiling Profile** | Enable flamegraph generation for performance debugging |
+
+### 30.11 Benchmark Results Reference
+
+Real-world improvements observed in CASS codebase:
+
+| Optimization | Before | After | Improvement |
+|--------------|--------|-------|-------------|
+| Sequential → Parallel search | ~63-135ms | ~2.04ms | **30-50x** |
+| Scalar → SIMD dot product | baseline | faster | **4-8x** (typical) |
+| HashMap → FxHashMap | baseline | faster | **10-30%** (small keys) |
+| String → &str where possible | allocating | zero-copy | **significant** |
+
+### 30.12 Profiling Checklist
+
+Before optimization:
+- [ ] Establish baseline measurements with criterion
+- [ ] Identify actual hot paths (don't guess)
+- [ ] Profile under realistic workloads
+
+During optimization:
+- [ ] Make one change at a time
+- [ ] Measure after each change
+- [ ] Verify correctness with tests
+
+After optimization:
+- [ ] Document the improvement with benchmarks
+- [ ] Add regression tests if performance is critical
+- [ ] Consider adding benchmark to CI
+
 ---
 
-*Plan version: 1.5.0*
+*Plan version: 1.6.0*
 *Created: 2026-01-13*
 *Updated: 2026-01-13*
 *Author: Claude Opus 4.5*
