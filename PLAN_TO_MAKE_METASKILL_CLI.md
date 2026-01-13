@@ -1285,6 +1285,13 @@ CREATE TABLE tx_log (
     created_at TEXT NOT NULL
 );
 
+-- CASS session fingerprints for incremental processing
+CREATE TABLE cass_fingerprints (
+    session_id TEXT PRIMARY KEY,
+    content_hash TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
 -- Indexes
 CREATE INDEX idx_skills_name ON skills(name);
 CREATE INDEX idx_skills_modified ON skills(modified_at);
@@ -1597,6 +1604,7 @@ ms index
 ms index --path /data/projects/agent_flywheel_clawdbot_skills_and_integrations
 ms index --all  # Re-index everything
 ms index --watch  # Watch for changes (daemon mode)
+ms index --cass-incremental  # Only process new/changed sessions
 
 # Search for skills
 ms search "git workflow"
@@ -2295,6 +2303,7 @@ compdef _ms ms
 │  ┌───────────────────────────────────────────────────────────────────────┐ │
 │  │  ms calls: cass search "error handling in rust" --robot --limit 50    │ │
 │  │  Returns: Session metadata, file paths, relevance scores              │ │
+│  │  Incremental mode: only sessions with new hashes are processed         │ │
 │  └───────────────────────────────────────────────────────────────────────┘ │
 │                                      │                                      │
 │                                      ▼                                      │
@@ -7004,6 +7013,9 @@ min_pattern_confidence = 0.6
 
 # Minimum session quality score (0.0 - 1.0)
 min_session_quality = 0.5
+
+# Incremental session scan (uses fingerprint cache)
+incremental_scan = true
 
 [uncertainty]
 # Enable uncertainty queue for low-confidence generalizations
