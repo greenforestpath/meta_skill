@@ -1772,6 +1772,7 @@ ms update  # Install update if available
 ms doctor
 ms doctor --fix  # Attempt auto-fixes
 ms doctor --check=transactions
+ms doctor --check=security
 
 # Configuration
 ms config show
@@ -2133,6 +2134,12 @@ pub enum HealthStatus {
 │  ☐ Prompt-injection filter enabled                                         │
 │  ☐ Quarantine directory writable                                           │
 │  ☐ No high-severity injection findings in last N builds                    │
+│                                                                             │
+│ SECURITY                                                                    │
+│  ☐ Bundle signature verification enabled                                   │
+│  ☐ Update signature verification enabled                                   │
+│  ☐ Trusted signer keys available                                           │
+│  ☐ No unsigned bundles installed (unless explicitly allowed)               │
 │                                                                             │
 │ GIT ARCHIVE                                                                 │
 │  ☐ Archive directory exists                                                │
@@ -6867,6 +6874,14 @@ pub struct Updater {
     binary_name: String,
 }
 
+pub struct UpdateInfo {
+    pub version: Version,
+    pub download_url: Option<String>,
+    pub release_notes: Option<String>,
+    pub checksum_url: Option<String>,
+    pub signature_url: Option<String>,
+}
+
 impl Updater {
     /// Check for new release on GitHub
     pub async fn check(&self) -> Result<Option<UpdateInfo>> {
@@ -6885,6 +6900,13 @@ impl Updater {
                 a.name.contains(std::env::consts::ARCH)
             });
 
+            let signature_url = asset.and_then(|asset| {
+                let sig_name = format!("{}.sig", asset.name);
+                response.assets.iter()
+                    .find(|a| a.name == sig_name)
+                    .map(|a| a.browser_download_url.clone())
+            });
+
             Ok(Some(UpdateInfo {
                 version: latest,
                 download_url: asset.map(|a| a.browser_download_url.clone()),
@@ -6892,6 +6914,7 @@ impl Updater {
                 checksum_url: response.assets.iter()
                     .find(|a| a.name.ends_with(".sha256"))
                     .map(|a| a.browser_download_url.clone()),
+                signature_url,
             }))
         } else {
             Ok(None)
@@ -6899,7 +6922,11 @@ impl Updater {
     }
 
     /// Download and install update
-    pub async fn install(&self, info: &UpdateInfo) -> Result<()> {
+    pub async fn install(
+        &self,
+        info: &UpdateInfo,
+        security: &SecurityConfig,
+    ) -> Result<()> {
         let download_url = info.download_url.as_ref()
             .ok_or_else(|| anyhow!("No binary for this platform"))?;
 
@@ -6916,6 +6943,15 @@ impl Updater {
                 return Err(anyhow!("Checksum mismatch!"));
             }
             println!("✓ Checksum verified");
+        }
+
+        // Verify signature if enabled
+        if security.verify_updates {
+            let signature_url = info.signature_url.as_ref()
+                .ok_or_else(|| anyhow!("Missing signature for update"))?;
+            let signature = reqwest::get(signature_url).await?.bytes().await?;
+            verify_ed25519_signature(&binary, &signature, &security.trusted_keys)?;
+            println!("✓ Signature verified");
         }
 
         // Replace current binary
@@ -6984,12 +7020,19 @@ jobs:
           cp target/${{ matrix.target }}/release/ms ${{ matrix.artifact }}
           sha256sum ${{ matrix.artifact }} > ${{ matrix.artifact }}.sha256
 
+      - name: Sign
+        run: |
+          echo "${{ secrets.MS_SIGNING_KEY_PEM }}" > /tmp/ms_ed25519.pem
+          openssl pkeyutl -sign -inkey /tmp/ms_ed25519.pem -rawin \
+            -in ${{ matrix.artifact }} -out ${{ matrix.artifact }}.sig
+
       - name: Upload
         uses: softprops/action-gh-release@v2
         with:
           files: |
             ${{ matrix.artifact }}
             ${{ matrix.artifact }}.sha256
+            ${{ matrix.artifact }}.sig
 ```
 
 ---
@@ -7160,7 +7203,10 @@ quarantine_dir = "~/.local/share/ms/quarantine"
 # Verify bundle signatures on install/update
 verify_bundles = true
 
-# Trusted signer public keys
+# Verify ms self-update signatures
+verify_updates = true
+
+# Trusted signer public keys (bundles + updates)
 trusted_keys = [
     "~/.config/ms/keys/dicklesworthstone.pub",
 ]
@@ -13015,7 +13061,7 @@ After optimization:
 
 ---
 
-*Plan version: 1.7.0*
+*Plan version: 1.8.0*
 *Created: 2026-01-13*
 *Updated: 2026-01-13*
 *Author: Claude Opus 4.5*
@@ -14103,3 +14149,1047 @@ After optimization:
 - [ ] Add regression benchmark
 - [ ] Document the optimization for future maintainers
 - [ ] Consider if optimization adds complexity worth the gain
+
+## Section 32: Security Vulnerability Assessment Patterns
+
+*Source: CASS mining from security audits and vulnerability assessments across multiple codebases*
+
+This section captures systematic security vulnerability assessment methodologies and specific security patterns discovered through CASS analysis of real-world security work.
+
+### 32.1 Security Audit Methodology Framework
+
+#### Systematic Security Review Process
+
+```rust
+/// Security audit phases
+enum AuditPhase {
+    /// Phase 1: Identify attack surface
+    AttackSurfaceMapping,
+    /// Phase 2: Review each vulnerability category
+    CategoryReview,
+    /// Phase 3: Validate findings with PoC
+    Validation,
+    /// Phase 4: Risk assessment and prioritization
+    RiskAssessment,
+    /// Phase 5: Remediation recommendations
+    Remediation,
+}
+
+/// Vulnerability severity classification
+enum Severity {
+    Critical,  // Remote code execution, auth bypass, data breach
+    High,      // Privilege escalation, significant data exposure
+    Medium,    // Information disclosure, limited impact
+    Low,       // Minor issues, defense in depth improvements
+}
+
+/// Security finding structure
+struct SecurityFinding {
+    title: String,
+    severity: Severity,
+    file_path: String,
+    line_number: usize,
+    description: String,
+    proof_of_concept: Option<String>,
+    recommendation: String,
+    cwe_id: Option<u32>,  // Common Weakness Enumeration
+}
+```
+
+#### Attack Surface Mapping Checklist
+
+```markdown
+## Attack Surface Categories
+
+### 1. Network Boundaries
+- [ ] Public-facing endpoints (HTTP/HTTPS)
+- [ ] Internal APIs and services
+- [ ] WebSocket connections
+- [ ] Database connections
+- [ ] External service integrations
+
+### 2. User Input Entry Points
+- [ ] Form submissions
+- [ ] URL parameters (query strings, path params)
+- [ ] HTTP headers (especially X-Forwarded-*, Authorization)
+- [ ] File uploads
+- [ ] API request bodies (JSON, XML)
+- [ ] Command-line arguments
+- [ ] Environment variables
+
+### 3. Authentication Boundaries
+- [ ] Login flows (OAuth, password, MFA)
+- [ ] Session management (cookies, tokens)
+- [ ] API key validation
+- [ ] Service-to-service auth
+
+### 4. Data Storage
+- [ ] Database queries (SQL, NoSQL)
+- [ ] File system access
+- [ ] Cache storage (Redis, Memcached)
+- [ ] Browser storage (localStorage, sessionStorage)
+
+### 5. Process Boundaries
+- [ ] Command execution
+- [ ] Child process spawning
+- [ ] Inter-process communication
+```
+
+### 32.2 OWASP-Aligned Vulnerability Categories
+
+#### A01: Broken Access Control
+
+```rust
+/// Access control verification pattern
+pub fn verify_authorization(
+    user: &User,
+    resource: &Resource,
+    action: Action,
+) -> Result<(), AuthError> {
+    // 1. Verify user is authenticated
+    if !user.is_authenticated() {
+        return Err(AuthError::NotAuthenticated);
+    }
+    
+    // 2. Check resource ownership or explicit permission
+    let has_access = match resource.access_type {
+        AccessType::Owner => resource.owner_id == user.id,
+        AccessType::SharedWith => resource.shared_with.contains(&user.id),
+        AccessType::Public => true,
+        AccessType::RoleBased => user.roles.iter()
+            .any(|role| resource.allowed_roles.contains(role)),
+    };
+    
+    if !has_access {
+        return Err(AuthError::Forbidden);
+    }
+    
+    // 3. Verify action is permitted
+    if !resource.allowed_actions.contains(&action) {
+        return Err(AuthError::ActionNotPermitted);
+    }
+    
+    Ok(())
+}
+
+// Anti-pattern: Direct object reference without authorization
+// BAD: let doc = db.get_document(user_provided_id)?;
+// GOOD: let doc = db.get_document_for_user(user_provided_id, current_user.id)?;
+```
+
+#### A02: Cryptographic Failures
+
+```rust
+use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+use aes_gcm::aead::Aead;
+use argon2::{Argon2, PasswordHasher};
+use rand::rngs::OsRng;
+
+/// Secure password hashing with Argon2id
+pub fn hash_password(password: &str) -> Result<String, CryptoError> {
+    let salt = argon2::password_hash::SaltString::generate(&mut OsRng);
+    
+    // Argon2id with recommended parameters
+    let argon2 = Argon2::new(
+        argon2::Algorithm::Argon2id,  // Memory-hard, GPU-resistant
+        argon2::Version::V0x13,
+        argon2::Params::new(
+            65536,  // 64 MB memory
+            3,      // 3 iterations
+            4,      // 4 lanes parallelism
+            Some(32), // 32-byte output
+        )?,
+    );
+    
+    let hash = argon2.hash_password(password.as_bytes(), &salt)?;
+    Ok(hash.to_string())
+}
+
+/// Secure encryption with AES-256-GCM
+pub fn encrypt_data(
+    key: &[u8; 32],
+    plaintext: &[u8],
+    aad: &[u8],  // Additional authenticated data
+) -> Result<Vec<u8>, CryptoError> {
+    let cipher = Aes256Gcm::new_from_slice(key)?;
+    
+    // Generate random nonce (CRITICAL: must be unique per encryption)
+    let mut nonce_bytes = [0u8; 12];
+    OsRng.fill_bytes(&mut nonce_bytes);
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    
+    let ciphertext = cipher.encrypt(nonce, aes_gcm::aead::Payload {
+        msg: plaintext,
+        aad,
+    })?;
+    
+    // Prepend nonce to ciphertext
+    let mut result = nonce_bytes.to_vec();
+    result.extend(ciphertext);
+    Ok(result)
+}
+
+// CRITICAL: Nonce derivation anti-pattern
+// BAD: XOR-based nonce derivation (can cause collisions)
+fn bad_derive_nonce(base: &[u8; 12], counter: u32) -> [u8; 12] {
+    let mut nonce = *base;
+    let idx_bytes = counter.to_be_bytes();
+    for i in 0..4 {
+        nonce[8 + i] ^= idx_bytes[i];  // XOR is NOT collision-resistant!
+    }
+    nonce
+}
+
+// GOOD: Counter-based nonce derivation
+fn good_derive_nonce(base: &[u8; 12], counter: u32) -> [u8; 12] {
+    let mut nonce = *base;
+    // Direct assignment of counter in big-endian
+    nonce[8..12].copy_from_slice(&counter.to_be_bytes());
+    nonce
+}
+```
+
+#### A03: Injection
+
+```rust
+/// SQL injection prevention with parameterized queries
+pub fn get_user_by_email(conn: &Connection, email: &str) -> Result<User, DbError> {
+    // GOOD: Parameterized query
+    conn.query_row(
+        "SELECT id, email, name FROM users WHERE email = ?1",
+        [email],
+        |row| Ok(User {
+            id: row.get(0)?,
+            email: row.get(1)?,
+            name: row.get(2)?,
+        }),
+    )
+}
+
+// BAD: String interpolation (SQL injection vulnerable)
+// let query = format!("SELECT * FROM users WHERE email = '{}'", email);
+
+/// Command injection prevention
+pub fn safe_execute_command(
+    allowed_commands: &[&str],
+    command: &str,
+    args: &[&str],
+) -> Result<Output, SecurityError> {
+    // 1. Whitelist validation
+    if !allowed_commands.contains(&command) {
+        return Err(SecurityError::CommandNotAllowed(command.to_string()));
+    }
+    
+    // 2. Argument validation (no shell metacharacters)
+    for arg in args {
+        if arg.contains(|c: char| ";&|`$(){}[]<>\\\"'".contains(c)) {
+            return Err(SecurityError::InvalidArgument(arg.to_string()));
+        }
+    }
+    
+    // 3. Use execve-style execution (no shell)
+    Command::new(command)
+        .args(args)
+        .output()
+        .map_err(|e| SecurityError::ExecutionFailed(e))
+}
+
+/// Shell argument escaping (when shell is unavoidable)
+pub fn escape_shell_arg(arg: &str) -> String {
+    // Single-quote escaping: replace ' with '\''
+    format!("'{}'", arg.replace('\'', "'\\''"))
+}
+```
+
+#### A04: Insecure Design
+
+```rust
+/// Secure session management
+pub struct SecureSession {
+    /// Random session ID (cryptographically secure)
+    id: [u8; 32],
+    /// User identifier
+    user_id: Uuid,
+    /// Creation timestamp
+    created_at: DateTime<Utc>,
+    /// Expiration timestamp
+    expires_at: DateTime<Utc>,
+    /// Last activity timestamp
+    last_activity: DateTime<Utc>,
+    /// IP address (for anomaly detection)
+    ip_address: IpAddr,
+    /// User agent fingerprint
+    user_agent_hash: [u8; 32],
+}
+
+impl SecureSession {
+    pub fn new(user_id: Uuid, ip: IpAddr, user_agent: &str) -> Self {
+        let mut id = [0u8; 32];
+        OsRng.fill_bytes(&mut id);
+        
+        let now = Utc::now();
+        Self {
+            id,
+            user_id,
+            created_at: now,
+            expires_at: now + Duration::hours(24),  // Configurable
+            last_activity: now,
+            ip_address: ip,
+            user_agent_hash: sha256(user_agent.as_bytes()),
+        }
+    }
+    
+    pub fn validate(&self, ip: IpAddr, user_agent: &str) -> Result<(), SessionError> {
+        // Check expiration
+        if Utc::now() > self.expires_at {
+            return Err(SessionError::Expired);
+        }
+        
+        // Detect session hijacking (IP or user agent change)
+        if self.ip_address != ip {
+            log::warn!("Session IP mismatch: {} vs {}", self.ip_address, ip);
+            // Consider: require re-authentication for sensitive operations
+        }
+        
+        if self.user_agent_hash != sha256(user_agent.as_bytes()) {
+            log::warn!("Session user agent mismatch");
+        }
+        
+        Ok(())
+    }
+}
+```
+
+#### A05: Security Misconfiguration
+
+```rust
+/// Security configuration validation
+pub struct SecurityConfig {
+    /// CORS allowed origins
+    cors_origins: Vec<String>,
+    /// Rate limiting configuration
+    rate_limit: RateLimitConfig,
+    /// TLS configuration
+    tls: TlsConfig,
+    /// Secret management
+    secrets: SecretsConfig,
+}
+
+impl SecurityConfig {
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        // Validate CORS is not too permissive
+        if self.cors_origins.contains(&"*".to_string()) {
+            return Err(ConfigError::InsecureCors(
+                "Wildcard CORS is dangerous in production".into()
+            ));
+        }
+        
+        // Validate rate limiting is enabled
+        if self.rate_limit.requests_per_minute == 0 {
+            return Err(ConfigError::NoRateLimiting);
+        }
+        
+        // Validate TLS is enforced
+        if !self.tls.enforce_https {
+            log::warn!("HTTPS enforcement is disabled");
+        }
+        
+        // Validate secrets are not hardcoded
+        for (name, value) in &self.secrets.values {
+            if value.len() < 32 {
+                log::warn!("Secret '{}' may be weak (length < 32)", name);
+            }
+        }
+        
+        Ok(())
+    }
+}
+
+// Environment variable security
+pub fn load_secret(name: &str) -> Result<String, ConfigError> {
+    std::env::var(name).map_err(|_| {
+        ConfigError::MissingSecret(format!(
+            "Required secret '{}' not found in environment", name
+        ))
+    })
+}
+```
+
+### 32.3 Input Validation Patterns
+
+#### Path Traversal Prevention
+
+```rust
+use std::path::{Path, PathBuf, Component};
+
+/// Validate path is within allowed directory
+pub fn validate_path(base_dir: &Path, user_path: &str) -> Result<PathBuf, PathError> {
+    // 1. Reject absolute paths
+    if Path::new(user_path).is_absolute() {
+        return Err(PathError::AbsolutePathNotAllowed);
+    }
+    
+    // 2. Normalize and check for traversal attempts
+    let requested = base_dir.join(user_path);
+    let canonical = requested.canonicalize()
+        .map_err(|_| PathError::InvalidPath)?;
+    
+    // 3. Verify path is still within base directory
+    if !canonical.starts_with(base_dir) {
+        return Err(PathError::TraversalAttempt);
+    }
+    
+    // 4. Additional check: reject suspicious components
+    for component in Path::new(user_path).components() {
+        match component {
+            Component::ParentDir => {
+                return Err(PathError::ParentDirNotAllowed);
+            }
+            Component::Normal(s) => {
+                let s = s.to_string_lossy();
+                // Reject hidden files and common bypass attempts
+                if s.starts_with('.') || s.contains('\0') {
+                    return Err(PathError::SuspiciousComponent(s.into()));
+                }
+            }
+            _ => {}
+        }
+    }
+    
+    Ok(canonical)
+}
+
+/// Sanitize filename for safe storage
+pub fn sanitize_filename(name: &str) -> String {
+    name.chars()
+        .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_' || *c == '.')
+        .take(255)  // Max filename length
+        .collect()
+}
+```
+
+#### XSS Prevention
+
+```rust
+/// HTML entity escaping for output encoding
+pub fn escape_html(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    for c in input.chars() {
+        match c {
+            '&' => output.push_str("&amp;"),
+            '<' => output.push_str("&lt;"),
+            '>' => output.push_str("&gt;"),
+            '"' => output.push_str("&quot;"),
+            '\'' => output.push_str("&#x27;"),
+            '/' => output.push_str("&#x2F;"),
+            _ => output.push(c),
+        }
+    }
+    output
+}
+
+/// Content Security Policy header generation
+pub fn csp_header() -> String {
+    vec![
+        "default-src 'self'",
+        "script-src 'self' 'strict-dynamic'",
+        "style-src 'self' 'unsafe-inline'",  // Consider nonces for inline styles
+        "img-src 'self' data: https:",
+        "font-src 'self'",
+        "connect-src 'self'",
+        "frame-ancestors 'none'",
+        "base-uri 'self'",
+        "form-action 'self'",
+    ].join("; ")
+}
+
+/// Sanitize user-generated HTML (whitelist approach)
+pub fn sanitize_html(input: &str) -> String {
+    let allowed_tags = ["p", "br", "b", "i", "u", "a", "ul", "ol", "li"];
+    let allowed_attrs = [("a", "href")];
+    
+    // Use a proper HTML sanitizer library like ammonia in production
+    // This is a simplified example
+    ammonia::Builder::default()
+        .tags(allowed_tags.iter().cloned())
+        .tag_attributes(allowed_attrs.iter().cloned().collect())
+        .clean(input)
+        .to_string()
+}
+```
+
+### 32.4 Authentication Security Patterns
+
+#### JWT Token Management
+
+```rust
+use jsonwebtoken::{encode, decode, Header, Validation, EncodingKey, DecodingKey};
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AccessTokenClaims {
+    /// Subject (user ID)
+    pub sub: String,
+    /// Email
+    pub email: String,
+    /// User tier/role
+    pub tier: String,
+    /// Token type
+    pub r#type: String,  // "access"
+    /// Issuer
+    pub iss: String,
+    /// Audience
+    pub aud: String,
+    /// Issued at
+    pub iat: i64,
+    /// Expiration
+    pub exp: i64,
+}
+
+/// Generate access token with secure defaults
+pub fn generate_access_token(
+    user: &User,
+    secret: &[u8],
+    issuer: &str,
+    audience: &str,
+) -> Result<String, TokenError> {
+    let now = Utc::now().timestamp();
+    let claims = AccessTokenClaims {
+        sub: user.id.to_string(),
+        email: user.email.clone(),
+        tier: user.tier.clone(),
+        r#type: "access".to_string(),
+        iss: issuer.to_string(),
+        aud: audience.to_string(),
+        iat: now,
+        exp: now + 86400,  // 24 hours
+    };
+    
+    encode(
+        &Header::default(),  // HS256
+        &claims,
+        &EncodingKey::from_secret(secret),
+    ).map_err(|e| TokenError::EncodingFailed(e.to_string()))
+}
+
+/// Validate access token with strict checks
+pub fn validate_access_token(
+    token: &str,
+    secret: &[u8],
+    issuer: &str,
+    audience: &str,
+) -> Result<AccessTokenClaims, TokenError> {
+    let mut validation = Validation::default();
+    validation.set_issuer(&[issuer]);
+    validation.set_audience(&[audience]);
+    validation.set_required_spec_claims(&["sub", "exp", "iat", "iss", "aud"]);
+    
+    let token_data = decode::<AccessTokenClaims>(
+        token,
+        &DecodingKey::from_secret(secret),
+        &validation,
+    ).map_err(|e| TokenError::ValidationFailed(e.to_string()))?;
+    
+    // Additional type check
+    if token_data.claims.r#type != "access" {
+        return Err(TokenError::WrongTokenType);
+    }
+    
+    Ok(token_data.claims)
+}
+
+/// Token refresh with rotation
+pub struct TokenPair {
+    pub access_token: String,
+    pub refresh_token: String,
+    pub refresh_token_id: Uuid,
+}
+
+pub fn refresh_tokens(
+    old_refresh_token: &str,
+    secret: &[u8],
+    db: &Database,
+) -> Result<TokenPair, TokenError> {
+    // 1. Validate old refresh token
+    let claims = validate_refresh_token(old_refresh_token, secret)?;
+    
+    // 2. Check if refresh token is in database (not revoked)
+    let token_hash = sha256(claims.token_id.as_bytes());
+    if !db.is_refresh_token_valid(&token_hash)? {
+        // Token was revoked - possible token theft, invalidate all user sessions
+        db.revoke_all_user_tokens(claims.sub)?;
+        return Err(TokenError::TokenRevoked);
+    }
+    
+    // 3. Generate new token pair (rotation)
+    let new_refresh_id = Uuid::new_v4();
+    let new_pair = generate_token_pair(&claims.sub, secret, new_refresh_id)?;
+    
+    // 4. Revoke old refresh token, store new one
+    db.revoke_refresh_token(&token_hash)?;
+    db.store_refresh_token(&sha256(new_refresh_id.as_bytes()), &claims.sub)?;
+    
+    Ok(new_pair)
+}
+```
+
+#### OAuth Security
+
+```rust
+/// OAuth callback URL validation
+pub fn validate_redirect_url(url: &str, allowed_origins: &[&str]) -> Result<Url, OAuthError> {
+    let parsed = Url::parse(url)
+        .map_err(|_| OAuthError::InvalidRedirectUrl)?;
+    
+    // 1. Reject non-HTTPS (except localhost for development)
+    if parsed.scheme() != "https" && parsed.host_str() != Some("localhost") {
+        return Err(OAuthError::InsecureRedirect);
+    }
+    
+    // 2. Check against allowed origins
+    let origin = format!("{}://{}", parsed.scheme(), parsed.host_str().unwrap_or(""));
+    if !allowed_origins.contains(&origin.as_str()) {
+        return Err(OAuthError::UnauthorizedOrigin);
+    }
+    
+    // 3. Reject protocol-relative URLs
+    if url.starts_with("//") {
+        return Err(OAuthError::ProtocolRelativeUrl);
+    }
+    
+    Ok(parsed)
+}
+
+/// PKCE (Proof Key for Code Exchange) implementation
+pub struct PkceChallenge {
+    pub code_verifier: String,
+    pub code_challenge: String,
+    pub code_challenge_method: String,
+}
+
+impl PkceChallenge {
+    pub fn generate() -> Self {
+        // Generate 43-128 character code verifier
+        let mut verifier_bytes = [0u8; 32];
+        OsRng.fill_bytes(&mut verifier_bytes);
+        let code_verifier = base64_url_encode(&verifier_bytes);
+        
+        // SHA256 hash for S256 method
+        let challenge_hash = sha256(code_verifier.as_bytes());
+        let code_challenge = base64_url_encode(&challenge_hash);
+        
+        Self {
+            code_verifier,
+            code_challenge,
+            code_challenge_method: "S256".to_string(),
+        }
+    }
+    
+    pub fn verify(verifier: &str, challenge: &str) -> bool {
+        let computed = base64_url_encode(&sha256(verifier.as_bytes()));
+        // Constant-time comparison to prevent timing attacks
+        constant_time_compare(computed.as_bytes(), challenge.as_bytes())
+    }
+}
+```
+
+### 32.5 Rate Limiting and DoS Protection
+
+#### IP-Based Rate Limiting
+
+```rust
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
+use parking_lot::Mutex;
+
+pub struct RateLimiter {
+    limits: Mutex<HashMap<String, RateLimitEntry>>,
+    max_requests: u32,
+    window: Duration,
+    max_entries: usize,  // Prevent memory exhaustion
+}
+
+struct RateLimitEntry {
+    count: u32,
+    window_start: Instant,
+}
+
+impl RateLimiter {
+    pub fn check(&self, key: &str) -> Result<(), RateLimitError> {
+        let mut limits = self.limits.lock();
+        let now = Instant::now();
+        
+        // Cleanup expired entries periodically
+        if limits.len() > self.max_entries {
+            limits.retain(|_, entry| {
+                now.duration_since(entry.window_start) < self.window
+            });
+        }
+        
+        let entry = limits.entry(key.to_string()).or_insert(RateLimitEntry {
+            count: 0,
+            window_start: now,
+        });
+        
+        // Reset window if expired
+        if now.duration_since(entry.window_start) >= self.window {
+            entry.count = 0;
+            entry.window_start = now;
+        }
+        
+        entry.count += 1;
+        
+        if entry.count > self.max_requests {
+            Err(RateLimitError::Exceeded {
+                retry_after: self.window - now.duration_since(entry.window_start),
+            })
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// Secure IP extraction (don't trust X-Forwarded-For blindly)
+pub fn extract_client_ip(
+    request: &Request,
+    trusted_proxies: &[IpAddr],
+) -> IpAddr {
+    // 1. Get connection IP
+    let conn_ip = request.connection_info().realip_remote_addr()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+    
+    // 2. Only trust X-Forwarded-For if from trusted proxy
+    if trusted_proxies.contains(&conn_ip) {
+        if let Some(xff) = request.headers().get("X-Forwarded-For") {
+            if let Ok(xff_str) = xff.to_str() {
+                // Take last IP before trusted proxy
+                let ips: Vec<&str> = xff_str.split(',')
+                    .map(|s| s.trim())
+                    .collect();
+                for ip in ips.iter().rev() {
+                    if let Ok(parsed) = ip.parse::<IpAddr>() {
+                        if !trusted_proxies.contains(&parsed) {
+                            return parsed;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    conn_ip
+}
+```
+
+#### ReDoS (Regex Denial of Service) Protection
+
+```rust
+use regex::Regex;
+use std::time::Duration;
+
+/// Safe regex execution with timeout
+pub struct SafeRegex {
+    inner: Regex,
+    max_input_len: usize,
+}
+
+impl SafeRegex {
+    pub fn new(pattern: &str, max_input_len: usize) -> Result<Self, RegexError> {
+        // Use regex crate which has built-in protections against catastrophic backtracking
+        let inner = Regex::new(pattern)?;
+        Ok(Self { inner, max_input_len })
+    }
+    
+    pub fn is_match(&self, text: &str) -> bool {
+        // Reject oversized inputs
+        if text.len() > self.max_input_len {
+            return false;
+        }
+        self.inner.is_match(text)
+    }
+}
+
+// Anti-pattern: Vulnerable regex patterns
+// BAD: (a+)+     - Nested quantifiers
+// BAD: (a|a)+    - Overlapping alternatives with quantifiers
+// BAD: (.*a.*)+  - Greedy with backtracking
+```
+
+### 32.6 Secret Management
+
+#### Environment Variable Security
+
+```rust
+use zeroize::Zeroize;
+
+/// Secure secret loading with zeroization
+#[derive(Zeroize)]
+#[zeroize(drop)]
+pub struct Secret(String);
+
+impl Secret {
+    pub fn from_env(name: &str) -> Result<Self, SecretError> {
+        let value = std::env::var(name)
+            .map_err(|_| SecretError::NotFound(name.to_string()))?;
+        
+        // Remove from environment after loading (defense in depth)
+        std::env::remove_var(name);
+        
+        Ok(Self(value))
+    }
+    
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Secret validation at startup
+pub fn validate_required_secrets(names: &[&str]) -> Result<(), ConfigError> {
+    let mut missing = Vec::new();
+    
+    for name in names {
+        if std::env::var(name).is_err() {
+            missing.push(*name);
+        }
+    }
+    
+    if !missing.is_empty() {
+        return Err(ConfigError::MissingSecrets(missing));
+    }
+    
+    Ok(())
+}
+```
+
+#### API Key Best Practices
+
+```rust
+// ANTI-PATTERN: Secret in URL (logged by proxies, browsers, servers)
+// BAD:
+async fn bad_api_call() {
+    let url = format!(
+        "https://api.example.com/data?api_key={}",
+        api_secret  // SECRET IN URL - DANGEROUS!
+    );
+    reqwest::get(&url).await?;
+}
+
+// GOOD: Secret in header
+async fn good_api_call(api_secret: &str) -> Result<Response, Error> {
+    let client = reqwest::Client::new();
+    client.get("https://api.example.com/data")
+        .header("Authorization", format!("Bearer {}", api_secret))
+        .send()
+        .await
+}
+
+// GOOD: Use environment-specific secrets
+pub struct ApiClient {
+    base_url: String,
+    secret: Secret,
+}
+
+impl ApiClient {
+    pub fn from_env() -> Result<Self, ConfigError> {
+        Ok(Self {
+            base_url: std::env::var("API_BASE_URL")?,
+            secret: Secret::from_env("API_SECRET")?,
+        })
+    }
+}
+```
+
+### 32.7 Command Execution Security
+
+#### Safe Command Execution Patterns
+
+```rust
+use std::process::{Command, Stdio};
+
+/// Whitelist-based command execution
+pub struct CommandExecutor {
+    allowed_commands: HashSet<String>,
+    allowed_cwd: PathBuf,
+}
+
+impl CommandExecutor {
+    pub fn execute(
+        &self,
+        command: &str,
+        args: &[&str],
+        cwd: Option<&Path>,
+    ) -> Result<Output, SecurityError> {
+        // 1. Validate command is whitelisted
+        if !self.allowed_commands.contains(command) {
+            return Err(SecurityError::CommandNotWhitelisted(command.to_string()));
+        }
+        
+        // 2. Validate working directory
+        let working_dir = cwd.unwrap_or(&self.allowed_cwd);
+        if !working_dir.starts_with(&self.allowed_cwd) {
+            return Err(SecurityError::InvalidWorkingDirectory);
+        }
+        
+        // 3. Validate arguments (no shell metacharacters)
+        for arg in args {
+            self.validate_argument(arg)?;
+        }
+        
+        // 4. Execute without shell
+        Command::new(command)
+            .args(args)
+            .current_dir(working_dir)
+            .stdin(Stdio::null())  // Prevent stdin attacks
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(|e| SecurityError::ExecutionFailed(e.to_string()))
+    }
+    
+    fn validate_argument(&self, arg: &str) -> Result<(), SecurityError> {
+        // Reject shell metacharacters
+        let forbidden = ['|', ';', '&', '$', '`', '(', ')', '{', '}', 
+                         '[', ']', '<', '>', '\\', '"', '\'', '\n', '\r'];
+        
+        for c in arg.chars() {
+            if forbidden.contains(&c) {
+                return Err(SecurityError::ForbiddenCharacter(c));
+            }
+        }
+        
+        // Reject null bytes
+        if arg.contains('\0') {
+            return Err(SecurityError::NullByteInArgument);
+        }
+        
+        Ok(())
+    }
+}
+
+/// Heredoc analysis for embedded script detection
+pub fn analyze_heredoc(content: &str) -> Vec<SecurityWarning> {
+    let mut warnings = Vec::new();
+    
+    // Detect embedded scripts
+    let script_patterns = [
+        (r"python\s+-c", "Embedded Python code"),
+        (r"node\s+-e", "Embedded Node.js code"),
+        (r"ruby\s+-e", "Embedded Ruby code"),
+        (r"perl\s+-e", "Embedded Perl code"),
+        (r"\$\(.*\)", "Command substitution"),
+        (r"`.*`", "Backtick command substitution"),
+    ];
+    
+    for (pattern, description) in script_patterns {
+        if Regex::new(pattern).unwrap().is_match(content) {
+            warnings.push(SecurityWarning {
+                severity: Severity::High,
+                description: description.to_string(),
+            });
+        }
+    }
+    
+    warnings
+}
+```
+
+### 32.8 Security Audit Report Template
+
+```markdown
+## Security Audit Report
+
+### Executive Summary
+[Brief overview of findings: X critical, Y high, Z medium, W low severity issues]
+
+---
+
+### Critical Vulnerabilities
+
+#### 1. [Title] (CRITICAL)
+**File:** `path/to/file.rs` (Line XXX)
+
+**Issue:** [Description of the vulnerability]
+
+**Code:**
+```rust
+// Vulnerable code snippet
+```
+
+**Proof of Concept:**
+[Steps to exploit or demonstrate the issue]
+
+**Recommendation:**
+```rust
+// Fixed code snippet
+```
+
+**CWE Reference:** CWE-XXX
+
+---
+
+### High Severity Issues
+[Similar format]
+
+---
+
+### Medium Severity Issues
+[Similar format]
+
+---
+
+### Low Severity Issues
+[Similar format]
+
+---
+
+### Security Strengths
+- ✓ [Positive finding 1]
+- ✓ [Positive finding 2]
+
+---
+
+### Recommendations Summary
+
+| Priority | Issue | Effort |
+|----------|-------|--------|
+| P0 | [Critical fix] | Low |
+| P1 | [High fix] | Medium |
+| P2 | [Medium fix] | Low |
+
+---
+
+### Compliance Notes
+- [ ] OWASP Top 10 coverage
+- [ ] CWE coverage
+- [ ] Industry standard alignment
+```
+
+### 32.9 Application to meta_skill
+
+| Security Area | Application |
+|---------------|-------------|
+| **Input Validation** | Validate skill file paths, template inputs, user queries |
+| **Path Traversal** | Protect skill repository access, session file access |
+| **Command Injection** | Safe execution of skill commands, template rendering |
+| **Secret Management** | API keys for external services, embedding model credentials |
+| **Authentication** | User sessions for skill customization (if applicable) |
+| **Rate Limiting** | Prevent abuse of skill extraction endpoints |
+| **Crypto** | Secure storage of user preferences, session encryption |
+
+### 32.10 Security Checklist
+
+Before deployment:
+- [ ] All user inputs validated and sanitized
+- [ ] SQL queries parameterized (no string interpolation)
+- [ ] Command execution whitelisted and argument-validated
+- [ ] Path traversal attacks prevented
+- [ ] XSS outputs properly escaped
+- [ ] Secrets loaded from environment, not hardcoded
+- [ ] Rate limiting implemented on public endpoints
+- [ ] Authentication tokens properly validated
+- [ ] HTTPS enforced in production
+- [ ] Security headers configured (CSP, HSTS, X-Frame-Options)
+- [ ] Error messages don't leak sensitive information
+- [ ] Logging doesn't include secrets or PII
+- [ ] Dependencies scanned for known vulnerabilities
+
