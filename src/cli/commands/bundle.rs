@@ -1,16 +1,17 @@
 //! ms bundle - Manage skill bundles
 
-use std::collections::HashSet;
-use std::path::{PathBuf};
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 
 use clap::{Args, Subcommand};
 
 use crate::app::AppContext;
-use crate::bundler::{Bundle, BundleInfo, BundleManifest, BundledSkill};
 use crate::bundler::github::{download_bundle, download_url, publish_bundle, GitHubConfig};
 use crate::bundler::install::{install as install_bundle, InstallReport};
-use crate::error::{MsError, Result};
+use crate::bundler::local_safety::{detect_modifications, ModificationStatus, SkillModificationReport};
+use crate::bundler::{Bundle, BundleInfo, BundleManifest, BundledSkill};
 use crate::cli::output::emit_json;
+use crate::error::{MsError, Result};
 
 #[derive(Args, Debug)]
 pub struct BundleArgs {
@@ -28,6 +29,8 @@ pub enum BundleCommand {
     Install(BundleInstallArgs),
     /// List installed bundles
     List,
+    /// Check for local modifications and conflicts
+    Conflicts(BundleConflictsArgs),
 }
 
 #[derive(Args, Debug)]
@@ -108,6 +111,25 @@ pub struct BundleInstallArgs {
     pub asset_name: Option<String>,
 }
 
+#[derive(Args, Debug)]
+pub struct BundleConflictsArgs {
+    /// Skill to check (default: all installed skills)
+    #[arg(long)]
+    pub skill: Option<String>,
+
+    /// Bundle to check against (default: detect from installed bundles)
+    #[arg(long)]
+    pub bundle: Option<String>,
+
+    /// Show only modified files
+    #[arg(long)]
+    pub modified_only: bool,
+
+    /// Show detailed diff information
+    #[arg(long)]
+    pub diff: bool,
+}
+
 pub fn run(_ctx: &AppContext, _args: &BundleArgs) -> Result<()> {
     let ctx = _ctx;
     let args = _args;
@@ -117,6 +139,7 @@ pub fn run(_ctx: &AppContext, _args: &BundleArgs) -> Result<()> {
         BundleCommand::Install(install) => run_install(ctx, install),
         BundleCommand::Publish(publish) => run_publish(ctx, publish),
         BundleCommand::List => run_list(ctx),
+        BundleCommand::Conflicts(conflicts) => run_conflicts(ctx, conflicts),
     }
 }
 
@@ -297,6 +320,129 @@ fn run_publish(ctx: &AppContext, args: &BundlePublishArgs) -> Result<()> {
     Ok(())
 }
 
+fn run_conflicts(ctx: &AppContext, args: &BundleConflictsArgs) -> Result<()> {
+    let skills_dir = ctx.git.root().join("skills");
+    if !skills_dir.exists() {
+        if ctx.robot_mode {
+            return emit_json(&ConflictsReport {
+                skills: vec![],
+                total_modified: 0,
+                total_conflicts: 0,
+            });
+        }
+        println!("No skills installed.");
+        return Ok(());
+    }
+
+    let mut reports = Vec::new();
+
+    // If specific skill requested, check only that one
+    let skill_ids: Vec<String> = if let Some(ref skill) = args.skill {
+        vec![skill.clone()]
+    } else {
+        // List all installed skills
+        let mut ids = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&skills_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
+                        ids.push(name.to_string());
+                    }
+                }
+            }
+        }
+        ids.sort();
+        ids
+    };
+
+    for skill_id in skill_ids {
+        let skill_path = skills_dir.join(&skill_id);
+        if !skill_path.exists() {
+            if args.skill.is_some() {
+                return Err(MsError::SkillNotFound(format!(
+                    "skill not found: {}",
+                    skill_id
+                )));
+            }
+            continue;
+        }
+
+        // Try to load expected hashes from bundle metadata
+        let meta_path = skill_path.join(".bundle_meta.json");
+        let expected_hashes: HashMap<PathBuf, String> = if meta_path.exists() {
+            match std::fs::read_to_string(&meta_path) {
+                Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
+                Err(_) => HashMap::new(),
+            }
+        } else {
+            HashMap::new()
+        };
+
+        let report = detect_modifications(&skill_path, &skill_id, &expected_hashes)?;
+
+        // Filter to modified only if requested
+        if args.modified_only && report.status == ModificationStatus::Clean {
+            continue;
+        }
+
+        reports.push(report);
+    }
+
+    let total_modified = reports
+        .iter()
+        .filter(|r| r.status != ModificationStatus::Clean)
+        .count();
+    let total_conflicts = reports.iter().map(|r| r.summary.conflict).sum();
+
+    if ctx.robot_mode {
+        return emit_json(&ConflictsReport {
+            skills: reports,
+            total_modified,
+            total_conflicts,
+        });
+    }
+
+    if reports.is_empty() {
+        println!("No modifications detected.");
+        return Ok(());
+    }
+
+    for report in &reports {
+        println!("Skill: {}", report.skill_id);
+        println!("  Status: {:?}", report.status);
+        println!(
+            "  Files: {} total, {} modified, {} new, {} deleted",
+            report.summary.total(),
+            report.summary.modified,
+            report.summary.new,
+            report.summary.deleted
+        );
+
+        if args.diff && !report.files.is_empty() {
+            println!("  Changes:");
+            for file in &report.files {
+                let status_str = match file.status {
+                    ModificationStatus::Clean => "clean",
+                    ModificationStatus::Modified => "modified",
+                    ModificationStatus::New => "new",
+                    ModificationStatus::Deleted => "deleted",
+                    ModificationStatus::Conflict => "conflict",
+                };
+                println!("    {} [{}]", file.path.display(), status_str);
+            }
+        }
+        println!();
+    }
+
+    println!(
+        "Summary: {} skill(s) with modifications, {} conflict(s)",
+        total_modified, total_conflicts
+    );
+
+    Ok(())
+}
+
 fn run_list(ctx: &AppContext) -> Result<()> {
     let bundles_dir = ctx.git.root().join("bundles");
 
@@ -443,4 +589,11 @@ struct BundleCreateReport {
 struct BundleListReport {
     bundles: Vec<String>,
     count: usize,
+}
+
+#[derive(serde::Serialize)]
+struct ConflictsReport {
+    skills: Vec<SkillModificationReport>,
+    total_modified: usize,
+    total_conflicts: usize,
 }
