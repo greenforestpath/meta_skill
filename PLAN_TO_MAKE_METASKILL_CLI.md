@@ -20417,3 +20417,1108 @@ Before shipping CI/CD:
 - [ ] Pre-commit hooks run in CI
 - [ ] Bundle size monitoring if applicable
 - [ ] Container images scanned for vulnerabilities
+
+---
+
+## Section 36: Caching and Memoization Patterns
+
+**Source**: CASS mining of beads_viewer, xf, coding_agent_session_search, and related optimization sessions
+
+### 36.1 Caching Philosophy
+
+#### When to Cache
+
+| Scenario | Cache Strategy | Example |
+|----------|----------------|---------|
+| **Computed on demand, used multiple times** | Lazy accessor with memoization | `TriageContext.ActionableIssues()` |
+| **Expensive computation, stable inputs** | Hash-keyed persistent cache | Graph metrics, embeddings |
+| **Hot path, sub-millisecond latency required** | In-memory with TTL | API responses, search results |
+| **Large dataset, memory-limited** | LRU eviction | File caches, database query results |
+| **One-time initialization, immutable after** | `OnceLock` / `sync.Once` | Configuration, static indices |
+
+#### Caching Anti-Patterns
+
+```
+❌ Caching non-deterministic results (random, timestamps)
+❌ Caching without invalidation strategy
+❌ Unbounded cache growth (no eviction)
+❌ Caching across security boundaries without validation
+❌ Over-caching (cache overhead > computation cost)
+```
+
+### 36.2 Lazy Initialization Patterns
+
+#### Rust: OnceLock for Static Lazy Values
+
+**Source**: CASS mining of xf VectorIndex cache
+
+```rust
+use std::sync::OnceLock;
+
+/// Lazy-loaded vector index (only loaded if semantic search used)
+static VECTOR_INDEX: OnceLock<VectorIndex> = OnceLock::new();
+
+pub fn get_vector_index() -> &'static VectorIndex {
+    VECTOR_INDEX.get_or_init(|| {
+        // Expensive initialization only happens once
+        VectorIndex::load_from_disk()
+            .expect("failed to load vector index")
+    })
+}
+
+// Alternative: Fallible initialization with once_cell::sync::Lazy
+use once_cell::sync::Lazy;
+
+static SIMD_DOT_ENABLED: Lazy<bool> = Lazy::new(|| {
+    std::env::var("CASS_SIMD_DOT")
+        .map(|v| v != "0")
+        .unwrap_or(true)
+});
+```
+
+**When to use**:
+- Configuration that's expensive to compute
+- Indices loaded on first access
+- Runtime feature flags
+
+#### Go: sync.Once for Thread-Safe Initialization
+
+```go
+import "sync"
+
+var (
+    globalCache *Cache
+    cacheOnce   sync.Once
+)
+
+// GetCache returns the singleton cache instance
+func GetCache() *Cache {
+    cacheOnce.Do(func() {
+        globalCache = &Cache{
+            entries:   make(map[string]*CacheEntry),
+            maxSize:   1000,
+            ttl:       5 * time.Minute,
+        }
+    })
+    return globalCache
+}
+
+// Alternative: Using sync.OnceValue (Go 1.21+)
+var getConfig = sync.OnceValue(func() *Config {
+    cfg, err := loadConfig()
+    if err != nil {
+        panic(fmt.Sprintf("config load failed: %v", err))
+    }
+    return cfg
+})
+```
+
+#### TypeScript: Lazy Accessor Pattern
+
+```typescript
+class LazyConfig {
+    private _parsed: ParsedConfig | null = null;
+    private _raw: string;
+    
+    constructor(rawConfig: string) {
+        this._raw = rawConfig;
+    }
+    
+    get parsed(): ParsedConfig {
+        if (this._parsed === null) {
+            this._parsed = JSON.parse(this._raw);
+        }
+        return this._parsed;
+    }
+}
+
+// Class-based lazy with getter
+class SkillLoader {
+    private _skills: Map<string, Skill> | null = null;
+    
+    get skills(): Map<string, Skill> {
+        return this._skills ??= this.loadAllSkills();
+    }
+    
+    private loadAllSkills(): Map<string, Skill> {
+        // Expensive loading logic
+    }
+}
+```
+
+### 36.3 TriageContext Pattern: Unified Lazy Caching
+
+**Source**: CASS mining of beads_viewer TriageContext implementation
+
+This pattern provides a context object that lazily computes and caches multiple related values, avoiding redundant computation in complex workflows.
+
+#### Go Implementation
+
+```go
+package analysis
+
+import "sync"
+
+// TriageContext provides unified caching for triage-related computations.
+// Values are computed on first access and cached for the lifetime of the context.
+type TriageContext struct {
+    analyzer           *Analyzer
+    
+    // Cached values
+    actionable         []Issue
+    actionableSet      map[string]bool
+    actionableComputed bool
+    
+    blockerDepth       map[string]int
+    openBlockers       map[string][]string
+    
+    unblocksMap        map[string][]string
+    unblocksComputed   bool
+    
+    // Thread safety (nil for single-threaded use)
+    mu *sync.Mutex
+}
+
+// NewTriageContext creates a single-threaded context
+func NewTriageContext(analyzer *Analyzer) *TriageContext {
+    return &TriageContext{
+        analyzer:     analyzer,
+        blockerDepth: make(map[string]int),
+        openBlockers: make(map[string][]string),
+    }
+}
+
+// NewTriageContextThreadSafe creates a thread-safe context
+func NewTriageContextThreadSafe(analyzer *Analyzer) *TriageContext {
+    ctx := NewTriageContext(analyzer)
+    ctx.mu = &sync.Mutex{}
+    return ctx
+}
+
+func (ctx *TriageContext) lock() {
+    if ctx.mu != nil {
+        ctx.mu.Lock()
+    }
+}
+
+func (ctx *TriageContext) unlock() {
+    if ctx.mu != nil {
+        ctx.mu.Unlock()
+    }
+}
+
+// ActionableIssues returns cached actionable issues, computing on first call
+func (ctx *TriageContext) ActionableIssues() []Issue {
+    ctx.lock()
+    defer ctx.unlock()
+    
+    if ctx.actionableComputed {
+        return ctx.actionable
+    }
+    
+    // Compute once
+    ctx.actionable = ctx.analyzer.GetActionableIssues()
+    
+    // Build lookup set for O(1) IsActionable checks
+    ctx.actionableSet = make(map[string]bool, len(ctx.actionable))
+    for _, issue := range ctx.actionable {
+        ctx.actionableSet[issue.ID] = true
+    }
+    
+    ctx.actionableComputed = true
+    return ctx.actionable
+}
+
+// IsActionable is O(1) after first ActionableIssues() call
+func (ctx *TriageContext) IsActionable(id string) bool {
+    ctx.lock()
+    defer ctx.unlock()
+    
+    if !ctx.actionableComputed {
+        // Force computation
+        ctx.unlock()
+        ctx.ActionableIssues()
+        ctx.lock()
+    }
+    
+    return ctx.actionableSet[id]
+}
+
+// BlockerDepth computes depth with cycle detection, cached per-issue
+func (ctx *TriageContext) BlockerDepth(id string) int {
+    ctx.lock()
+    defer ctx.unlock()
+    
+    if depth, ok := ctx.blockerDepth[id]; ok {
+        return depth
+    }
+    
+    // Use internal method to avoid nested lock
+    depth := ctx.computeBlockerDepthInternal(id, make(map[string]bool))
+    ctx.blockerDepth[id] = depth
+    return depth
+}
+
+func (ctx *TriageContext) computeBlockerDepthInternal(id string, visiting map[string]bool) int {
+    if visiting[id] {
+        return 0 // Cycle detected
+    }
+    visiting[id] = true
+    defer delete(visiting, id)
+    
+    blockers := ctx.getOpenBlockersInternal(id)
+    if len(blockers) == 0 {
+        return 0
+    }
+    
+    maxDepth := 0
+    for _, blockerId := range blockers {
+        depth := ctx.computeBlockerDepthInternal(blockerId, visiting)
+        if depth+1 > maxDepth {
+            maxDepth = depth + 1
+        }
+    }
+    return maxDepth
+}
+
+// Reset clears all cached values for reuse with new data
+func (ctx *TriageContext) Reset() {
+    ctx.lock()
+    defer ctx.unlock()
+    
+    ctx.actionable = nil
+    ctx.actionableSet = nil
+    ctx.actionableComputed = false
+    ctx.blockerDepth = make(map[string]int)
+    ctx.openBlockers = make(map[string][]string)
+    ctx.unblocksMap = nil
+    ctx.unblocksComputed = false
+}
+```
+
+#### Key Design Points
+
+| Aspect | Implementation | Rationale |
+|--------|----------------|-----------|
+| **Lazy computation** | Check `computed` flag before work | Avoid redundant expensive calls |
+| **Lookup optimization** | Build `Set` from `Slice` on first access | O(1) membership tests |
+| **Thread safety** | Optional mutex via constructor | Single-threaded hot paths stay fast |
+| **Internal methods** | `*Internal` methods don't acquire locks | Avoid deadlock from nested calls |
+| **Cycle detection** | `visiting` map parameter | Handle graph cycles gracefully |
+| **Reset capability** | Clear all cached state | Reuse context across operations |
+
+### 36.4 Heap-Based Top-K Collectors
+
+**Source**: CASS mining of beads_viewer topk utility and cass vector search
+
+For selecting the top K items from a stream or large collection, a min-heap is more efficient than full sorting: O(n log k) vs O(n log n).
+
+#### Go Generic Implementation
+
+```go
+package topk
+
+import (
+    "container/heap"
+    "sort"
+)
+
+// Scored pairs an item with its score
+type Scored[T any] struct {
+    Item  T
+    Score float64
+}
+
+// Collector collects the top-K highest-scoring items
+type Collector[T any] struct {
+    k    int
+    h    *minHeap[T]
+    less func(a, b T) bool // For deterministic ordering of equal scores
+}
+
+// minHeap implements heap.Interface for Scored items
+type minHeap[T any] struct {
+    items []Scored[T]
+    less  func(a, b T) bool
+}
+
+func (h *minHeap[T]) Len() int           { return len(h.items) }
+func (h *minHeap[T]) Less(i, j int) bool { return h.items[i].Score < h.items[j].Score }
+func (h *minHeap[T]) Swap(i, j int)      { h.items[i], h.items[j] = h.items[j], h.items[i] }
+func (h *minHeap[T]) Push(x any)         { h.items = append(h.items, x.(Scored[T])) }
+func (h *minHeap[T]) Pop() any {
+    n := len(h.items)
+    x := h.items[n-1]
+    h.items = h.items[:n-1]
+    return x
+}
+
+// New creates a Collector for the top k items
+func New[T any](k int, less func(a, b T) bool) *Collector[T] {
+    if k < 0 {
+        k = 0
+    }
+    h := &minHeap[T]{
+        items: make([]Scored[T], 0, k),
+        less:  less,
+    }
+    heap.Init(h)
+    return &Collector[T]{k: k, h: h, less: less}
+}
+
+// Add considers an item for inclusion in the top-K
+// Returns true if the item was added to the collection
+func (c *Collector[T]) Add(item T, score float64) bool {
+    if c.k <= 0 {
+        return false
+    }
+    
+    entry := Scored[T]{Item: item, Score: score}
+    
+    // If heap not full, always add
+    if c.h.Len() < c.k {
+        heap.Push(c.h, entry)
+        return true
+    }
+    
+    // If score beats minimum, replace
+    if score > c.h.items[0].Score {
+        heap.Pop(c.h)
+        heap.Push(c.h, entry)
+        return true
+    }
+    
+    // Tie-breaking for equal scores (deterministic ordering)
+    if score == c.h.items[0].Score && c.less != nil {
+        if c.less(item, c.h.items[0].Item) {
+            heap.Pop(c.h)
+            heap.Push(c.h, entry)
+            return true
+        }
+    }
+    
+    return false
+}
+
+// Results returns items sorted by score descending
+func (c *Collector[T]) Results() []T {
+    results := make([]T, c.h.Len())
+    scores := c.ResultsWithScores()
+    for i, s := range scores {
+        results[i] = s.Item
+    }
+    return results
+}
+
+// ResultsWithScores returns items with their scores, sorted descending
+func (c *Collector[T]) ResultsWithScores() []Scored[T] {
+    results := make([]Scored[T], c.h.Len())
+    copy(results, c.h.items)
+    
+    sort.Slice(results, func(i, j int) bool {
+        if results[i].Score != results[j].Score {
+            return results[i].Score > results[j].Score
+        }
+        // Deterministic tie-breaking
+        if c.less != nil {
+            return c.less(results[i].Item, results[j].Item)
+        }
+        return false
+    })
+    
+    return results
+}
+
+// Reset allows collector reuse without reallocation
+func (c *Collector[T]) Reset() {
+    c.h.items = c.h.items[:0]
+}
+```
+
+#### Rust BinaryHeap Implementation
+
+```rust
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
+
+/// Top-K collector using min-heap (via Reverse)
+pub struct TopKCollector<T> {
+    k: usize,
+    heap: BinaryHeap<Reverse<ScoredEntry<T>>>,
+}
+
+#[derive(Clone, PartialEq)]
+pub struct ScoredEntry<T> {
+    pub score: f32,
+    pub item: T,
+}
+
+impl<T: Ord> Eq for ScoredEntry<T> {}
+
+impl<T: Ord> PartialOrd for ScoredEntry<T> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl<T: Ord> Ord for ScoredEntry<T> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Primary: score (ascending for min-heap via Reverse)
+        // Secondary: item for deterministic tie-breaking
+        self.score
+            .partial_cmp(&other.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| self.item.cmp(&other.item))
+    }
+}
+
+impl<T: Ord + Clone> TopKCollector<T> {
+    pub fn new(k: usize) -> Self {
+        Self {
+            k,
+            heap: BinaryHeap::with_capacity(k + 1),
+        }
+    }
+    
+    pub fn add(&mut self, item: T, score: f32) -> bool {
+        if self.k == 0 {
+            return false;
+        }
+        
+        let entry = ScoredEntry { score, item };
+        
+        if self.heap.len() < self.k {
+            self.heap.push(Reverse(entry));
+            return true;
+        }
+        
+        // Check if beats minimum
+        if let Some(Reverse(min)) = self.heap.peek() {
+            if score > min.score {
+                self.heap.pop();
+                self.heap.push(Reverse(entry));
+                return true;
+            }
+        }
+        
+        false
+    }
+    
+    pub fn results(self) -> Vec<T> {
+        let mut results: Vec<_> = self.heap
+            .into_iter()
+            .map(|Reverse(e)| e)
+            .collect();
+        
+        // Sort descending by score
+        results.sort_by(|a, b| {
+            b.score.partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.item.cmp(&b.item))
+        });
+        
+        results.into_iter().map(|e| e.item).collect()
+    }
+}
+```
+
+#### Complexity Comparison
+
+| Operation | sort.Slice | Heap-based Top-K |
+|-----------|------------|------------------|
+| Time | O(n log n) | O(n log k) |
+| Space | O(n) | O(k) |
+| Streaming | No (need all items) | Yes (process items as they arrive) |
+
+**Benchmark results** (from beads_viewer): ~15x faster for k=10 on n=10,000 items
+
+### 36.5 LRU Cache with Disk Persistence
+
+**Source**: CASS mining of beads_viewer cache.go and codex LRU discussions
+
+#### Go Implementation
+
+```go
+package cache
+
+import (
+    "container/list"
+    "encoding/json"
+    "os"
+    "path/filepath"
+    "sync"
+    "time"
+)
+
+// DiskCache implements LRU eviction with disk persistence
+type DiskCache struct {
+    mu         sync.RWMutex
+    entries    map[string]*list.Element
+    order      *list.List  // LRU order (front = most recent)
+    maxEntries int
+    ttl        time.Duration
+    path       string
+}
+
+type cacheEntry struct {
+    Key        string    `json:"key"`
+    Value      any       `json:"value"`
+    Hash       string    `json:"hash"`       // For staleness detection
+    ComputedAt time.Time `json:"computed_at"`
+    AccessedAt time.Time `json:"accessed_at"`
+}
+
+// NewDiskCache creates a persistent LRU cache
+func NewDiskCache(path string, maxEntries int, ttl time.Duration) *DiskCache {
+    cache := &DiskCache{
+        entries:    make(map[string]*list.Element),
+        order:      list.New(),
+        maxEntries: maxEntries,
+        ttl:        ttl,
+        path:       path,
+    }
+    
+    // Load existing entries from disk
+    cache.loadFromDisk()
+    return cache
+}
+
+// Get retrieves a cached value, returning nil if expired or missing
+func (c *DiskCache) Get(key string) (any, bool) {
+    c.mu.Lock()
+    defer c.mu.Unlock()
+    
+    elem, ok := c.entries[key]
+    if !ok {
+        return nil, false
+    }
+    
+    entry := elem.Value.(*cacheEntry)
+    
+    // Check TTL
+    if time.Since(entry.ComputedAt) > c.ttl {
+        c.removeElement(elem)
+        return nil, false
+    }
+    
+    // Move to front (most recently used)
+    c.order.MoveToFront(elem)
+    entry.AccessedAt = time.Now()
+    
+    return entry.Value, true
+}
+
+// Set stores a value, evicting LRU entries if needed
+func (c *DiskCache) Set(key string, value any, hash string) {
+    c.mu.Lock()
+    defer c.mu.Unlock()
+    
+    now := time.Now()
+    
+    // Update existing entry
+    if elem, ok := c.entries[key]; ok {
+        entry := elem.Value.(*cacheEntry)
+        entry.Value = value
+        entry.Hash = hash
+        entry.ComputedAt = now
+        entry.AccessedAt = now
+        c.order.MoveToFront(elem)
+        c.saveToDisk()
+        return
+    }
+    
+    // Create new entry
+    entry := &cacheEntry{
+        Key:        key,
+        Value:      value,
+        Hash:       hash,
+        ComputedAt: now,
+        AccessedAt: now,
+    }
+    elem := c.order.PushFront(entry)
+    c.entries[key] = elem
+    
+    // Evict LRU entries if over capacity
+    for c.order.Len() > c.maxEntries {
+        oldest := c.order.Back()
+        if oldest != nil {
+            c.removeElement(oldest)
+        }
+    }
+    
+    c.saveToDisk()
+}
+
+// IsStale checks if cached value's hash differs from current
+func (c *DiskCache) IsStale(key, currentHash string) bool {
+    c.mu.RLock()
+    defer c.mu.RUnlock()
+    
+    elem, ok := c.entries[key]
+    if !ok {
+        return true
+    }
+    
+    entry := elem.Value.(*cacheEntry)
+    return entry.Hash != currentHash
+}
+
+func (c *DiskCache) removeElement(elem *list.Element) {
+    entry := elem.Value.(*cacheEntry)
+    delete(c.entries, entry.Key)
+    c.order.Remove(elem)
+}
+
+func (c *DiskCache) saveToDisk() {
+    entries := make([]*cacheEntry, 0, c.order.Len())
+    for elem := c.order.Front(); elem != nil; elem = elem.Next() {
+        entries = append(entries, elem.Value.(*cacheEntry))
+    }
+    
+    data, err := json.MarshalIndent(entries, "", "  ")
+    if err != nil {
+        return
+    }
+    
+    // Atomic write: temp file + rename
+    tempPath := c.path + ".tmp"
+    if err := os.WriteFile(tempPath, data, 0644); err != nil {
+        return
+    }
+    os.Rename(tempPath, c.path)
+}
+
+func (c *DiskCache) loadFromDisk() {
+    data, err := os.ReadFile(c.path)
+    if err != nil {
+        return
+    }
+    
+    var entries []*cacheEntry
+    if err := json.Unmarshal(data, &entries); err != nil {
+        return
+    }
+    
+    now := time.Now()
+    for _, entry := range entries {
+        // Skip expired entries
+        if now.Sub(entry.ComputedAt) > c.ttl {
+            continue
+        }
+        elem := c.order.PushBack(entry)
+        c.entries[entry.Key] = elem
+    }
+}
+```
+
+### 36.6 In-Memory Cache with TTL
+
+**Source**: CASS mining of beads_viewer GlobalCache pattern
+
+```go
+package cache
+
+import (
+    "sync"
+    "time"
+)
+
+// GlobalCache is a thread-safe in-memory cache with TTL
+type GlobalCache struct {
+    mu      sync.RWMutex
+    entries map[string]*CacheEntry
+    ttl     time.Duration
+}
+
+type CacheEntry struct {
+    Value      any
+    Hash       string
+    ComputedAt time.Time
+}
+
+var (
+    defaultCache     *GlobalCache
+    defaultCacheOnce sync.Once
+)
+
+// Default returns the global cache instance (5-minute TTL)
+func Default() *GlobalCache {
+    defaultCacheOnce.Do(func() {
+        defaultCache = &GlobalCache{
+            entries: make(map[string]*CacheEntry),
+            ttl:     5 * time.Minute,
+        }
+    })
+    return defaultCache
+}
+
+// Get retrieves a cached value
+func (c *GlobalCache) Get(key string) (any, bool) {
+    c.mu.RLock()
+    defer c.mu.RUnlock()
+    
+    entry, ok := c.entries[key]
+    if !ok {
+        return nil, false
+    }
+    
+    // Check expiration
+    if time.Since(entry.ComputedAt) > c.ttl {
+        // Entry expired (will be cleaned on next Set)
+        return nil, false
+    }
+    
+    return entry.Value, true
+}
+
+// GetOrCompute returns cached value or computes and caches it
+func (c *GlobalCache) GetOrCompute(key, hash string, compute func() any) any {
+    c.mu.RLock()
+    entry, ok := c.entries[key]
+    if ok && entry.Hash == hash && time.Since(entry.ComputedAt) < c.ttl {
+        c.mu.RUnlock()
+        return entry.Value
+    }
+    c.mu.RUnlock()
+    
+    // Compute new value
+    value := compute()
+    
+    c.mu.Lock()
+    defer c.mu.Unlock()
+    
+    c.entries[key] = &CacheEntry{
+        Value:      value,
+        Hash:       hash,
+        ComputedAt: time.Now(),
+    }
+    
+    return value
+}
+
+// Invalidate removes a specific key
+func (c *GlobalCache) Invalidate(key string) {
+    c.mu.Lock()
+    defer c.mu.Unlock()
+    delete(c.entries, key)
+}
+
+// Clear removes all entries
+func (c *GlobalCache) Clear() {
+    c.mu.Lock()
+    defer c.mu.Unlock()
+    c.entries = make(map[string]*CacheEntry)
+}
+
+// Cleanup removes expired entries
+func (c *GlobalCache) Cleanup() int {
+    c.mu.Lock()
+    defer c.mu.Unlock()
+    
+    now := time.Now()
+    removed := 0
+    
+    for key, entry := range c.entries {
+        if now.Sub(entry.ComputedAt) > c.ttl {
+            delete(c.entries, key)
+            removed++
+        }
+    }
+    
+    return removed
+}
+```
+
+### 36.7 SIMD-Optimized Dot Product
+
+**Source**: CASS mining of xf and cass vector search implementations
+
+```rust
+use wide::f32x8;
+
+/// SIMD-optimized dot product using AVX-256 (8 floats per iteration)
+#[inline]
+pub fn dot_product_simd(a: &[f32], b: &[f32]) -> f32 {
+    assert_eq!(a.len(), b.len());
+    
+    let chunks_a = a.chunks_exact(8);
+    let chunks_b = b.chunks_exact(8);
+    let remainder_a = chunks_a.remainder();
+    let remainder_b = chunks_b.remainder();
+    
+    // SIMD accumulator
+    let mut sum = f32x8::ZERO;
+    
+    for (ca, cb) in chunks_a.zip(chunks_b) {
+        let arr_a: [f32; 8] = ca.try_into().unwrap();
+        let arr_b: [f32; 8] = cb.try_into().unwrap();
+        
+        // 8 FMA operations per iteration
+        sum += f32x8::from(arr_a) * f32x8::from(arr_b);
+    }
+    
+    // Horizontal reduction
+    let mut scalar_sum: f32 = sum.reduce_add();
+    
+    // Handle remainder (non-8-multiple dimensions)
+    for (a, b) in remainder_a.iter().zip(remainder_b) {
+        scalar_sum += a * b;
+    }
+    
+    scalar_sum
+}
+
+/// Feature flag for SIMD enable/disable
+static SIMD_ENABLED: once_cell::sync::Lazy<bool> = once_cell::sync::Lazy::new(|| {
+    std::env::var("CASS_SIMD_DOT")
+        .map(|v| v != "0")
+        .unwrap_or(true)
+});
+
+/// Dispatch to SIMD or scalar based on feature flag
+pub fn dot_product(a: &[f32], b: &[f32]) -> f32 {
+    if *SIMD_ENABLED {
+        dot_product_simd(a, b)
+    } else {
+        dot_product_scalar(a, b)
+    }
+}
+
+#[inline]
+fn dot_product_scalar(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+}
+```
+
+### 36.8 Parallel K-NN Search with Thread-Local Heaps
+
+**Source**: CASS mining of cass vector index parallel search
+
+```rust
+use rayon::prelude::*;
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
+
+const PARALLEL_THRESHOLD: usize = 10_000;
+const PARALLEL_CHUNK_SIZE: usize = 1024;
+
+impl VectorIndex {
+    pub fn search_top_k(&self, query: &[f32], k: usize) -> Vec<SearchResult> {
+        if self.rows.len() >= PARALLEL_THRESHOLD {
+            self.search_top_k_parallel(query, k)
+        } else {
+            self.search_top_k_sequential(query, k)
+        }
+    }
+    
+    fn search_top_k_sequential(&self, query: &[f32], k: usize) -> Vec<SearchResult> {
+        let mut heap: BinaryHeap<Reverse<ScoredEntry>> = 
+            BinaryHeap::with_capacity(k + 1);
+        
+        for row in &self.rows {
+            let score = self.dot_product_at(row.vec_offset, query);
+            
+            heap.push(Reverse(ScoredEntry { 
+                score, 
+                doc_id: row.doc_id 
+            }));
+            
+            if heap.len() > k {
+                heap.pop();
+            }
+        }
+        
+        // Sort results descending
+        let mut results: Vec<_> = heap
+            .into_iter()
+            .map(|Reverse(e)| SearchResult::from(e))
+            .collect();
+        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+        results
+    }
+    
+    fn search_top_k_parallel(&self, query: &[f32], k: usize) -> Vec<SearchResult> {
+        // Phase 1: Thread-local top-k collection
+        let partial_results: Vec<Vec<ScoredEntry>> = self.rows
+            .par_chunks(PARALLEL_CHUNK_SIZE)
+            .map(|chunk| {
+                let mut local_heap: BinaryHeap<Reverse<ScoredEntry>> = 
+                    BinaryHeap::with_capacity(k + 1);
+                
+                for row in chunk {
+                    let score = self.dot_product_at(row.vec_offset, query)
+                        .unwrap_or(0.0);
+                    
+                    local_heap.push(Reverse(ScoredEntry { 
+                        score, 
+                        doc_id: row.doc_id 
+                    }));
+                    
+                    if local_heap.len() > k {
+                        local_heap.pop();
+                    }
+                }
+                
+                local_heap.into_iter().map(|r| r.0).collect()
+            })
+            .collect();
+        
+        // Phase 2: Merge thread-local heaps
+        let mut final_heap: BinaryHeap<Reverse<ScoredEntry>> = 
+            BinaryHeap::with_capacity(k + 1);
+        
+        for entries in partial_results {
+            for entry in entries {
+                final_heap.push(Reverse(entry));
+                if final_heap.len() > k {
+                    final_heap.pop();
+                }
+            }
+        }
+        
+        // Sort results descending
+        let mut results: Vec<_> = final_heap
+            .into_iter()
+            .map(|Reverse(e)| SearchResult::from(e))
+            .collect();
+        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+        results
+    }
+}
+```
+
+### 36.9 Cache-Efficient Data Layout (Struct of Arrays)
+
+**Source**: CASS mining of cass vector index memory layout
+
+```rust
+/// Struct of Arrays (SoA) layout for cache efficiency
+pub struct VectorIndex {
+    // Metadata slab (70 bytes per row)
+    rows: Vec<VectorRow>,
+    
+    // Vector slab (separate, contiguous)
+    vectors: VectorStorage,
+}
+
+pub struct VectorRow {
+    pub message_id: u64,      // 8 bytes
+    pub created_at_ms: i64,   // 8 bytes
+    pub agent_id: u32,        // 4 bytes
+    pub workspace_id: u32,    // 4 bytes
+    pub source_id: u32,       // 4 bytes
+    pub role: u8,             // 1 byte
+    pub chunk_idx: u8,        // 1 byte
+    pub vec_offset: u64,      // 8 bytes (offset into vector slab)
+    pub content_hash: [u8; 32], // 32 bytes
+}
+
+pub enum VectorStorage {
+    F32(Vec<f32>),           // Full precision
+    F16(Vec<f16>),           // Half precision (memory savings)
+    Mmap { offset: u64, len: u64 }, // Memory-mapped file
+}
+
+const VECTOR_ALIGN_BYTES: usize = 32; // AVX-256 alignment
+
+/// Ensure vector slab starts at 32-byte boundary
+pub fn vector_slab_offset_bytes(header_len: usize, count: u32) -> usize {
+    let rows_len = count as usize * std::mem::size_of::<VectorRow>();
+    let end = header_len + rows_len;
+    align_up(end, VECTOR_ALIGN_BYTES)
+}
+
+fn align_up(value: usize, align: usize) -> usize {
+    let rem = value % align;
+    if rem == 0 { value } else { value + (align - rem) }
+}
+```
+
+**Benefits of SoA Layout**:
+| Aspect | Array of Structs (AoS) | Struct of Arrays (SoA) |
+|--------|------------------------|------------------------|
+| **Cache utilization** | Poor (loads unused fields) | Excellent (loads only needed data) |
+| **SIMD friendliness** | Poor (scattered data) | Excellent (contiguous data) |
+| **Memory bandwidth** | Wasteful | Efficient |
+| **Prefetching** | Unpredictable | Sequential access patterns |
+
+### 36.10 Hash-Based Content Deduplication
+
+**Source**: CASS mining of xf and cass embedding deduplication
+
+```rust
+use ring::digest::{Context, SHA256};
+
+/// Compute content hash for deduplication
+pub fn content_hash(text: &str) -> [u8; 32] {
+    let mut context = Context::new(&SHA256);
+    context.update(text.as_bytes());
+    let digest = context.finish();
+    
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(digest.as_ref());
+    hash
+}
+
+/// Check if embedding already exists for content
+impl EmbeddingCache {
+    pub fn get_or_compute<F>(
+        &mut self,
+        content: &str,
+        compute: F,
+    ) -> Vec<f32>
+    where
+        F: FnOnce(&str) -> Vec<f32>,
+    {
+        let hash = content_hash(content);
+        
+        // Check cache
+        if let Some(embedding) = self.get_by_hash(&hash) {
+            return embedding.clone();
+        }
+        
+        // Compute and cache
+        let embedding = compute(content);
+        self.insert(hash, embedding.clone());
+        embedding
+    }
+}
+```
+
+### 36.11 Cache Invalidation Strategies
+
+| Strategy | Use Case | Implementation |
+|----------|----------|----------------|
+| **TTL-based** | Time-sensitive data | Check `time.Since(computedAt) > ttl` |
+| **Hash-based** | Content-derived values | Compare `storedHash != currentHash` |
+| **Event-driven** | Reactive systems | Publish invalidation on data change |
+| **LRU eviction** | Memory-bounded caches | Remove least-recently-used entries |
+| **Version-based** | Schema migrations | Store version, invalidate on mismatch |
+| **Manual** | User-triggered | Explicit `cache.Invalidate(key)` |
+
+### 36.12 Application to meta_skill
+
+| Component | Caching Strategy | Pattern |
+|-----------|------------------|---------|
+| **Skill index** | Lazy initialization | `OnceLock` / `sync.Once` for singleton |
+| **Rendered templates** | Content hash deduplication | Hash template + variables |
+| **Search results** | LRU with TTL | Top-10 recent queries |
+| **Parsed YAML** | TriageContext pattern | Lazy accessor on skill struct |
+| **Vector embeddings** | Disk cache with hash | Avoid re-computing unchanged skills |
+| **API responses** | In-memory TTL | 5-minute cache for list endpoints |
+
+### 36.13 Caching Checklist
+
+Before implementing caching:
+- [ ] Identify the computation bottleneck (profile first)
+- [ ] Determine cache key granularity (too broad = cache misses, too narrow = explosion)
+- [ ] Choose appropriate TTL for data freshness requirements
+- [ ] Implement invalidation strategy (stale data is worse than no caching)
+- [ ] Set memory bounds (LRU eviction or max entries)
+- [ ] Add hash-based staleness detection for derived values
+- [ ] Consider thread safety requirements (single-threaded vs concurrent)
+- [ ] Use lazy initialization for expensive one-time setup
+- [ ] For hot paths, consider SIMD and cache-line alignment
+- [ ] For large datasets, consider parallel processing with thread-local heaps
+- [ ] Test cache behavior under memory pressure
+- [ ] Add metrics for cache hit rate monitoring
