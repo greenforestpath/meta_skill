@@ -254,6 +254,27 @@ impl Database {
         Ok(out)
     }
 
+    pub fn list_quarantine_records_by_session(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<QuarantineRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT quarantine_id, session_id, message_index, content_hash, safe_excerpt,
+                    classification_json, audit_tag, created_at, replay_command
+             FROM injection_quarantine
+             WHERE session_id = ?
+             ORDER BY created_at DESC
+             LIMIT ?",
+        )?;
+        let mut rows = stmt.query(params![session_id, limit as i64])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(quarantine_from_row(row)?);
+        }
+        Ok(out)
+    }
+
     pub fn get_quarantine_record(&self, quarantine_id: &str) -> Result<Option<QuarantineRecord>> {
         let mut stmt = self.conn.prepare(
             "SELECT quarantine_id, session_id, message_index, content_hash, safe_excerpt,
@@ -283,6 +304,27 @@ impl Database {
             params![review_id, quarantine_id, action, reason, created_at],
         )?;
         Ok(review_id)
+    }
+
+    pub fn list_quarantine_reviews(&self, quarantine_id: &str) -> Result<Vec<QuarantineReview>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, quarantine_id, action, reason, created_at
+             FROM injection_quarantine_reviews
+             WHERE quarantine_id = ?
+             ORDER BY created_at DESC",
+        )?;
+        let mut rows = stmt.query([quarantine_id])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(QuarantineReview {
+                id: row.get(0)?,
+                quarantine_id: row.get(1)?,
+                action: row.get(2)?,
+                reason: row.get(3)?,
+                created_at: row.get(4)?,
+            });
+        }
+        Ok(out)
     }
 
     fn configure_pragmas(conn: &Connection) -> Result<()> {
@@ -342,10 +384,20 @@ fn quarantine_from_row(row: &Row<'_>) -> std::result::Result<QuarantineRecord, r
     })
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct QuarantineReview {
+    pub id: String,
+    pub quarantine_id: String,
+    pub action: String,
+    pub reason: Option<String>,
+    pub created_at: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::tempdir;
+    use crate::security::AcipClassification;
 
     #[test]
     fn test_database_creation_and_schema_version() {
@@ -514,6 +566,48 @@ mod tests {
         db.delete_skill("alias-target").unwrap();
         let alias = db.resolve_alias("legacy-id").unwrap();
         assert!(alias.is_none());
+    }
+
+    #[test]
+    fn test_quarantine_roundtrip_and_reviews() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.db")).unwrap();
+
+        let record = QuarantineRecord {
+            quarantine_id: "q_test".to_string(),
+            session_id: "sess_1".to_string(),
+            message_index: 3,
+            content_hash: "hash123".to_string(),
+            safe_excerpt: "safe excerpt".to_string(),
+            acip_classification: AcipClassification::Disallowed {
+                category: "prompt_injection".to_string(),
+                action: "quarantine".to_string(),
+            },
+            audit_tag: Some("ACIP_AUDIT_MODE=ENABLED".to_string()),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            replay_command: "ms security quarantine replay q_test --i-understand-the-risks".to_string(),
+        };
+
+        db.insert_quarantine_record(&record).unwrap();
+
+        let fetched = db.get_quarantine_record("q_test").unwrap().unwrap();
+        assert_eq!(fetched.session_id, "sess_1");
+        assert_eq!(fetched.message_index, 3);
+        assert!(matches!(
+            fetched.acip_classification,
+            AcipClassification::Disallowed { .. }
+        ));
+
+        let records = db.list_quarantine_records_by_session("sess_1", 10).unwrap();
+        assert_eq!(records.len(), 1);
+
+        let review_id = db
+            .insert_quarantine_review("q_test", "confirm_injection", None)
+            .unwrap();
+        let reviews = db.list_quarantine_reviews("q_test").unwrap();
+        assert_eq!(reviews.len(), 1);
+        assert_eq!(reviews[0].id, review_id);
+        assert_eq!(reviews[0].action, "confirm_injection");
     }
 
     #[test]

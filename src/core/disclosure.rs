@@ -363,7 +363,7 @@ pub fn disclose_level(spec: &SkillSpec, assets: &SkillAssets, level: DisclosureL
 }
 
 /// Pack content within a token budget
-fn disclose_packed(spec: &SkillSpec, assets: &SkillAssets, budget: &TokenBudget) -> DisclosedContent {
+fn disclose_packed(spec: &SkillSpec, _assets: &SkillAssets, budget: &TokenBudget) -> DisclosedContent {
     // Start with frontmatter (always included)
     let frontmatter = DisclosedFrontmatter::from(&spec.metadata);
     let frontmatter_tokens = estimate_tokens_frontmatter(&spec.metadata, false);

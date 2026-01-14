@@ -25,6 +25,12 @@ pub enum MsError {
     #[error("Search index error: {0}")]
     SearchIndex(#[from] tantivy::TantivyError),
 
+    #[error("JSON serialization error: {0}")]
+    Json(#[from] serde_json::Error),
+
+    #[error("YAML serialization error: {0}")]
+    Yaml(#[from] serde_yaml::Error),
+
     #[error("Query parse error: {0}")]
     QueryParse(String),
 

@@ -78,14 +78,18 @@ Replay is always opt-in with explicit acknowledgement flags.
 
 ```text
 ms security scan
+ms security scan --input "..."
+ms security scan --input-file path/to/file --session-id sess_123 --message-index 7
 ms security scan --session <session-id>
 ms security scan --audit-mode
 
 ms security quarantine list
+ms security quarantine list --session-id <session-id>
 ms security quarantine show <id>
 ms security quarantine review <id> --confirm-injection
 ms security quarantine review <id> --false-positive --reason "..."
 ms security quarantine replay <id> --i-understand-the-risks
+ms security quarantine reviews <id>
 
 ms security acip status
 ms security acip config
@@ -102,7 +106,7 @@ All `ms security * --robot` commands should emit JSON only. Suggested shapes:
 ```
 
 Review/replay behaviors:
-- `review` validates flags and records intent (persistence TBD).
+- `review` validates flags and records the action in SQLite.
 - `replay` returns safe excerpt only; raw content is never emitted.
 
 ```json

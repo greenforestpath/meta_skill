@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use git2::{Commit, ErrorCode, IndexAddOption, Oid, Repository, Signature};
 use serde::{Deserialize, Serialize};
 
-use crate::core::SkillSpec;
+use crate::core::{SkillMetadata, SkillSpec};
 use crate::error::{MsError, Result};
 
 /// Git archive for skill versioning and audit trail
@@ -56,6 +56,60 @@ impl GitArchive {
         &self.root
     }
 
+    pub fn list_skill_ids(&self) -> Result<Vec<String>> {
+        let base = self.root.join("skills/by-id");
+        if !base.exists() {
+            return Ok(Vec::new());
+        }
+        let mut ids = Vec::new();
+        for entry in fs::read_dir(base)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                if let Some(name) = entry.file_name().to_str() {
+                    ids.push(name.to_string());
+                }
+            }
+        }
+        ids.sort();
+        Ok(ids)
+    }
+
+    pub fn recent_commits(&self, limit: usize) -> Result<Vec<SkillCommit>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut revwalk = self.repo.revwalk()?;
+        match self.repo.head() {
+            Ok(head) => {
+                if let Some(oid) = head.target() {
+                    revwalk.push(oid)?;
+                } else {
+                    return Ok(Vec::new());
+                }
+            }
+            Err(err) if err.code() == ErrorCode::UnbornBranch => return Ok(Vec::new()),
+            Err(err) if err.code() == ErrorCode::NotFound => return Ok(Vec::new()),
+            Err(err) => return Err(MsError::Git(err)),
+        }
+
+        let mut commits = Vec::new();
+        for oid in revwalk.take(limit) {
+            let oid = oid.map_err(MsError::Git)?;
+            let commit = self.repo.find_commit(oid)?;
+            let message = commit
+                .summary()
+                .unwrap_or_default()
+                .to_string();
+            commits.push(SkillCommit {
+                oid: oid.to_string(),
+                message,
+            });
+        }
+
+        Ok(commits)
+    }
+
     /// Write a skill spec + compiled markdown into the archive and commit.
     pub fn write_skill(&self, spec: &SkillSpec) -> Result<SkillCommit> {
         let skill_id = spec.metadata.id.trim();
@@ -67,6 +121,8 @@ impl GitArchive {
 
         let skill_dir = self.root.join("skills/by-id").join(skill_id);
         fs::create_dir_all(&skill_dir)?;
+        fs::create_dir_all(skill_dir.join("evidence"))?;
+        fs::create_dir_all(skill_dir.join("tests"))?;
 
         let metadata_path = skill_dir.join("metadata.yaml");
         let spec_path = skill_dir.join("skill.spec.json");
@@ -115,6 +171,18 @@ impl GitArchive {
         let contents = fs::read_to_string(spec_path)?;
         let spec = serde_json::from_str(&contents)?;
         Ok(spec)
+    }
+
+    /// Read skill metadata from the archive.
+    pub fn read_metadata(&self, skill_id: &str) -> Result<SkillMetadata> {
+        let metadata_path = self
+            .root
+            .join("skills/by-id")
+            .join(skill_id)
+            .join("metadata.yaml");
+        let contents = fs::read_to_string(metadata_path)?;
+        let metadata = serde_yaml::from_str(&contents)?;
+        Ok(metadata)
     }
 
     /// Delete a skill directory and commit the removal.
@@ -296,6 +364,12 @@ mod tests {
 
         let read_spec = archive.read_skill("test-skill").unwrap();
         assert_eq!(read_spec.metadata.id, "test-skill");
+
+        let metadata = archive.read_metadata("test-skill").unwrap();
+        assert_eq!(metadata.id, "test-skill");
+        assert!(skill_dir.join("evidence").exists());
+        assert!(skill_dir.join("tests").exists());
+        assert!(skill_dir.join("usage-log.jsonl").exists());
     }
 
     #[test]
@@ -320,5 +394,30 @@ mod tests {
         let commit = archive.delete_skill("delete-skill").unwrap();
         assert!(commit.message.contains("delete-skill"));
         assert!(!dir.path().join("skills/by-id/delete-skill").exists());
+    }
+
+    #[test]
+    fn test_list_skill_ids() {
+        let dir = tempdir().unwrap();
+        let archive = GitArchive::open(dir.path()).unwrap();
+        let spec_a = sample_spec("alpha");
+        let spec_b = sample_spec("beta");
+        archive.write_skill(&spec_b).unwrap();
+        archive.write_skill(&spec_a).unwrap();
+
+        let ids = archive.list_skill_ids().unwrap();
+        assert_eq!(ids, vec!["alpha".to_string(), "beta".to_string()]);
+    }
+
+    #[test]
+    fn test_recent_commits() {
+        let dir = tempdir().unwrap();
+        let archive = GitArchive::open(dir.path()).unwrap();
+        let spec = sample_spec("recent-skill");
+        archive.write_skill(&spec).unwrap();
+
+        let commits = archive.recent_commits(5).unwrap();
+        assert!(!commits.is_empty());
+        assert!(commits[0].message.contains("recent-skill"));
     }
 }
