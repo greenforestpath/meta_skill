@@ -422,4 +422,35 @@ mod tests {
         // File should still not exist at original location
         assert!(!test_file.exists());
     }
+
+    #[test]
+    fn test_tombstone_id_validation() {
+        let tmp = TempDir::new().unwrap();
+        let ms_root = tmp.path();
+        let manager = TombstoneManager::new(ms_root);
+
+        // Path traversal attacks should be rejected
+        assert!(manager.restore("../../../etc/passwd").is_err());
+        assert!(manager.restore("..").is_err());
+        assert!(manager.restore("foo/../bar").is_err());
+        assert!(manager.restore("foo/bar").is_err());
+        assert!(manager.restore("foo\\bar").is_err());
+        assert!(manager.restore("foo\0bar").is_err());
+        assert!(manager.restore("").is_err());
+
+        // Same for purge
+        assert!(manager.purge("../../../etc/passwd").is_err());
+        assert!(manager.purge("..").is_err());
+
+        // Invalid characters (not UUID format)
+        assert!(manager.restore("not a valid uuid!").is_err());
+        assert!(manager.restore("hello world").is_err());
+
+        // Valid UUID format should pass validation (but fail with NotFound)
+        let result = manager.restore("550e8400-e29b-41d4-a716-446655440000");
+        assert!(result.is_err());
+        // Should be NotFound, not ValidationFailed
+        let err_msg = format!("{:?}", result.unwrap_err());
+        assert!(err_msg.contains("NotFound") || err_msg.contains("not found"));
+    }
 }

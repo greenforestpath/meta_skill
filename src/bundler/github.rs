@@ -590,4 +590,22 @@ mod tests {
         let asset = select_asset(&assets, None).unwrap();
         assert_eq!(asset.id, 1);
     }
+
+    #[test]
+    fn is_github_url_accepts_github_domains() {
+        assert!(is_github_url("https://github.com/owner/repo"));
+        assert!(is_github_url("https://api.github.com/repos/owner/repo"));
+        assert!(is_github_url("https://raw.githubusercontent.com/owner/repo/main/file"));
+        assert!(is_github_url("https://objects.githubusercontent.com/some/path"));
+        // Case insensitive
+        assert!(is_github_url("HTTPS://GITHUB.COM/owner/repo"));
+    }
+
+    #[test]
+    fn is_github_url_rejects_non_github() {
+        assert!(!is_github_url("https://example.com/bundle.msb"));
+        assert!(!is_github_url("https://evil.com/github.com/fake"));
+        assert!(!is_github_url("http://github.com.evil.com/"));
+        assert!(!is_github_url("https://notgithub.com/"));
+    }
 }
