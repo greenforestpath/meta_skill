@@ -236,10 +236,16 @@ fn run_create(ctx: &AppContext, args: &BundleCreateArgs) -> Result<()> {
 }
 
 fn run_install(ctx: &AppContext, args: &BundleInstallArgs) -> Result<()> {
-    let bytes = if std::path::Path::new(&args.source).exists() {
-        std::fs::read(&args.source).map_err(|err| {
-            MsError::Config(format!("read {}: {err}", args.source))
+    let local_path = expand_local_path(&args.source);
+    let bytes = if local_path.exists() {
+        std::fs::read(&local_path).map_err(|err| {
+            MsError::Config(format!("read {}: {err}", local_path.display()))
         })?
+    } else if looks_like_path(&args.source) {
+        return Err(MsError::ValidationFailed(format!(
+            "bundle source not found: {}",
+            local_path.display()
+        )));
     } else if args.source.starts_with("http://") || args.source.starts_with("https://") {
         download_url(&args.source, args.token.clone())?
     } else if let Some((repo, tag)) = split_repo_tag(&args.source) {
@@ -352,6 +358,28 @@ fn split_repo_tag(input: &str) -> Option<(&str, Option<&str>)> {
         return Some((input, None));
     }
     None
+}
+
+fn looks_like_path(input: &str) -> bool {
+    input == "~"
+        || input.starts_with("~/")
+        || input.starts_with("./")
+        || input.starts_with("../")
+        || input.starts_with('/')
+}
+
+fn expand_local_path(input: &str) -> PathBuf {
+    if input == "~" {
+        if let Some(home) = dirs::home_dir() {
+            return home;
+        }
+    }
+    if let Some(stripped) = input.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(stripped);
+        }
+    }
+    PathBuf::from(input)
 }
 
 #[derive(serde::Serialize)]

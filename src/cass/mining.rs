@@ -231,6 +231,258 @@ pub struct CommandIR {
 }
 
 // =============================================================================
+// Session Segmentation
+// =============================================================================
+
+/// Phase of a coding session
+///
+/// Sessions typically progress through these phases:
+/// 1. Reconnaissance - understanding the problem, reading code
+/// 2. Change - making modifications to solve the problem
+/// 3. Validation - testing, verifying the changes work
+/// 4. WrapUp - committing, cleanup, final summaries
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionPhase {
+    /// Initial exploration: reading files, searching, understanding
+    Reconnaissance,
+    /// Active changes: editing, writing, running commands
+    Change,
+    /// Verification: running tests, checking builds, reviewing
+    Validation,
+    /// Final steps: commits, cleanup, summaries
+    WrapUp,
+}
+
+/// A segment of messages belonging to a single phase
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionSegment {
+    /// The phase this segment belongs to
+    pub phase: SessionPhase,
+    /// Starting message index (inclusive)
+    pub start_idx: usize,
+    /// Ending message index (exclusive)
+    pub end_idx: usize,
+    /// Confidence that this segmentation is correct (0.0 to 1.0)
+    pub confidence: f32,
+}
+
+/// A session divided into phase segments
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SegmentedSession {
+    /// The original session ID
+    pub session_id: String,
+    /// Ordered list of segments
+    pub segments: Vec<SessionSegment>,
+    /// Total message count
+    pub total_messages: usize,
+}
+
+impl SegmentedSession {
+    /// Get all segments of a particular phase
+    pub fn segments_for_phase(&self, phase: SessionPhase) -> Vec<&SessionSegment> {
+        self.segments.iter().filter(|s| s.phase == phase).collect()
+    }
+
+    /// Get the dominant phase (most messages)
+    pub fn dominant_phase(&self) -> Option<SessionPhase> {
+        let mut counts = std::collections::HashMap::new();
+        for seg in &self.segments {
+            let len = seg.end_idx - seg.start_idx;
+            *counts.entry(seg.phase).or_insert(0usize) += len;
+        }
+        counts.into_iter().max_by_key(|(_, c)| *c).map(|(p, _)| p)
+    }
+}
+
+/// Segment a session into phases based on tool usage and message patterns
+pub fn segment_session(session: &Session) -> SegmentedSession {
+    let mut segments = Vec::new();
+    let mut current_phase = SessionPhase::Reconnaissance;
+    let mut phase_start = 0;
+
+    for (idx, msg) in session.messages.iter().enumerate() {
+        let detected_phase = classify_message_phase(msg);
+
+        // Phase transition detected
+        if detected_phase != current_phase && idx > phase_start {
+            // Only record segment if it has messages
+            segments.push(SessionSegment {
+                phase: current_phase,
+                start_idx: phase_start,
+                end_idx: idx,
+                confidence: compute_segment_confidence(&session.messages[phase_start..idx], current_phase),
+            });
+            current_phase = detected_phase;
+            phase_start = idx;
+        }
+    }
+
+    // Record final segment
+    if phase_start < session.messages.len() {
+        segments.push(SessionSegment {
+            phase: current_phase,
+            start_idx: phase_start,
+            end_idx: session.messages.len(),
+            confidence: compute_segment_confidence(&session.messages[phase_start..], current_phase),
+        });
+    }
+
+    // Merge adjacent segments of same phase
+    segments = merge_adjacent_segments(segments);
+
+    SegmentedSession {
+        session_id: session.id.clone(),
+        segments,
+        total_messages: session.messages.len(),
+    }
+}
+
+/// Classify a message into a session phase based on its content and tool usage
+fn classify_message_phase(msg: &super::client::SessionMessage) -> SessionPhase {
+    // Check tool calls to determine phase
+    for tool in &msg.tool_calls {
+        match tool.name.as_str() {
+            // Reconnaissance tools
+            "Read" | "read" | "Glob" | "glob" | "Grep" | "grep" | "ListDirectory" => {
+                return SessionPhase::Reconnaissance;
+            }
+            // Change tools
+            "Edit" | "edit" | "Write" | "write" | "NotebookEdit" => {
+                return SessionPhase::Change;
+            }
+            // Bash commands need deeper analysis
+            "Bash" | "bash" => {
+                if let Some(cmd) = tool.arguments.get("command").and_then(|v| v.as_str()) {
+                    return classify_bash_command(cmd);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Check content for phase indicators
+    let content_lower = msg.content.to_lowercase();
+
+    // WrapUp indicators
+    if content_lower.contains("commit")
+        || content_lower.contains("done")
+        || content_lower.contains("complete")
+        || content_lower.contains("finished")
+        || content_lower.contains("summary")
+    {
+        return SessionPhase::WrapUp;
+    }
+
+    // Validation indicators
+    if content_lower.contains("test")
+        || content_lower.contains("verify")
+        || content_lower.contains("check")
+        || content_lower.contains("works")
+    {
+        return SessionPhase::Validation;
+    }
+
+    // Default to reconnaissance for user messages, change for assistant
+    if msg.role == "user" {
+        SessionPhase::Reconnaissance
+    } else {
+        SessionPhase::Change
+    }
+}
+
+/// Classify a bash command into a session phase
+fn classify_bash_command(cmd: &str) -> SessionPhase {
+    let cmd_lower = cmd.to_lowercase();
+
+    // WrapUp commands
+    if cmd_lower.starts_with("git commit")
+        || cmd_lower.starts_with("git push")
+        || cmd_lower.contains("git tag")
+    {
+        return SessionPhase::WrapUp;
+    }
+
+    // Validation commands
+    if cmd_lower.contains("test")
+        || cmd_lower.contains("cargo check")
+        || cmd_lower.contains("cargo build")
+        || cmd_lower.contains("npm run")
+        || cmd_lower.contains("pytest")
+        || cmd_lower.contains("go test")
+        || cmd_lower.starts_with("git status")
+        || cmd_lower.starts_with("git diff")
+    {
+        return SessionPhase::Validation;
+    }
+
+    // Reconnaissance commands
+    if cmd_lower.starts_with("ls")
+        || cmd_lower.starts_with("cat")
+        || cmd_lower.starts_with("head")
+        || cmd_lower.starts_with("tail")
+        || cmd_lower.starts_with("find")
+        || cmd_lower.starts_with("grep")
+        || cmd_lower.starts_with("rg")
+        || cmd_lower.starts_with("git log")
+        || cmd_lower.starts_with("git show")
+    {
+        return SessionPhase::Reconnaissance;
+    }
+
+    // Default to Change for other bash commands
+    SessionPhase::Change
+}
+
+/// Compute confidence score for a segment
+fn compute_segment_confidence(
+    messages: &[super::client::SessionMessage],
+    expected_phase: SessionPhase,
+) -> f32 {
+    if messages.is_empty() {
+        return 0.0;
+    }
+
+    let mut matching = 0;
+    for msg in messages {
+        if classify_message_phase(msg) == expected_phase {
+            matching += 1;
+        }
+    }
+
+    matching as f32 / messages.len() as f32
+}
+
+/// Merge adjacent segments that have the same phase
+fn merge_adjacent_segments(segments: Vec<SessionSegment>) -> Vec<SessionSegment> {
+    if segments.is_empty() {
+        return segments;
+    }
+
+    let mut merged = Vec::new();
+    let mut current = segments[0].clone();
+
+    for seg in segments.into_iter().skip(1) {
+        if seg.phase == current.phase && seg.start_idx == current.end_idx {
+            // Merge: extend current segment
+            current.end_idx = seg.end_idx;
+            // Recompute confidence as weighted average
+            let current_len = current.end_idx - current.start_idx;
+            let seg_len = seg.end_idx - seg.start_idx;
+            current.confidence = (current.confidence * (current_len - seg_len) as f32
+                + seg.confidence * seg_len as f32)
+                / current_len as f32;
+        } else {
+            merged.push(current);
+            current = seg;
+        }
+    }
+    merged.push(current);
+
+    merged
+}
+
+// =============================================================================
 // Legacy Pattern Type (for backward compatibility)
 // =============================================================================
 

@@ -1,0 +1,193 @@
+//! Skill Overlays
+//!
+//! Overlays allow dynamic modification of skills based on runtime context.
+//! This enables features like environment-specific adjustments, A/B testing,
+//! and conditional skill variations.
+
+use serde::{Deserialize, Serialize};
+
+use super::skill::SkillSpec;
+
+/// Result of applying an overlay to a skill
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OverlayApplicationResult {
+    /// ID of the overlay that was applied
+    pub overlay_id: String,
+    /// Whether the overlay was successfully applied
+    pub applied: bool,
+    /// Description of what changed (if anything)
+    pub changes: Vec<String>,
+}
+
+/// Context for overlay application (e.g., environment, user preferences)
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OverlayContext {
+    /// Environment name (e.g., "development", "production")
+    pub environment: Option<String>,
+    /// User-specific settings
+    pub user_settings: std::collections::HashMap<String, String>,
+}
+
+impl OverlayContext {
+    /// Create context from environment variables
+    pub fn from_env() -> Self {
+        let environment = std::env::var("MS_ENVIRONMENT").ok();
+        Self {
+            environment,
+            user_settings: std::collections::HashMap::new(),
+        }
+    }
+}
+
+/// An overlay that can modify a skill based on context
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillOverlay {
+    /// Unique ID for this overlay
+    pub id: String,
+    /// ID of the skill this overlay applies to
+    pub skill_id: String,
+    /// Priority for overlay application (higher = applied later)
+    pub priority: i32,
+    /// Conditions under which this overlay applies
+    pub conditions: Vec<OverlayCondition>,
+    /// Modifications to apply
+    pub modifications: Vec<OverlayModification>,
+}
+
+impl SkillOverlay {
+    /// Apply this overlay to a skill spec
+    pub fn apply_to(&self, spec: &mut SkillSpec, context: &OverlayContext) -> OverlayApplicationResult {
+        // Check if conditions are met
+        if !self.conditions_met(context) {
+            return OverlayApplicationResult {
+                overlay_id: self.id.clone(),
+                applied: false,
+                changes: vec![],
+            };
+        }
+
+        let mut changes = Vec::new();
+
+        for modification in &self.modifications {
+            match modification {
+                OverlayModification::AppendDescription(text) => {
+                    spec.metadata.description.push_str(text);
+                    changes.push(format!("Appended to description: {}", text));
+                }
+                OverlayModification::AddTag(tag) => {
+                    spec.metadata.tags.push(tag.clone());
+                    changes.push(format!("Added tag: {}", tag));
+                }
+                OverlayModification::SetMetadata { key, value } => {
+                    // For now, just track the change - metadata modifications
+                    // would need more sophisticated handling
+                    changes.push(format!("Set metadata {}: {}", key, value));
+                }
+            }
+        }
+
+        OverlayApplicationResult {
+            overlay_id: self.id.clone(),
+            applied: true,
+            changes,
+        }
+    }
+
+    fn conditions_met(&self, context: &OverlayContext) -> bool {
+        self.conditions.iter().all(|c| c.is_met(context))
+    }
+}
+
+impl PartialEq for SkillOverlay {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for SkillOverlay {}
+
+impl PartialOrd for SkillOverlay {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for SkillOverlay {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.priority.cmp(&other.priority)
+    }
+}
+
+/// Conditions for overlay application
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum OverlayCondition {
+    /// Apply only in specific environment
+    Environment(String),
+    /// Apply based on user setting
+    UserSetting { key: String, value: String },
+    /// Always apply
+    Always,
+}
+
+impl OverlayCondition {
+    fn is_met(&self, context: &OverlayContext) -> bool {
+        match self {
+            OverlayCondition::Environment(env) => {
+                context.environment.as_ref() == Some(env)
+            }
+            OverlayCondition::UserSetting { key, value } => {
+                context.user_settings.get(key) == Some(value)
+            }
+            OverlayCondition::Always => true,
+        }
+    }
+}
+
+/// Modifications an overlay can make
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum OverlayModification {
+    /// Append text to description
+    AppendDescription(String),
+    /// Add a tag
+    AddTag(String),
+    /// Set arbitrary metadata
+    SetMetadata { key: String, value: String },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_overlay_context_from_env() {
+        let ctx = OverlayContext::from_env();
+        // Just verify it doesn't panic
+        assert!(ctx.user_settings.is_empty());
+    }
+
+    #[test]
+    fn test_condition_always() {
+        let cond = OverlayCondition::Always;
+        let ctx = OverlayContext::default();
+        assert!(cond.is_met(&ctx));
+    }
+
+    #[test]
+    fn test_overlay_ordering() {
+        let low = SkillOverlay {
+            id: "low".into(),
+            skill_id: "test".into(),
+            priority: 1,
+            conditions: vec![],
+            modifications: vec![],
+        };
+        let high = SkillOverlay {
+            id: "high".into(),
+            skill_id: "test".into(),
+            priority: 10,
+            conditions: vec![],
+            modifications: vec![],
+        };
+        assert!(low < high);
+    }
+}
