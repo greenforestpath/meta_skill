@@ -93,6 +93,11 @@ impl SkillOverlay {
         }
     }
 
+    /// Apply this overlay (alias for apply_to).
+    pub fn apply(&self, spec: &mut SkillSpec, context: &OverlayContext) -> OverlayApplicationResult {
+        self.apply_to(spec, context)
+    }
+
     fn conditions_met(&self, context: &OverlayContext) -> bool {
         self.conditions.iter().all(|c| c.is_met(context))
     }
