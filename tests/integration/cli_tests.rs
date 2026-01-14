@@ -223,7 +223,7 @@ fn test_build_requires_source() {
 
 #[test]
 fn test_build_guided_and_auto_mutually_exclusive() {
-    let mut fixture = TestFixture::new("test_build_guided_and_auto_mutually_exclusive");
+    let fixture = TestFixture::new("test_build_guided_and_auto_mutually_exclusive");
     let init = fixture.init();
     assert!(init.success, "init failed");
 
@@ -239,7 +239,7 @@ fn test_build_guided_and_auto_mutually_exclusive() {
 
 #[test]
 fn test_build_auto_requires_from_cass() {
-    let mut fixture = TestFixture::new("test_build_auto_requires_from_cass");
+    let fixture = TestFixture::new("test_build_auto_requires_from_cass");
     let init = fixture.init();
     assert!(init.success, "init failed");
 
