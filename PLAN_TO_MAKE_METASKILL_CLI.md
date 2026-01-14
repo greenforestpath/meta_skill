@@ -13266,6 +13266,8 @@ impl CrossProjectAnalyzer {
     }
 
     /// Identify tech-specific patterns by filtering out universal ones
+    ///
+    /// NOTE: Properly tracks distinct projects per pattern (not just occurrence count).
     pub async fn find_tech_specific_patterns(
         &self,
         tech_stack: &TechStackContext,
@@ -13281,7 +13283,9 @@ impl CrossProjectAnalyzer {
             .filter(|p| self.stacks_overlap(&p.tech_stack, tech_stack))
             .collect();
 
-        let mut tech_patterns = Vec::new();
+        // Track patterns with their source projects for correct project_count
+        let mut pattern_projects: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut pattern_examples: HashMap<String, Pattern> = HashMap::new();
 
         for project in tech_projects {
             let sessions = self.cass.get_sessions_for_project(&project.path).await?;
@@ -13295,39 +13299,93 @@ impl CrossProjectAnalyzer {
                     continue;
                 }
 
-                tech_patterns.push(TechSpecificPattern {
-                    pattern: pattern.clone(),
-                    tech_stack: tech_stack.clone(),
-                    project_count: 1,
-                });
+                // Track distinct projects per normalized pattern
+                pattern_projects
+                    .entry(normalized.clone())
+                    .or_default()
+                    .insert(project.name.clone());
+
+                // Keep one example of the original pattern
+                pattern_examples
+                    .entry(normalized)
+                    .or_insert(pattern);
             }
         }
 
-        // Merge similar patterns
+        // Convert to TechSpecificPattern with correct project_count
+        let tech_patterns: Vec<TechSpecificPattern> = pattern_projects
+            .into_iter()
+            .filter_map(|(normalized, projects)| {
+                pattern_examples.get(&normalized).map(|example| {
+                    TechSpecificPattern {
+                        pattern: example.clone(),
+                        tech_stack: tech_stack.clone(),
+                        project_count: projects.len(),  // Correct: distinct project count
+                    }
+                })
+            })
+            .collect();
+
+        // Merge similar patterns (further clustering if needed)
         Ok(self.merge_tech_patterns(tech_patterns))
     }
 
     /// Normalize pattern for cross-project comparison
+    ///
+    /// IMPORTANT: Uses pre-compiled regexes for performance (LazyLock).
+    /// Normalization is idempotent: normalize(normalize(x)) == normalize(x)
     fn normalize_pattern(&self, pattern: &Pattern) -> String {
+        use std::sync::LazyLock;
+
+        // Pre-compiled regexes (compiled once, reused across calls)
+        static PATH_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+            // Cross-platform: handles Unix and Windows paths, hyphens, dots in names
+            Regex::new(r"(?:[A-Za-z]:\\|/)?[\w\-./\\]+[/\\](src|lib|pkg|internal|cmd)[/\\]").unwrap()
+        });
+        static JS_EXT_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+            // All JS-family extensions including ESM/CJS variants
+            Regex::new(r"\.(ts|tsx|js|jsx|mjs|cjs|mts|cts)").unwrap()
+        });
+        static RUST_EXT_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(r"\.rs").unwrap()
+        });
+        static GO_EXT_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(r"\.go").unwrap()
+        });
+        static PY_EXT_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(r"\.(py|pyi)").unwrap()
+        });
+        static JAVA_EXT_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(r"\.(java|kt|kts)").unwrap()
+        });
+
         // Remove project-specific details
         let mut normalized = pattern.generalized.clone();
 
-        // Replace specific paths with placeholders
-        normalized = regex::Regex::new(r"/[\w/]+/(src|lib|pkg)/").unwrap()
+        // Replace specific paths with placeholders (cross-platform)
+        normalized = PATH_REGEX
             .replace_all(&normalized, "/PROJECT_ROOT/")
             .to_string();
 
         // Replace specific file extensions with type placeholders
-        normalized = regex::Regex::new(r"\.(ts|tsx|js|jsx)").unwrap()
+        normalized = JS_EXT_REGEX
             .replace_all(&normalized, ".{js-family}")
             .to_string();
 
-        normalized = regex::Regex::new(r"\.rs").unwrap()
+        normalized = RUST_EXT_REGEX
             .replace_all(&normalized, ".{rust}")
             .to_string();
 
-        normalized = regex::Regex::new(r"\.go").unwrap()
+        normalized = GO_EXT_REGEX
             .replace_all(&normalized, ".{go}")
+            .to_string();
+
+        normalized = PY_EXT_REGEX
+            .replace_all(&normalized, ".{python}")
+            .to_string();
+
+        normalized = JAVA_EXT_REGEX
+            .replace_all(&normalized, ".{jvm}")
             .to_string();
 
         // Lowercase for comparison
@@ -13400,38 +13458,85 @@ pub enum EdgeRelation {
 
 impl CoverageAnalyzer {
     /// Find topics with sessions but no skills
+    ///
+    /// OPTIMIZATION: Uses batch scoring instead of O(N×search) per-topic queries.
+    /// Pre-computes skill embeddings and matches topics locally with ANN search.
     pub async fn find_gaps(&self) -> Result<Vec<CoverageGap>> {
-        let mut gaps = Vec::new();
-
-        // Get all unique topics from sessions
+        // Get all unique topics from sessions (cached with TTL)
         let session_topics = self.cass.get_all_topics().await?;
 
-        for topic in session_topics {
-            // Check if any skill covers this topic
-            let matching_skills = self.search.search(&topic.name, &SearchFilters::default(), 5).await?;
+        // BATCH APPROACH: Pre-compute coverage scores for all topics at once
+        // instead of N individual search calls
+        let coverage_scores = self.batch_compute_coverage(&session_topics).await?;
 
-            let coverage_score = if matching_skills.is_empty() {
-                0.0
-            } else {
-                matching_skills[0].score
-            };
+        let mut gaps: Vec<CoverageGap> = session_topics
+            .iter()
+            .filter_map(|topic| {
+                let (coverage_score, best_skill) = coverage_scores
+                    .get(&topic.name)
+                    .cloned()
+                    .unwrap_or((0.0, None));
 
-            if coverage_score < 0.5 {  // Threshold for "covered"
-                gaps.push(CoverageGap {
-                    topic: topic.name.clone(),
-                    session_count: topic.session_count,
-                    pattern_count: topic.pattern_count,
-                    best_matching_skill: matching_skills.first().map(|s| s.skill_id.clone()),
-                    coverage_score,
-                    priority: self.calculate_gap_priority(&topic, coverage_score),
-                });
-            }
-        }
+                if coverage_score < 0.5 {  // Threshold for "covered"
+                    Some(CoverageGap {
+                        topic: topic.name.clone(),
+                        session_count: topic.session_count,
+                        pattern_count: topic.pattern_count,
+                        best_matching_skill: best_skill,
+                        coverage_score,
+                        priority: self.calculate_gap_priority(topic, coverage_score),
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect();
 
-        // Sort by priority
-        gaps.sort_by(|a, b| b.priority.partial_cmp(&a.priority).unwrap());
+        // Sort by priority (deterministic: stable sort)
+        gaps.sort_by(|a, b| {
+            b.priority.partial_cmp(&a.priority)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.topic.cmp(&b.topic))  // Tiebreaker for stability
+        });
 
         Ok(gaps)
+    }
+
+    /// Batch compute coverage scores for all topics
+    ///
+    /// Instead of O(N) search calls, this:
+    /// 1. Embeds all skill tags into a local index (done once, cached)
+    /// 2. For each topic, does fast local ANN lookup
+    async fn batch_compute_coverage(
+        &self,
+        topics: &[TopicStats],
+    ) -> Result<HashMap<String, (f32, Option<String>)>> {
+        // Build skill coverage index (cached)
+        let skill_index = self.get_or_build_skill_index().await?;
+
+        let mut results = HashMap::with_capacity(topics.len());
+
+        for topic in topics {
+            // Fast local lookup against pre-built index
+            let (score, skill_id) = skill_index.best_match(&topic.name);
+            results.insert(topic.name.clone(), (score, skill_id));
+        }
+
+        Ok(results)
+    }
+
+    /// Get or build cached skill coverage index
+    async fn get_or_build_skill_index(&self) -> Result<SkillCoverageIndex> {
+        // In practice, this would be cached with TTL and rebuilt when skills change
+        let all_skills = self.skill_registry.all_skills()?;
+
+        let mut index = SkillCoverageIndex::new();
+        for skill in all_skills {
+            // Index by skill tags and name for fast topic matching
+            index.add_skill(&skill.id, &skill.metadata.tags, &skill.metadata.name);
+        }
+
+        Ok(index)
     }
 
     /// Suggest which skill to build next
@@ -13486,35 +13591,46 @@ impl CoverageAnalyzer {
     }
 
     /// Build knowledge graph for coverage and discovery
+    ///
+    /// Uses HashMap for node deduplication - no duplicate node IDs in output.
+    /// Node IDs follow stable format: `skill:<id>`, `topic:<tag>`, `pattern:<hash>`, `stack:<id>`
     pub async fn build_graph(&self) -> Result<KnowledgeGraph> {
-        let mut graph = KnowledgeGraph { nodes: vec![], edges: vec![] };
+        // Use HashMap for O(1) deduplication by node ID
+        let mut nodes_map: HashMap<String, GraphNode> = HashMap::new();
+        let mut edges: Vec<GraphEdge> = Vec::new();
 
         // Add skills as nodes
         for skill in self.skill_registry.all_skills()? {
-            graph.nodes.push(GraphNode {
-                id: skill.id.clone(),
+            let skill_id = format!("skill:{}", skill.id);
+            nodes_map.insert(skill_id.clone(), GraphNode {
+                id: skill_id,
                 node_type: NodeType::Skill,
                 label: skill.metadata.name.clone(),
                 tags: skill.metadata.tags.clone(),
             });
         }
 
-        // Add edges from skills to topics (from tags)
-        let skills: Vec<_> = graph.nodes.iter()
+        // Collect skill nodes for edge creation
+        let skill_nodes: Vec<_> = nodes_map.values()
             .filter(|n| matches!(n.node_type, NodeType::Skill))
             .cloned()
             .collect();
 
-        for node in skills {
+        // Add edges from skills to topics (from tags)
+        // Dedup topic nodes via HashMap - same topic from multiple skills = one node
+        for node in &skill_nodes {
             for tag in &node.tags {
                 let topic_id = format!("topic:{}", tag);
-                graph.nodes.push(GraphNode {
+
+                // Insert topic node only if not already present (dedup)
+                nodes_map.entry(topic_id.clone()).or_insert_with(|| GraphNode {
                     id: topic_id.clone(),
                     node_type: NodeType::Topic,
                     label: tag.clone(),
                     tags: vec![],
                 });
-                graph.edges.push(GraphEdge {
+
+                edges.push(GraphEdge {
                     from: node.id.clone(),
                     to: topic_id,
                     relation: EdgeRelation::AppliesTo,
@@ -13523,7 +13639,12 @@ impl CoverageAnalyzer {
             }
         }
 
-        Ok(graph)
+        // Convert to sorted Vec for deterministic output (diff-stable)
+        let mut nodes: Vec<GraphNode> = nodes_map.into_values().collect();
+        nodes.sort_by(|a, b| a.id.cmp(&b.id));
+        edges.sort_by(|a, b| (&a.from, &a.to).cmp(&(&b.from, &b.to)));
+
+        Ok(KnowledgeGraph { nodes, edges })
     }
 }
 
@@ -13623,7 +13744,143 @@ Robust error handling for long-running autonomous skill generation, including ne
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 24.2 Retry System
+### 24.2 Error Taxonomy and Retryability Classification
+
+All errors in `ms` are classified by their retryability to prevent wasteful retry attempts and surface permanent failures immediately.
+
+```rust
+use thiserror::Error;
+
+/// Unified error type with retryability classification
+#[derive(Error, Debug)]
+pub enum MsError {
+    // === TRANSIENT (safe to retry with backoff) ===
+    #[error("Network timeout: {0}")]
+    NetworkTimeout(String),
+
+    #[error("Connection refused: {0}")]
+    ConnectionRefused(String),
+
+    #[error("Rate limited by {provider}, retry after {retry_after:?}")]
+    RateLimited {
+        provider: String,
+        retry_after: Option<Duration>,
+    },
+
+    #[error("CASS temporarily unavailable: {0}")]
+    CassUnavailable(String),
+
+    #[error("LLM service error (retriable): {0}")]
+    LlmTransient(String),
+
+    // === PERMANENT (do NOT retry) ===
+    #[error("Invalid input: {0}")]
+    InvalidInput(String),
+
+    #[error("Skill not found: {0}")]
+    SkillNotFound(String),
+
+    #[error("Authentication failed: {0}")]
+    AuthFailed(String),
+
+    #[error("Permission denied: {0}")]
+    PermissionDenied(String),
+
+    #[error("Schema validation failed: {0}")]
+    ValidationFailed(String),
+
+    #[error("Corrupt checkpoint: {path}")]
+    CorruptCheckpoint { path: PathBuf },
+
+    #[error("LLM rejected request (permanent): {0}")]
+    LlmPermanent(String),
+
+    // === RESOURCE EXHAUSTION (may recover after cleanup) ===
+    #[error("Disk full: {0}")]
+    DiskFull(String),
+
+    #[error("Out of memory: {0}")]
+    OutOfMemory(String),
+
+    #[error("Context window exhausted")]
+    ContextExhausted,
+}
+
+/// Retry decision based on error classification
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryDecision {
+    /// Safe to retry immediately or with backoff
+    Retry { max_attempts: usize },
+    /// Retry after specific delay (from rate limit headers)
+    RetryAfter(Duration),
+    /// Do not retry - fail immediately with clear error
+    NoRetry,
+    /// May retry after resource cleanup (disk, memory)
+    RetryAfterCleanup,
+}
+
+impl MsError {
+    /// Determine retry policy based on error type
+    pub fn retry_policy(&self) -> RetryDecision {
+        match self {
+            // Transient errors: retry with exponential backoff
+            MsError::NetworkTimeout(_) |
+            MsError::ConnectionRefused(_) |
+            MsError::CassUnavailable(_) |
+            MsError::LlmTransient(_) => RetryDecision::Retry { max_attempts: 5 },
+
+            // Rate limit: respect the retry-after
+            MsError::RateLimited { retry_after, .. } => {
+                RetryDecision::RetryAfter(retry_after.unwrap_or(Duration::from_secs(60)))
+            }
+
+            // Permanent errors: fail fast, don't waste time retrying
+            MsError::InvalidInput(_) |
+            MsError::SkillNotFound(_) |
+            MsError::AuthFailed(_) |
+            MsError::PermissionDenied(_) |
+            MsError::ValidationFailed(_) |
+            MsError::CorruptCheckpoint { .. } |
+            MsError::LlmPermanent(_) => RetryDecision::NoRetry,
+
+            // Resource exhaustion: might recover after cleanup
+            MsError::DiskFull(_) |
+            MsError::OutOfMemory(_) |
+            MsError::ContextExhausted => RetryDecision::RetryAfterCleanup,
+        }
+    }
+
+    /// Exit code for CLI (follows Unix conventions)
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            MsError::InvalidInput(_) | MsError::ValidationFailed(_) => 1,
+            MsError::SkillNotFound(_) => 2,
+            MsError::AuthFailed(_) | MsError::PermissionDenied(_) => 3,
+            MsError::CassUnavailable(_) => 4,
+            MsError::NetworkTimeout(_) | MsError::ConnectionRefused(_) => 5,
+            MsError::RateLimited { .. } => 6,
+            MsError::DiskFull(_) | MsError::OutOfMemory(_) => 7,
+            MsError::CorruptCheckpoint { .. } => 8,
+            MsError::LlmTransient(_) | MsError::LlmPermanent(_) => 9,
+            MsError::ContextExhausted => 10,
+        }
+    }
+
+    /// User-facing hint for resolving the error
+    pub fn hint(&self) -> Option<&'static str> {
+        match self {
+            MsError::CassUnavailable(_) => Some("Check if CASS is running: `cass health`"),
+            MsError::CorruptCheckpoint { .. } => Some("Try: `ms build --prune-checkpoints`"),
+            MsError::DiskFull(_) => Some("Free disk space or prune checkpoints"),
+            MsError::RateLimited { .. } => Some("Wait and retry, or use a different provider"),
+            MsError::ContextExhausted => Some("Try with smaller input or use --resume"),
+            _ => None,
+        }
+    }
+}
+```
+
+### 24.3 Retry System
 
 ```rust
 /// Configurable retry system with backoff
@@ -13748,6 +14005,10 @@ impl RateLimitHandler {
     }
 
     /// Update rate limit state from API response headers
+    ///
+    /// Handles multiple header formats used by different providers:
+    /// - `x-ratelimit-reset`: Unix timestamp (seconds) OR RFC3339 datetime
+    /// - `retry-after`: Seconds (integer) OR HTTP-date (RFC2616)
     pub fn update_from_headers(&mut self, provider: &str, headers: &HeaderMap) {
         let state = self.limits.entry(provider.to_string()).or_insert_with(|| {
             RateLimitState {
@@ -13765,31 +14026,73 @@ impl RateLimitHandler {
                 .and_then(|s| s.parse().ok());
         }
 
+        // x-ratelimit-reset: Try unix timestamp first (most common), then RFC3339
         if let Some(reset) = headers.get("x-ratelimit-reset") {
-            state.reset_at = reset.to_str().ok()
-                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-                .map(|dt| dt.with_timezone(&Utc));
+            if let Ok(s) = reset.to_str() {
+                state.reset_at = Self::parse_reset_timestamp(s);
+            }
         }
 
-        // Handle retry-after header (common for 429 responses)
+        // retry-after: Can be seconds OR HTTP-date (RFC2616)
         if let Some(retry_after) = headers.get("retry-after") {
-            let seconds: u64 = retry_after.to_str().ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(60);
-            state.backoff_until = Some(Utc::now() + chrono::Duration::seconds(seconds as i64));
+            if let Ok(s) = retry_after.to_str() {
+                let backoff_duration = Self::parse_retry_after(s);
+                state.backoff_until = Some(Utc::now() + backoff_duration);
+            }
         }
     }
 
+    /// Parse x-ratelimit-reset header value
+    /// Handles: unix timestamp (seconds), RFC3339 datetime
+    fn parse_reset_timestamp(value: &str) -> Option<DateTime<Utc>> {
+        // Try unix timestamp first (most APIs use this)
+        if let Ok(secs) = value.parse::<i64>() {
+            return DateTime::from_timestamp(secs, 0);
+        }
+
+        // Try RFC3339 datetime
+        if let Ok(dt) = DateTime::parse_from_rfc3339(value) {
+            return Some(dt.with_timezone(&Utc));
+        }
+
+        None
+    }
+
+    /// Parse retry-after header value
+    /// Handles: seconds (integer), HTTP-date (RFC2616)
+    fn parse_retry_after(value: &str) -> chrono::Duration {
+        // Try seconds first (most common)
+        if let Ok(secs) = value.parse::<i64>() {
+            return chrono::Duration::seconds(secs);
+        }
+
+        // Try HTTP-date format (e.g., "Wed, 21 Oct 2015 07:28:00 GMT")
+        if let Ok(dt) = DateTime::parse_from_rfc2822(value) {
+            let now = Utc::now();
+            let target = dt.with_timezone(&Utc);
+            if target > now {
+                return target - now;
+            }
+        }
+
+        // Default fallback
+        chrono::Duration::seconds(60)
+    }
+
     /// Execute with rate limit awareness
-    pub async fn execute_with_limits<F, T>(
+    ///
+    /// IMPORTANT: Takes a closure that produces a Future, not a Future directly.
+    /// This ensures the operation isn't started until after rate limit check.
+    pub async fn execute_with_limits<F, Fut, T>(
         &mut self,
         provider: &str,
         operation: F,
     ) -> Result<T>
     where
-        F: Future<Output = Result<T>>,
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<T>>,
     {
-        // Wait if rate limited
+        // Wait if rate limited (BEFORE creating the future)
         if let Some(wait_duration) = self.should_wait(provider) {
             eprintln!(
                 "Rate limited by {}, waiting {:?}",
@@ -13798,7 +14101,8 @@ impl RateLimitHandler {
             tokio::time::sleep(wait_duration).await;
         }
 
-        operation.await
+        // Now create and await the future
+        operation().await
     }
 }
 ```
@@ -13967,21 +14271,51 @@ pub enum DataLoss {
 ### 24.5 Graceful Degradation
 
 ```rust
+use serde::{Serialize, de::DeserializeOwned};
+
 /// Handle component failures gracefully
 pub struct GracefulDegradation {
     cass_available: AtomicBool,
     network_available: AtomicBool,
     cache: DegradationCache,
+    /// Configured endpoints for health checks (not hardcoded)
+    health_endpoints: HealthEndpoints,
+}
+
+/// Configurable health check endpoints
+#[derive(Debug, Clone)]
+pub struct HealthEndpoints {
+    /// CASS endpoint (required dependency)
+    pub cass: Option<String>,
+    /// LLM provider endpoints (optional, only if LLM features enabled)
+    pub llm_providers: Vec<String>,
+    /// Network check endpoint (optional, for offline detection)
+    pub network_probe: Option<String>,
+}
+
+impl Default for HealthEndpoints {
+    fn default() -> Self {
+        Self {
+            cass: None,  // Will use CassClient default
+            llm_providers: vec![],
+            network_probe: None,  // Optional: only check if configured
+        }
+    }
 }
 
 impl GracefulDegradation {
     /// Execute with fallback options
+    ///
+    /// NOTE: T must be Serialize + DeserializeOwned for caching to work.
     pub async fn execute_with_fallback<T>(
         &self,
         primary: impl Future<Output = Result<T>>,
         fallback: impl Future<Output = Result<T>>,
         cache_key: &str,
-    ) -> Result<T> {
+    ) -> Result<T>
+    where
+        T: Serialize + DeserializeOwned,  // Required for cache serialization
+    {
         // Try primary
         match primary.await {
             Ok(result) => {
@@ -14016,26 +14350,55 @@ impl GracefulDegradation {
     }
 
     /// Check component health and update status
+    ///
+    /// Probes CONFIGURED dependencies only - not hardcoded external services.
+    /// Network check is optional and uses configured probe endpoint if provided.
     pub async fn health_check(&self) -> HealthStatus {
-        // Check CASS
+        // Check CASS (our primary dependency)
         let cass_ok = timeout(Duration::from_secs(5), async {
             CassClient::new().health_check().await.is_ok()
         }).await.unwrap_or(false);
         self.cass_available.store(cass_ok, Ordering::SeqCst);
 
-        // Check network
-        let network_ok = timeout(Duration::from_secs(5), async {
-            reqwest::get("https://api.github.com/").await.is_ok()
-        }).await.unwrap_or(false);
+        // Check network only if a probe endpoint is configured
+        // Don't hardcode external services (like GitHub) that may be irrelevant
+        let network_ok = if let Some(ref probe_url) = self.health_endpoints.network_probe {
+            timeout(Duration::from_secs(5), async {
+                reqwest::get(probe_url).await.is_ok()
+            }).await.unwrap_or(false)
+        } else {
+            // No network probe configured = assume network is OK (offline-friendly)
+            true
+        };
         self.network_available.store(network_ok, Ordering::SeqCst);
+
+        // Optionally check LLM providers if configured
+        let llm_status: Vec<_> = futures::future::join_all(
+            self.health_endpoints.llm_providers.iter().map(|url| async move {
+                let ok = timeout(Duration::from_secs(3), async {
+                    reqwest::get(url).await.is_ok()
+                }).await.unwrap_or(false);
+                (url.clone(), ok)
+            })
+        ).await;
 
         HealthStatus {
             cass_available: cass_ok,
             network_available: network_ok,
+            llm_providers: llm_status,
             cache_size: self.cache.size(),
-            degraded_mode: !cass_ok || !network_ok,
+            degraded_mode: !cass_ok,  // Only CASS is required
         }
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct HealthStatus {
+    pub cass_available: bool,
+    pub network_available: bool,
+    pub llm_providers: Vec<(String, bool)>,
+    pub cache_size: usize,
+    pub degraded_mode: bool,
 }
 ```
 
@@ -14242,8 +14605,43 @@ pub enum MigrationAction {
 
 ### 25.3 Version Tracking
 
+```sql
+-- Database schema for versioning
+-- Supports both "available" (registry) and "installed" (local) states
+
+CREATE TABLE skill_versions (
+    skill_id TEXT NOT NULL,
+    version TEXT NOT NULL,           -- semver string e.g. "2.1.0"
+    changelog TEXT NOT NULL,
+    breaking_changes_json TEXT,       -- JSON array of BreakingChange
+    migration_from TEXT,              -- Previous version this migrates from
+    created_at TEXT NOT NULL,         -- RFC3339 timestamp
+    author TEXT NOT NULL,
+    content_hash TEXT,                -- SHA256 of skill content for integrity
+    PRIMARY KEY (skill_id, version)
+);
+
+-- Track what's installed locally vs what's available in registry
+CREATE TABLE installed_skills (
+    skill_id TEXT PRIMARY KEY,
+    installed_version TEXT NOT NULL,  -- Currently installed version
+    pinned_version TEXT,              -- NULL = auto-update, non-NULL = pinned
+    installed_at TEXT NOT NULL,       -- RFC3339 timestamp
+    source TEXT NOT NULL,             -- 'local', 'registry', 'git:url'
+    FOREIGN KEY (skill_id, installed_version) REFERENCES skill_versions(skill_id, version)
+);
+
+CREATE INDEX idx_skill_versions_skill ON skill_versions(skill_id);
+CREATE INDEX idx_installed_source ON installed_skills(source);
+```
+
 ```rust
 /// Track and manage skill versions
+///
+/// Distinguishes between:
+/// - **Available versions**: All versions in the registry (skill_versions table)
+/// - **Installed version**: What's currently active locally (installed_skills table)
+/// - **Pinned version**: Prevents auto-update (installed_skills.pinned_version)
 pub struct VersionManager {
     db: Connection,
     git: GitArchive,
@@ -14276,26 +14674,102 @@ impl VersionManager {
             author: self.get_current_author()?,
         };
 
-        // Store in database
+        // Store in database with explicit column list (prevents schema/code mismatch)
         self.db.execute(
-            "INSERT INTO skill_versions VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO skill_versions (
+                skill_id, version, changelog, breaking_changes_json,
+                migration_from, created_at, author
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)",
             params![
                 skill_id,
                 version.version.to_string(),
                 version.changelog,
                 serde_json::to_string(&version.breaking_changes)?,
+                version.migration_from.as_ref().map(|v| v.to_string()),
                 version.created_at.to_rfc3339(),
                 version.author,
             ],
         )?;
 
-        // Create git tag
-        self.git.tag(
+        // Create git tag (in transaction - rollback DB if tag fails)
+        if let Err(e) = self.git.tag(
             &format!("{}-v{}", skill_id, new_version),
             &format!("Skill {} version {}\n\n{}", skill_id, new_version, changelog),
-        )?;
+        ) {
+            // Rollback: delete the version we just inserted
+            self.db.execute(
+                "DELETE FROM skill_versions WHERE skill_id = ? AND version = ?",
+                params![skill_id, new_version.to_string()],
+            )?;
+            return Err(e);
+        }
 
         Ok(version)
+    }
+
+    /// Get latest available version (what's in registry)
+    pub fn get_latest_available(&self, skill_id: &str) -> Result<Option<Version>> {
+        let version_str: Option<String> = self.db.query_row(
+            "SELECT version FROM skill_versions WHERE skill_id = ?
+             ORDER BY version DESC LIMIT 1",
+            params![skill_id],
+            |row| row.get(0),
+        ).optional()?;
+
+        version_str.map(|s| Version::parse(&s).map_err(Into::into)).transpose()
+    }
+
+    /// Get installed version (what's active locally)
+    pub fn get_installed(&self, skill_id: &str) -> Result<Option<InstalledSkill>> {
+        self.db.query_row(
+            "SELECT installed_version, pinned_version, installed_at, source
+             FROM installed_skills WHERE skill_id = ?",
+            params![skill_id],
+            |row| Ok(InstalledSkill {
+                skill_id: skill_id.to_string(),
+                installed_version: Version::parse(&row.get::<_, String>(0)?).unwrap(),
+                pinned_version: row.get::<_, Option<String>>(1)?
+                    .map(|s| Version::parse(&s).unwrap()),
+                installed_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(2)?)
+                    .unwrap().with_timezone(&Utc),
+                source: row.get(3)?,
+            }),
+        ).optional().map_err(Into::into)
+    }
+
+    /// Check if skill needs update (installed < available, not pinned)
+    pub fn needs_update(&self, skill_id: &str) -> Result<bool> {
+        let installed = self.get_installed(skill_id)?;
+        let available = self.get_latest_available(skill_id)?;
+
+        match (installed, available) {
+            (Some(i), Some(a)) => {
+                // Pinned skills never auto-update
+                if i.pinned_version.is_some() {
+                    return Ok(false);
+                }
+                Ok(a > i.installed_version)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// Pin skill to specific version (prevent auto-update)
+    pub fn pin(&self, skill_id: &str, version: &Version) -> Result<()> {
+        self.db.execute(
+            "UPDATE installed_skills SET pinned_version = ? WHERE skill_id = ?",
+            params![version.to_string(), skill_id],
+        )?;
+        Ok(())
+    }
+
+    /// Unpin skill (allow auto-update)
+    pub fn unpin(&self, skill_id: &str) -> Result<()> {
+        self.db.execute(
+            "UPDATE installed_skills SET pinned_version = NULL WHERE skill_id = ?",
+            params![skill_id],
+        )?;
+        Ok(())
     }
 
     /// Detect version bump type from changes
@@ -15081,6 +15555,248 @@ F: CALIBRATION → documented limitations
 | meta_skill-z2r | P1 | Performance Profiling |
 | meta_skill-dag | P2 | Error Handling |
 | meta_skill-f8s | P2 | CI/CD Automation |
+
+### 28.7 Interactive TUI Wizard: `ms mine --guided`
+
+The Brenner extraction loop becomes operable through an interactive TUI that guides users from "some sessions" to "skill + tests" in one flow.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    BRENNER EXTRACTION WIZARD                                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌─────────┐    ┌─────────┐    ┌─────────┐    ┌─────────┐    ┌─────────┐  │
+│  │ SELECT  │───▶│ EXTRACT │───▶│  GUARD  │───▶│FORMALIZE│───▶│  TEST   │  │
+│  │Sessions │    │ Moves   │    │ (Filter)│    │ (SKILL) │    │& Refine │  │
+│  └─────────┘    └─────────┘    └─────────┘    └─────────┘    └─────────┘  │
+│       │              │              │              │              │        │
+│       ▼              ▼              ▼              ▼              ▼        │
+│   TUI Panel:     TUI Panel:     TUI Panel:     TUI Panel:     TUI Panel:  │
+│   Search/pick    See moves,     Confidence     Live preview   Run tests,  │
+│   sessions       add evidence   threshold      & edit skill   see results │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### CLI Interface
+
+```bash
+# Launch guided wizard
+ms mine --guided
+ms mine --guided --query "authentication patterns"  # Pre-seed with query
+
+# Resume interrupted wizard session
+ms mine --guided --resume abc123
+```
+
+#### TUI Screens
+
+**Screen 1: Session Selection**
+```
+┌─ Session Selection ─────────────────────────────────────────────────────────┐
+│                                                                             │
+│ Search: [authentication error handling____________]                        │
+│                                                                             │
+│ ┌─ Results (23 sessions) ─────────────────────────────────────────────────┐│
+│ │ [x] 2026-01-10 brenner-bot: OAuth2 token refresh bug fix (★★★★)        ││
+│ │ [x] 2026-01-08 brenner-bot: JWT validation edge cases (★★★★)           ││
+│ │ [ ] 2026-01-05 xf-project: Rate limit handling (★★★)                    ││
+│ │ [x] 2025-12-28 ms-project: Auth middleware refactor (★★★★★)             ││
+│ │ [ ] 2025-12-20 cass: Session token rotation (★★★)                       ││
+│ └─────────────────────────────────────────────────────────────────────────┘│
+│                                                                             │
+│ Selected: 3 sessions │ Min recommended: 3-5 │ Quality filter: ★★★+         │
+│                                                                             │
+│ [Tab: Filter by project] [Enter: Continue] [q: Quit]                       │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Screen 2: Cognitive Move Extraction**
+```
+┌─ Cognitive Move Extraction ─────────────────────────────────────────────────┐
+│                                                                             │
+│ Extracted 12 cognitive moves from 3 sessions:                               │
+│                                                                             │
+│ ┌─ Move: "Always validate token expiry before use" ──────────────────────┐ │
+│ │ Tag: [InnerTruth]  Confidence: 0.89  Sources: 3/3 sessions              │ │
+│ │                                                                          │ │
+│ │ Evidence:                                                                │ │
+│ │   • brenner-bot/oauth2: "Check exp claim first, avoid round-trip"       │ │
+│ │   • brenner-bot/jwt: "Token validation: expiry > signature > claims"    │ │
+│ │   • ms-project/auth: "Pre-flight token check saves network calls"       │ │
+│ │                                                                          │ │
+│ │ [Include ✓] [Exclude] [Edit] [Add Evidence]                              │ │
+│ └──────────────────────────────────────────────────────────────────────────┘│
+│                                                                             │
+│ Progress: 4/12 moves reviewed │ Included: 3 │ Excluded: 1                   │
+│                                                                             │
+│ [j/k: Navigate] [Space: Toggle] [e: Edit] [Enter: Next] [S: Skip to Guard] │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Screen 3: Third-Alternative Guard**
+```
+┌─ Third-Alternative Guard ───────────────────────────────────────────────────┐
+│                                                                             │
+│ Review low-confidence moves for potential rejection:                        │
+│                                                                             │
+│ ┌─ ⚠️  "Use refresh tokens for long-lived sessions" (0.62 confidence) ───┐ │
+│ │                                                                          │ │
+│ │ This move appears in 2/3 sessions but with conflicting approaches:       │ │
+│ │   • Session 1: "Always use refresh tokens"                               │ │
+│ │   • Session 3: "Refresh tokens add complexity, use short-lived JWTs"     │ │
+│ │                                                                          │ │
+│ │ Third-Alternative Check:                                                 │ │
+│ │   Could BOTH approaches be wrong? Is there a better framing?             │ │
+│ │                                                                          │ │
+│ │ Decision: [Keep as-is] [Reject] [Reframe] [Mark as context-dependent]    │ │
+│ └──────────────────────────────────────────────────────────────────────────┘│
+│                                                                             │
+│ Confidence threshold: [0.70 ▼] │ Flagged: 3 │ Reviewed: 1/3                 │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Screen 4: Skill Formalization (Live Editor)**
+```
+┌─ Skill Formalization ───────────────────────────────────────────────────────┐
+│                                                                             │
+│ ┌─ SKILL.md Preview ──────────────────────────────────────────────────────┐│
+│ │ ---                                                                      ││
+│ │ name: auth-token-patterns                                                ││
+│ │ description: Authentication token handling patterns from production     ││
+│ │ version: 1.0.0                                                           ││
+│ │ tags: [auth, jwt, oauth, security]                                       ││
+│ │ ---                                                                      ││
+│ │                                                                          ││
+│ │ # Authentication Token Patterns                                          ││
+│ │                                                                          ││
+│ │ ## ⚠️ CRITICAL RULES                                                    ││
+│ │                                                                          ││
+│ │ 1. ALWAYS validate token expiry before making authenticated requests    ││
+│ │ 2. NEVER store tokens in localStorage (use httpOnly cookies)            ││
+│ │ 3. ALWAYS implement token refresh 5 minutes before expiry               ││
+│ │                                                                          ││
+│ │ ## Token Validation Order                                                ││
+│ │ ...                                                                      ││
+│ └──────────────────────────────────────────────────────────────────────────┘│
+│                                                                             │
+│ Quality Score: 0.78 │ Token Count: ~1,240 │ Validation: ✓ Passes            │
+│                                                                             │
+│ [e: Edit in $EDITOR] [r: Regenerate section] [v: Validate] [Enter: Test]   │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Screen 5: Materialization Test**
+```
+┌─ Materialization Test ──────────────────────────────────────────────────────┐
+│                                                                             │
+│ Running validation tests for: auth-token-patterns                           │
+│                                                                             │
+│ ┌─ Test Results ──────────────────────────────────────────────────────────┐│
+│ │ ✓ Skill parses correctly                                                 ││
+│ │ ✓ All required sections present                                          ││
+│ │ ✓ Tags are valid and indexed                                             ││
+│ │ ✓ Search retrieval: ranks #1 for "jwt validation" query                  ││
+│ │ ✓ Search retrieval: ranks #2 for "oauth token refresh" query             ││
+│ │ ⚠ Search retrieval: ranks #5 for "auth middleware" (expected top 3)      ││
+│ │                                                                          ││
+│ │ Simulated agent test:                                                    ││
+│ │ ✓ Agent correctly applies "validate expiry first" rule                   ││
+│ │ ✓ Agent identifies security issue in test scenario                       ││
+│ └──────────────────────────────────────────────────────────────────────────┘│
+│                                                                             │
+│ Overall: 8/9 tests passing │ Quality: GOOD                                  │
+│                                                                             │
+│ [f: Fix failing test] [s: Save skill] [r: Return to edit] [Enter: Finish]  │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Wizard Output Artifacts
+
+On completion, the wizard produces:
+
+```
+auth-token-patterns/
+├── SKILL.md                    # The generated skill
+├── tests/
+│   └── retrieval.yaml          # Auto-generated search tests
+├── mining-manifest.json        # Provenance: sessions, moves, decisions
+└── calibration.md              # Documented limitations from Guard phase
+```
+
+#### Implementation
+
+```rust
+/// Guided Brenner extraction wizard state machine
+pub struct BrennerWizard {
+    state: WizardState,
+    sessions: Vec<SelectedSession>,
+    moves: Vec<CognitiveMove>,
+    skill_draft: Option<SkillDraft>,
+    test_results: Option<TestResults>,
+}
+
+#[derive(Debug, Clone)]
+pub enum WizardState {
+    SessionSelection { query: String, results: Vec<SessionResult> },
+    MoveExtraction { current: usize, reviewed: HashSet<usize> },
+    ThirdAlternativeGuard { flagged: Vec<usize>, current: usize },
+    SkillFormalization { draft: SkillDraft, validation: ValidationResult },
+    MaterializationTest { results: TestResults },
+    Complete { output_dir: PathBuf },
+}
+
+impl BrennerWizard {
+    /// Run the interactive wizard
+    pub async fn run(&mut self, terminal: &mut Terminal) -> Result<WizardOutput> {
+        loop {
+            match &self.state {
+                WizardState::SessionSelection { .. } => {
+                    self.render_session_selection(terminal)?;
+                    match self.handle_session_selection_input().await? {
+                        WizardAction::Next => self.transition_to_extraction().await?,
+                        WizardAction::Quit => return Ok(WizardOutput::Cancelled),
+                        _ => {}
+                    }
+                }
+                WizardState::MoveExtraction { .. } => {
+                    self.render_move_extraction(terminal)?;
+                    // ... handle input, transition when all moves reviewed
+                }
+                WizardState::ThirdAlternativeGuard { .. } => {
+                    self.render_guard(terminal)?;
+                    // ... handle input, filter low-confidence moves
+                }
+                WizardState::SkillFormalization { .. } => {
+                    self.render_formalization(terminal)?;
+                    // ... live preview, edit, validate
+                }
+                WizardState::MaterializationTest { .. } => {
+                    self.render_tests(terminal)?;
+                    // ... run tests, show results, allow fixes
+                }
+                WizardState::Complete { output_dir } => {
+                    return Ok(WizardOutput::Success {
+                        skill_path: output_dir.join("SKILL.md"),
+                        manifest_path: output_dir.join("mining-manifest.json"),
+                    });
+                }
+            }
+        }
+    }
+
+    /// Allow resuming interrupted wizard session
+    pub fn resume(checkpoint: WizardCheckpoint) -> Result<Self> {
+        Ok(Self {
+            state: checkpoint.state,
+            sessions: checkpoint.sessions,
+            moves: checkpoint.moves,
+            skill_draft: checkpoint.skill_draft,
+            test_results: None,
+        })
+    }
+}
+```
 
 ---
 
@@ -16338,37 +17054,47 @@ impl LazySkillIndex {
 #### Deferred Computation Pattern
 
 ```rust
-/// Computation that's only performed if result is actually used
-enum Deferred<T, F: FnOnce() -> T> {
-    Pending(F),
-    Computed(T),
+use std::cell::OnceCell;
+
+/// Computation that's only performed if result is actually used.
+///
+/// SAFE implementation using OnceCell - no unsafe code needed.
+/// Prefer `std::cell::LazyCell` (Rust 1.80+) or `once_cell::sync::Lazy` for
+/// thread-safe lazy initialization.
+struct Deferred<T, F: FnOnce() -> T> {
+    cell: OnceCell<T>,
+    init: Option<F>,
 }
 
 impl<T, F: FnOnce() -> T> Deferred<T, F> {
     fn new(f: F) -> Self {
-        Deferred::Pending(f)
-    }
-    
-    fn get(&mut self) -> &T {
-        match self {
-            Deferred::Pending(_) => {
-                // Take ownership of closure and compute
-                let f = match std::mem::replace(self, Deferred::Computed(unsafe { 
-                    std::mem::zeroed() 
-                })) {
-                    Deferred::Pending(f) => f,
-                    _ => unreachable!(),
-                };
-                *self = Deferred::Computed(f());
-                match self {
-                    Deferred::Computed(v) => v,
-                    _ => unreachable!(),
-                }
-            }
-            Deferred::Computed(v) => v,
+        Self {
+            cell: OnceCell::new(),
+            init: Some(f),
         }
     }
+
+    fn get(&mut self) -> &T {
+        self.cell.get_or_init(|| {
+            // Take the initializer - this can only happen once
+            let f = self.init.take().expect("Deferred already initialized");
+            f()
+        })
+    }
+
+    /// Returns true if the value has been computed
+    fn is_computed(&self) -> bool {
+        self.cell.get().is_some()
+    }
 }
+
+// For cases where you need thread-safe lazy evaluation:
+use std::sync::LazyLock;
+
+static EXPENSIVE_COMPUTATION: LazyLock<Vec<u8>> = LazyLock::new(|| {
+    // This only runs once, when first accessed
+    compute_expensive_thing()
+});
 ```
 
 ### 31.6 Memoization with Invalidation
