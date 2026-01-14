@@ -239,7 +239,7 @@ impl GitArchive {
 }
 
 fn tombstone_skill_dir(root: &Path, skill_dir: &Path) -> Result<PathBuf> {
-    let tombstones = root.join(".ms").join("tombstones");
+    let tombstones = root.join("tombstones");
     fs::create_dir_all(&tombstones)?;
     let name = skill_dir
         .file_name()

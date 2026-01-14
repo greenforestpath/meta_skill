@@ -748,14 +748,19 @@ fn tombstone_file(ms_root: &Path, path: &Path, bucket: &str) -> Result<()> {
     if !path.exists() {
         return Ok(());
     }
-    let tombstones = ms_root.join(".ms").join("tombstones").join(bucket);
+    let tombstones = ms_root.join("tombstones").join(bucket);
     std::fs::create_dir_all(&tombstones).map_err(|e| {
         MsError::Config(format!("Failed to create tombstones dir: {}", e))
     })?;
     let name = path
         .file_name()
         .ok_or_else(|| MsError::Config("Invalid tombstone file name".to_string()))?;
-    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%S");
+    let now = chrono::Utc::now();
+    let stamp = format!(
+        "{}{:09}",
+        now.format("%Y%m%dT%H%M%S"),
+        now.timestamp_subsec_nanos()
+    );
     let dest = tombstones.join(format!("{}_{}", name.to_string_lossy(), stamp));
     std::fs::rename(path, &dest).map_err(|e| {
         MsError::Config(format!("Failed to tombstone file {}: {}", path.display(), e))
@@ -907,5 +912,193 @@ mod tests {
         cp.set_state("current_file", "main.rs");
         assert_eq!(cp.get_state("current_file"), Some("main.rs"));
         assert_eq!(cp.get_state("nonexistent"), None);
+    }
+
+    // --- Crash Simulation & Recovery Tests ---
+
+    #[test]
+    fn checkpoint_save_load_roundtrip() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let ms_root = temp_dir.path();
+
+        let mut cp = Checkpoint::new("roundtrip-test-001", "index");
+        cp.update_progress("scanning", 0.75);
+        cp.set_state("last_file", "skills/test.md");
+        cp.set_state("processed_count", "42");
+
+        // Save
+        cp.save(ms_root).unwrap();
+
+        // Load and verify
+        let loaded = Checkpoint::load(ms_root, "roundtrip-test-001")
+            .unwrap()
+            .expect("checkpoint should exist");
+
+        assert_eq!(loaded.operation_id, "roundtrip-test-001");
+        assert_eq!(loaded.operation_type, "index");
+        assert_eq!(loaded.phase, "scanning");
+        assert!((loaded.progress - 0.75).abs() < 0.001);
+        assert_eq!(loaded.get_state("last_file"), Some("skills/test.md"));
+        assert_eq!(loaded.get_state("processed_count"), Some("42"));
+
+        // Remove and verify gone
+        let removed = Checkpoint::remove(ms_root, "roundtrip-test-001").unwrap();
+        assert!(removed);
+
+        let after_remove = Checkpoint::load(ms_root, "roundtrip-test-001").unwrap();
+        assert!(after_remove.is_none());
+    }
+
+    #[test]
+    fn recovery_manager_diagnose_missing_paths() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let ms_root = temp_dir.path();
+
+        // Create RecoveryManager without db/git (paths don't exist)
+        let manager = RecoveryManager::new(ms_root);
+
+        let report = manager.diagnose().unwrap();
+
+        // Should find issues about missing database and archive
+        let db_issues: Vec<_> = report
+            .issues
+            .iter()
+            .filter(|i| matches!(i.mode, FailureMode::Database))
+            .collect();
+        let git_issues: Vec<_> = report
+            .issues
+            .iter()
+            .filter(|i| matches!(i.mode, FailureMode::GitArchive))
+            .collect();
+
+        assert!(!db_issues.is_empty(), "should report missing database");
+        assert!(!git_issues.is_empty(), "should report missing archive");
+    }
+
+    #[test]
+    fn with_retry_if_stops_on_condition_false() {
+        let config = RetryConfig {
+            max_attempts: 5,
+            initial_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(10),
+            backoff_multiplier: 2.0,
+            jitter_factor: 0.0,
+        };
+        let mut attempts = 0;
+
+        // Error type that indicates whether retry should happen
+        let result: std::result::Result<i32, (&str, bool)> = with_retry_if(
+            &config,
+            || {
+                attempts += 1;
+                Err(("fatal error", false)) // false = don't retry
+            },
+            |(_msg, should_retry)| *should_retry,
+        );
+
+        assert!(result.is_err());
+        assert_eq!(attempts, 1, "should stop immediately when condition is false");
+    }
+
+    #[test]
+    fn with_retry_if_continues_on_condition_true() {
+        let config = RetryConfig {
+            max_attempts: 3,
+            initial_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(10),
+            backoff_multiplier: 2.0,
+            jitter_factor: 0.0,
+        };
+        let mut attempts = 0;
+
+        let result: std::result::Result<i32, (&str, bool)> = with_retry_if(
+            &config,
+            || {
+                attempts += 1;
+                if attempts < 3 {
+                    Err(("transient error", true)) // true = should retry
+                } else {
+                    Ok(99)
+                }
+            },
+            |(_msg, should_retry)| *should_retry,
+        );
+
+        assert_eq!(result.unwrap(), 99);
+        assert_eq!(attempts, 3, "should retry until success");
+    }
+
+    #[test]
+    fn recovery_issue_builder_pattern() {
+        let issue = RecoveryIssue::new(FailureMode::Transaction, 2, "Orphaned transaction record")
+            .with_fix("Run 'ms doctor --fix' to clean up")
+            .not_auto_recoverable();
+
+        assert_eq!(issue.mode, FailureMode::Transaction);
+        assert_eq!(issue.severity, 2);
+        assert!(!issue.auto_recoverable);
+        assert!(issue.suggested_fix.is_some());
+        assert!(issue
+            .suggested_fix
+            .as_ref()
+            .unwrap()
+            .contains("ms doctor --fix"));
+    }
+
+    #[test]
+    fn recovery_report_critical_issues_detection() {
+        let mut report = RecoveryReport::default();
+
+        // Add non-critical issue
+        report.issues.push(RecoveryIssue::new(
+            FailureMode::Cache,
+            3,
+            "Large cache",
+        ));
+        assert!(!report.has_critical_issues());
+
+        // Add critical but auto-recoverable
+        report.issues.push(RecoveryIssue::new(
+            FailureMode::Database,
+            1,
+            "Database corruption",
+        ));
+        assert!(!report.has_critical_issues(), "auto-recoverable critical is not flagged");
+
+        // Add critical and NOT auto-recoverable
+        report.issues.push(
+            RecoveryIssue::new(FailureMode::Config, 1, "Missing config")
+                .not_auto_recoverable(),
+        );
+        assert!(report.has_critical_issues(), "non-auto-recoverable critical should be flagged");
+    }
+
+    #[test]
+    fn recovery_manager_cache_check() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let ms_root = temp_dir.path();
+
+        // Create cache directory with some temp files
+        let cache_dir = ms_root.join("cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        std::fs::write(cache_dir.join(".tmp_partial"), "partial data").unwrap();
+        std::fs::write(cache_dir.join("valid_cache.bin"), "valid").unwrap();
+        std::fs::write(cache_dir.join("another.tmp"), "another temp").unwrap();
+
+        let manager = RecoveryManager::new(ms_root);
+        let report = manager.diagnose().unwrap();
+
+        // Cache should not report issues for small cache
+        let cache_issues: Vec<_> = report
+            .issues
+            .iter()
+            .filter(|i| matches!(i.mode, FailureMode::Cache))
+            .collect();
+
+        // Small cache = no issues
+        assert!(
+            cache_issues.is_empty(),
+            "small cache should not trigger warnings"
+        );
     }
 }

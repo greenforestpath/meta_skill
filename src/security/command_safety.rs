@@ -92,13 +92,11 @@ impl SafetyGate {
             }
         };
 
-        let mut final_allowed = decision.allowed;
         if !decision.allowed {
             if self.require_verbatim_approval && decision.tier >= SafetyTier::Danger {
                 if approval_matches(command) {
                     decision.approved = true;
                     decision.allowed = true;
-                    final_allowed = true;
                 } else {
                     self.log_event(command, &decision, session_id)?;
                     return Err(MsError::ApprovalRequired(approval_hint(command)));
@@ -113,12 +111,6 @@ impl SafetyGate {
         }
 
         self.log_event(command, &decision, session_id)?;
-        if !final_allowed {
-            return Err(MsError::DestructiveBlocked(format!(
-                "blocked by dcg: {}",
-                decision.reason
-            )));
-        }
 
         if decision.approved {
             info!("command approved by verbatim match: {command}");
