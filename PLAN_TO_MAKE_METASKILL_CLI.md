@@ -19492,3 +19492,928 @@ Before shipping tests:
 - [ ] Test coverage gaps are documented and prioritized
 - [ ] Snapshot tests are reviewed when updated
 - [ ] Tests are organized by type (unit/, integration/, e2e/)
+
+---
+
+## Section 35: CI/CD Automation Patterns
+
+**Source**: CASS mining of repo_updater, apr, jeffreysprompts_premium, flywheel_gateway, and destructive_command_guard CI/CD implementations
+
+### 35.1 GitHub Actions Workflow Architecture
+
+#### Workflow File Organization
+
+**Source**: CASS mining of production GitHub Actions setups
+
+| Workflow File | Purpose | Trigger |
+|---------------|---------|---------|
+| `ci.yml` | Continuous integration (lint, test, build) | push, pull_request, workflow_dispatch |
+| `release.yml` | Release automation with artifacts | `tags: ['v*']` |
+| `deploy.yml` | Production deployment | `tags: ['v*']` or manual |
+| `e2e.yml` | Full E2E test suite | push to main |
+| `dependabot.yml` | Automated dependency updates | schedule |
+
+```yaml
+# .github/workflows/ci.yml - Comprehensive CI Pipeline
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:  # Manual trigger
+
+jobs:
+  # Job 1: Static analysis of shell scripts
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ludeeus/action-shellcheck@master
+        with:
+          severity: warning
+          scandir: '.'
+          additional_files: 'my-script install.sh'
+
+  # Job 2: Syntax validation
+  syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check bash syntax
+        run: |
+          bash -n my-script
+          bash -n install.sh
+          for script in scripts/*.sh; do
+            bash -n "$script"
+          done
+
+  # Job 3: Test suite with matrix
+  tests:
+    needs: [shellcheck, syntax]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install bash 5 on macOS
+        if: matrix.os == 'macos-latest'
+        run: |
+          brew install bash
+          echo "$(brew --prefix)/bin" >> $GITHUB_PATH
+
+      - name: Show bash version
+        run: bash --version
+
+      - name: Run tests (TAP format)
+        run: |
+          mkdir -p test-results
+          ./scripts/run_all_tests.sh --tap 2>&1 | tee test-results/tests.tap
+        continue-on-error: true
+
+      - name: Run tests (human format)
+        if: failure()
+        run: ./scripts/run_all_tests.sh 2>&1 | tee test-results/tests.log
+
+      - name: Upload test artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ matrix.os }}
+          path: test-results/
+          retention-days: 14
+
+  # Job 4: Installation test
+  install-test:
+    needs: [shellcheck, syntax]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install bash 5 on macOS
+        if: matrix.os == 'macos-latest'
+        run: |
+          brew install bash
+          echo "$(brew --prefix)/bin" >> $GITHUB_PATH
+
+      - name: Run installer
+        run: UNSAFE_MAIN=1 DEST=/tmp/test-install ./install.sh
+
+      - name: Verify installation
+        run: |
+          test -x /tmp/test-install/my-tool
+          /tmp/test-install/my-tool --version
+          /tmp/test-install/my-tool --help | head -20
+
+  # Job 5: Version consistency
+  version-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check VERSION file exists
+        run: |
+          if [[ ! -f VERSION ]]; then
+            echo "::warning::VERSION file not found"
+          fi
+
+      - name: Verify version consistency
+        run: |
+          file_version=$(cat VERSION)
+          script_version=$(grep -m1 'VERSION=' my-script | cut -d'"' -f2)
+
+          if [[ "$file_version" != "$script_version" ]]; then
+            echo "::error::Version mismatch: VERSION=$file_version, script=$script_version"
+            exit 1
+          fi
+
+          echo "Version verified: $file_version"
+```
+
+### 35.2 Job Dependencies and Ordering
+
+#### Dependency Graph Patterns
+
+```
+shellcheck ─┐
+            ├─→ tests (matrix: ubuntu, macos)
+syntax ─────┤
+            └─→ install-test (matrix: ubuntu, macos)
+
+version-check ──→ (independent, runs in parallel)
+```
+
+```yaml
+# Jobs with dependencies
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    # ... lint steps
+
+  test:
+    needs: [lint]  # Waits for lint to complete
+    runs-on: ubuntu-latest
+    # ... test steps
+
+  build:
+    needs: [lint, test]  # Waits for both
+    runs-on: ubuntu-latest
+    # ... build steps
+
+  deploy:
+    needs: [build]
+    if: github.ref == 'refs/heads/main'  # Only on main
+    runs-on: ubuntu-latest
+    # ... deploy steps
+```
+
+#### Conditional Execution
+
+```yaml
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    # Only deploy from main branch
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: Deploy to production
+        if: success()
+        run: ./deploy.sh
+
+      - name: Notify on failure
+        if: failure()
+        run: ./notify-failure.sh
+
+      - name: Cleanup
+        if: always()  # Runs regardless of job status
+        run: ./cleanup.sh
+```
+
+### 35.3 Release Automation
+
+#### Tag-Triggered Releases
+
+**Source**: CASS mining of repo_updater release workflow
+
+```yaml
+# .github/workflows/release.yml
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'  # Triggers on v1.0.0, v2.1.0-beta, etc.
+
+permissions:
+  contents: write  # Allows creating releases
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract version from tag
+        id: version
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Verify script version matches tag
+        run: |
+          script_version=$(grep -m1 'VERSION=' my-script | cut -d'"' -f2)
+          if [[ "$script_version" != "${{ steps.version.outputs.version }}" ]]; then
+            echo "::error::Tag ${{ steps.version.outputs.version }} doesn't match script version $script_version"
+            exit 1
+          fi
+          echo "Version verified: $script_version"
+
+      - name: Verify VERSION file matches tag
+        run: |
+          if [[ -f VERSION ]]; then
+            file_version=$(cat VERSION)
+            if [[ "$file_version" != "${{ steps.version.outputs.version }}" ]]; then
+              echo "::error::Tag doesn't match VERSION file"
+              exit 1
+            fi
+          fi
+
+      - name: Compute SHA256 checksums
+        run: |
+          sha256sum my-script install.sh > checksums.txt
+          sha256sum my-script | awk '{print $1}' > my-script.sha256
+          sha256sum install.sh | awk '{print $1}' > install.sh.sha256
+          echo "Generated checksums:"
+          cat checksums.txt
+
+      - name: Generate release notes
+        run: |
+          cat > release_notes.md << 'EOF'
+          ## Installation
+
+          ```bash
+          curl -fsSL https://example.com/install.sh | bash
+          ```
+
+          ## Verification
+
+          ```bash
+          echo "$(curl -fsSL https://example.com/my-script.sha256)  my-script" | sha256sum -c -
+          ```
+
+          ## Checksums
+
+          See `checksums.txt` for SHA256 hashes.
+          EOF
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          name: my-tool v${{ steps.version.outputs.version }}
+          body_path: release_notes.md
+          files: |
+            my-script
+            install.sh
+            checksums.txt
+            my-script.sha256
+            install.sh.sha256
+          generate_release_notes: true
+          append_body: true
+```
+
+### 35.4 Version Management Patterns
+
+#### Dual Version Storage
+
+**Source**: CASS mining of repo_updater version management
+
+```bash
+# VERSION file (single source of truth)
+1.2.1
+
+# Script variable (for --version flag)
+VERSION="1.2.1"
+
+# Version reading with fallback
+get_version() {
+    local script_dir
+    script_dir="$(dirname "${BASH_SOURCE[0]}")"
+
+    if [[ -f "$script_dir/VERSION" ]]; then
+        cat "$script_dir/VERSION"
+    else
+        echo "$VERSION"
+    fi
+}
+```
+
+#### Semantic Version Comparison
+
+```bash
+# Compare semantic versions
+# Returns 0 if v1 > v2, 1 otherwise
+version_gt() {
+    local v1="$1" v2="$2"
+
+    # Split into components
+    IFS='.' read -ra V1 <<< "$v1"
+    IFS='.' read -ra V2 <<< "$v2"
+
+    # Compare each component
+    for i in 0 1 2; do
+        local n1=${V1[$i]:-0}
+        local n2=${V2[$i]:-0}
+
+        if (( n1 > n2 )); then
+            return 0
+        elif (( n1 < n2 )); then
+            return 1
+        fi
+    done
+
+    return 1  # Equal
+}
+
+# Usage in self-update
+check_for_update() {
+    local current_version="$VERSION"
+    local latest_version
+    latest_version=$(curl -fsSL "$RELEASE_URL/latest/VERSION" 2>/dev/null)
+
+    if version_gt "$latest_version" "$current_version"; then
+        echo "Update available: $current_version → $latest_version"
+        return 0
+    fi
+    return 1
+}
+```
+
+### 35.5 Matrix Testing Strategies
+
+#### Multi-OS Matrix
+
+```yaml
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node-version: [18, 20, 22]
+      fail-fast: false  # Continue other matrix jobs if one fails
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+      - run: npm test
+```
+
+#### Browser Matrix for E2E
+
+**Source**: CASS mining of jeffreysprompts_premium E2E workflow
+
+```yaml
+jobs:
+  e2e:
+    strategy:
+      matrix:
+        browser: [chromium, webkit, firefox]
+        include:
+          - browser: chromium
+            project: Desktop Chrome
+          - browser: webkit
+            project: Desktop Safari
+          - browser: firefox
+            project: Desktop Firefox
+      fail-fast: false
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+      - run: npm ci
+      - run: npx playwright install --with-deps ${{ matrix.browser }}
+      - run: npx playwright test --project="${{ matrix.project }}"
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: playwright-report-${{ matrix.browser }}
+          path: playwright-report/
+```
+
+### 35.6 Container Image Pipelines
+
+#### Multi-Stage Dockerfile with CI
+
+**Source**: CASS mining of flywheel_gateway tenant container pipeline
+
+```dockerfile
+# Stage 1: Build application
+FROM docker.io/library/golang:1.23-bookworm AS builder
+WORKDIR /build
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /app ./cmd/server
+
+# Stage 2: Runtime image
+FROM docker.io/library/alpine:3.20
+RUN apk add --no-cache ca-certificates tzdata
+COPY --from=builder /app /usr/local/bin/app
+USER nobody:nobody
+ENTRYPOINT ["/usr/local/bin/app"]
+```
+
+```yaml
+# .github/workflows/build-image.yml
+name: Build Container Image
+
+on:
+  push:
+    tags: ['v*']
+  pull_request:
+    paths:
+      - 'Dockerfile'
+      - 'go.mod'
+      - 'go.sum'
+      - 'cmd/**'
+      - 'internal/**'
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU (for multi-arch)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+
+      - name: Upload Trivy scan results
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom.spdx.json
+```
+
+### 35.7 Artifact Management
+
+#### Upload and Download Patterns
+
+```yaml
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: npm run build
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          retention-days: 7
+          if-no-files-found: error
+
+  test:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - run: npm run test:e2e
+
+  deploy:
+    needs: [build, test]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+
+      - name: Deploy to production
+        run: ./deploy.sh dist/
+```
+
+#### Caching Dependencies
+
+```yaml
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Node.js with cache
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      # Or Bun with cache
+      - uses: oven-sh/setup-bun@v1
+        with:
+          bun-version: latest
+
+      - name: Cache Bun dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.bun/install/cache
+          key: ${{ runner.os }}-bun-${{ hashFiles('**/bun.lockb') }}
+          restore-keys: |
+            ${{ runner.os }}-bun-
+
+      # Rust with cache
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+```
+
+### 35.8 Automated Dependency Updates
+
+#### Dependabot Configuration
+
+```yaml
+# .github/dependabot.yml
+version: 2
+updates:
+  # npm dependencies
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 10
+    groups:
+      typescript:
+        patterns:
+          - "typescript"
+          - "@types/*"
+      testing:
+        patterns:
+          - "vitest"
+          - "@vitest/*"
+          - "playwright"
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+
+  # GitHub Actions
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      actions:
+        patterns:
+          - "*"
+
+  # Docker
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+
+  # Cargo (Rust)
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+```
+
+### 35.9 Pre-Commit Hook Integration
+
+#### Installing Pre-Commit Hooks
+
+**Source**: CASS mining of destructive_command_guard hook patterns
+
+```yaml
+# .github/workflows/ci.yml
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pre-commit
+        run: pip install pre-commit
+
+      - name: Run pre-commit hooks
+        run: pre-commit run --all-files
+```
+
+```yaml
+# .pre-commit-config.yaml
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-added-large-files
+      - id: check-merge-conflict
+
+  - repo: https://github.com/shellcheck-py/shellcheck-py
+    rev: v0.9.0.6
+    hooks:
+      - id: shellcheck
+
+  - repo: local
+    hooks:
+      - id: dcg-check
+        name: Destructive Command Guard
+        entry: dcg check
+        language: system
+        types: [shell]
+```
+
+### 35.10 Deployment Workflows
+
+#### Vercel Deployment
+
+**Source**: CASS mining of jeffreysprompts_premium deploy workflow
+
+```yaml
+# .github/workflows/deploy.yml
+name: Deploy
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+      - name: Deploy to Vercel
+        uses: amondnet/vercel-action@v25
+        with:
+          vercel-token: ${{ secrets.VERCEL_TOKEN }}
+          vercel-org-id: ${{ secrets.VERCEL_ORG_ID }}
+          vercel-project-id: ${{ secrets.VERCEL_PROJECT_ID }}
+          vercel-args: '--prod'
+
+      - name: Run database migrations
+        run: npm run db:migrate
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+
+      - name: Smoke test
+        run: |
+          sleep 30  # Wait for deployment
+          curl -f https://my-app.vercel.app/api/health || exit 1
+```
+
+### 35.11 Quality Gates
+
+#### Comprehensive Quality Pipeline
+
+```yaml
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup
+        uses: oven-sh/setup-bun@v1
+
+      - name: Install
+        run: bun install
+
+      # Lint check
+      - name: Lint
+        run: bun run lint
+
+      # Type check
+      - name: Type check
+        run: bun run typecheck
+
+      # Format check
+      - name: Format check
+        run: bun run format:check
+
+      # Unit tests
+      - name: Unit tests
+        run: bun run test
+
+      # Build verification
+      - name: Build
+        run: bun run build
+
+      # Bundle size check
+      - name: Analyze bundle
+        run: |
+          bun run build
+          du -sh dist/
+          # Fail if bundle exceeds threshold
+          MAX_SIZE=$((1024 * 1024))  # 1MB
+          ACTUAL_SIZE=$(du -sb dist/ | cut -f1)
+          if [[ $ACTUAL_SIZE -gt $MAX_SIZE ]]; then
+            echo "::error::Bundle size $ACTUAL_SIZE exceeds limit $MAX_SIZE"
+            exit 1
+          fi
+```
+
+### 35.12 Self-Update Mechanisms
+
+#### CLI Self-Update Pattern
+
+**Source**: CASS mining of apr self-update implementation
+
+```bash
+#!/bin/bash
+# Self-update with checksum verification
+
+RELEASE_URL="https://github.com/owner/repo/releases/latest/download"
+
+update_self() {
+    local current_version="$VERSION"
+    local temp_dir
+    temp_dir=$(mktemp -d)
+
+    echo "Checking for updates..."
+
+    # Download new version
+    if ! curl -fsSL "$RELEASE_URL/my-tool" -o "$temp_dir/my-tool"; then
+        echo "Failed to download update"
+        rm -rf "$temp_dir"
+        return 1
+    fi
+
+    # Download checksum
+    if ! curl -fsSL "$RELEASE_URL/my-tool.sha256" -o "$temp_dir/my-tool.sha256"; then
+        echo "Failed to download checksum"
+        rm -rf "$temp_dir"
+        return 1
+    fi
+
+    # Verify checksum
+    local expected_hash
+    expected_hash=$(cat "$temp_dir/my-tool.sha256")
+    local actual_hash
+    actual_hash=$(sha256sum "$temp_dir/my-tool" | awk '{print $1}')
+
+    if [[ "$expected_hash" != "$actual_hash" ]]; then
+        echo "Checksum verification failed!"
+        echo "Expected: $expected_hash"
+        echo "Got:      $actual_hash"
+        rm -rf "$temp_dir"
+        return 1
+    fi
+
+    # Verify script syntax
+    if ! bash -n "$temp_dir/my-tool"; then
+        echo "Downloaded script has syntax errors"
+        rm -rf "$temp_dir"
+        return 1
+    fi
+
+    # Install update
+    local install_path
+    install_path=$(which my-tool)
+    chmod +x "$temp_dir/my-tool"
+
+    if ! mv "$temp_dir/my-tool" "$install_path"; then
+        echo "Failed to install update (try with sudo)"
+        rm -rf "$temp_dir"
+        return 1
+    fi
+
+    rm -rf "$temp_dir"
+
+    local new_version
+    new_version=$("$install_path" --version)
+    echo "Updated: $current_version → $new_version"
+}
+```
+
+### 35.13 Application to meta_skill
+
+| CI/CD Component | Pattern | meta_skill Application |
+|-----------------|---------|------------------------|
+| **CI Pipeline** | Multi-job with dependencies | lint → test → build |
+| **Matrix Testing** | OS × Runtime | ubuntu + macos, Node 20/22 |
+| **Release** | Tag-triggered | `v*` creates GitHub Release with checksums |
+| **Versioning** | Dual storage | VERSION file + CLI --version |
+| **Quality Gates** | Lint, type, format, test, build | All must pass before merge |
+| **Caching** | Dependency cache | Bun cache by lockfile hash |
+| **Artifacts** | Test results, build output | 14-day retention |
+
+### 35.14 CI/CD Checklist
+
+Before shipping CI/CD:
+- [ ] CI runs on push and pull_request to main
+- [ ] Jobs have appropriate dependencies (`needs:`)
+- [ ] Matrix strategy covers target platforms
+- [ ] Tests run in TAP/JUnit format for reporting
+- [ ] Artifacts uploaded with sensible retention
+- [ ] Dependencies cached by lockfile hash
+- [ ] Release workflow validates version consistency
+- [ ] Checksums generated and published with releases
+- [ ] Quality gates include lint, type check, format, test, build
+- [ ] Deployment includes smoke tests/health checks
+- [ ] Dependabot configured for dependencies and actions
+- [ ] Pre-commit hooks run in CI
+- [ ] Bundle size monitoring if applicable
+- [ ] Container images scanned for vulnerabilities
