@@ -16,7 +16,7 @@ fn arb_block_type() -> impl Strategy<Value = BlockType> {
 
 fn arb_skill_spec() -> impl Strategy<Value = SkillSpec> {
     let block = (
-        "[a-z][a-z0-9_\-]{2,16}",
+        r"[a-z][a-z0-9_\-]{2,16}",
         arb_block_type(),
         ".{0,120}",
     )
@@ -27,7 +27,7 @@ fn arb_skill_spec() -> impl Strategy<Value = SkillSpec> {
         });
 
     let section = (
-        "[a-z][a-z0-9_\-]{2,16}",
+        r"[a-z][a-z0-9_\-]{2,16}",
         ".{1,32}",
         prop::collection::vec(block, 0..4),
     )
@@ -36,7 +36,7 @@ fn arb_skill_spec() -> impl Strategy<Value = SkillSpec> {
     (
         "[a-z][a-z0-9_]{2,16}",
         ".{1,32}",
-        "[0-9]+\\.[0-9]+\\.[0-9]+",
+        r"[0-9]+\.[0-9]+\.[0-9]+",
         ".{0,80}",
         prop::collection::vec("[a-z]{2,12}", 0..4),
         prop::collection::vec(section, 0..3),
