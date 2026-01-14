@@ -5,7 +5,11 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::skill::{ScriptFile, ReferenceFile, SkillAssets, SkillMetadata, SkillSection, SkillSpec};
+use super::packing::{ConstrainedPacker, MandatoryPredicate, MandatorySlice, PackConstraints};
+use super::skill::{
+    ReferenceFile, ScriptFile, SkillAssets, SkillMetadata, SkillSection, SkillSpec,
+};
+use super::slicing::SkillSlicer;
 
 // =============================================================================
 // DISCLOSURE LEVELS
@@ -284,7 +288,11 @@ pub fn disclose(spec: &SkillSpec, assets: &SkillAssets, plan: &DisclosurePlan) -
 }
 
 /// Generate content at a specified disclosure level
-pub fn disclose_level(spec: &SkillSpec, assets: &SkillAssets, level: DisclosureLevel) -> DisclosedContent {
+pub fn disclose_level(
+    spec: &SkillSpec,
+    assets: &SkillAssets,
+    level: DisclosureLevel,
+) -> DisclosedContent {
     match level {
         DisclosureLevel::Minimal => {
             let frontmatter = minimal_frontmatter(&spec.metadata);
@@ -363,13 +371,17 @@ pub fn disclose_level(spec: &SkillSpec, assets: &SkillAssets, level: DisclosureL
 }
 
 /// Pack content within a token budget
-fn disclose_packed(spec: &SkillSpec, _assets: &SkillAssets, budget: &TokenBudget) -> DisclosedContent {
+fn disclose_packed(
+    spec: &SkillSpec,
+    _assets: &SkillAssets,
+    budget: &TokenBudget,
+) -> DisclosedContent {
     // Start with frontmatter (always included)
     let frontmatter = DisclosedFrontmatter::from(&spec.metadata);
     let frontmatter_tokens = estimate_tokens_frontmatter(&spec.metadata, false);
 
-    let remaining = budget.tokens.saturating_sub(frontmatter_tokens);
-    if remaining < 50 {
+    let slice_budget = budget.tokens.saturating_sub(frontmatter_tokens);
+    if slice_budget < 50 {
         // Not enough for body, return minimal
         return DisclosedContent {
             frontmatter,
@@ -381,10 +393,43 @@ fn disclose_packed(spec: &SkillSpec, _assets: &SkillAssets, budget: &TokenBudget
         };
     }
 
-    // Render full body and truncate to fit budget
-    let full_body = render_sections(&spec.sections);
-    let body = truncate_to_tokens(&full_body, remaining);
-    let body_tokens = estimate_tokens_body(Some(&body));
+    let slice_index = SkillSlicer::slice(spec);
+    let mut constraints = PackConstraints::new(slice_budget, budget.max_per_group);
+    constraints
+        .mandatory_slices
+        .push(MandatorySlice::ByPredicate(MandatoryPredicate::Always));
+    let packer = ConstrainedPacker;
+    let packed = match packer.pack(&slice_index.slices, &constraints, budget.mode) {
+        Ok(result) => result,
+        Err(_) => {
+            return DisclosedContent {
+                frontmatter,
+                body: None,
+                scripts: vec![],
+                references: vec![],
+                token_estimate: frontmatter_tokens,
+                level: DisclosureLevel::Minimal,
+            };
+        }
+    };
+
+    let body_tokens = packed
+        .slices
+        .iter()
+        .map(|slice| slice.token_estimate)
+        .sum::<usize>();
+    let body = if packed.slices.is_empty() {
+        None
+    } else {
+        Some(
+            packed
+                .slices
+                .iter()
+                .map(|slice| slice.content.trim_end())
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+        )
+    };
 
     // Determine effective level based on content included
     let level = if body_tokens < 100 {
@@ -399,7 +444,7 @@ fn disclose_packed(spec: &SkillSpec, _assets: &SkillAssets, budget: &TokenBudget
 
     DisclosedContent {
         frontmatter,
-        body: Some(body),
+        body,
         scripts: vec![],
         references: vec![],
         token_estimate: frontmatter_tokens + body_tokens,
@@ -449,7 +494,8 @@ pub fn optimal_disclosure(context: &DisclosureContext) -> DisclosurePlan {
 /// Create minimal frontmatter (id, name, one-line description)
 fn minimal_frontmatter(meta: &SkillMetadata) -> DisclosedFrontmatter {
     // Truncate description to first sentence or 80 chars
-    let description = meta.description
+    let description = meta
+        .description
         .split('.')
         .next()
         .unwrap_or(&meta.description)
@@ -462,7 +508,7 @@ fn minimal_frontmatter(meta: &SkillMetadata) -> DisclosedFrontmatter {
         name: meta.name.clone(),
         version: meta.version.clone(),
         description,
-        tags: vec![], // Omit tags at minimal level
+        tags: vec![],     // Omit tags at minimal level
         requires: vec![], // Omit requires at minimal level
     }
 }
@@ -476,7 +522,8 @@ fn extract_headings(sections: &[SkillSection]) -> String {
         out.push('\n');
         // Add one-line summary if first block is text
         if let Some(first) = section.blocks.first() {
-            let summary: String = first.content
+            let summary: String = first
+                .content
                 .lines()
                 .next()
                 .unwrap_or("")
@@ -554,11 +601,15 @@ fn estimate_tokens_body(body: Option<&str>) -> usize {
 /// Estimate tokens for assets
 fn estimate_tokens_assets(assets: &SkillAssets) -> usize {
     // Scripts: file paths + language info
-    let scripts = assets.scripts.iter()
+    let scripts = assets
+        .scripts
+        .iter()
         .map(|s| s.path.to_string_lossy().len() + s.language.len() + 20)
         .sum::<usize>();
     // References: file paths
-    let refs = assets.references.iter()
+    let refs = assets
+        .references
+        .iter()
         .map(|r| r.path.to_string_lossy().len() + r.file_type.len() + 10)
         .sum::<usize>();
     (scripts + refs) / 4
@@ -574,16 +625,46 @@ mod tests {
 
     #[test]
     fn test_disclosure_level_from_str() {
-        assert_eq!(DisclosureLevel::from_str_or_level("minimal"), Some(DisclosureLevel::Minimal));
-        assert_eq!(DisclosureLevel::from_str_or_level("0"), Some(DisclosureLevel::Minimal));
-        assert_eq!(DisclosureLevel::from_str_or_level("overview"), Some(DisclosureLevel::Overview));
-        assert_eq!(DisclosureLevel::from_str_or_level("1"), Some(DisclosureLevel::Overview));
-        assert_eq!(DisclosureLevel::from_str_or_level("standard"), Some(DisclosureLevel::Standard));
-        assert_eq!(DisclosureLevel::from_str_or_level("2"), Some(DisclosureLevel::Standard));
-        assert_eq!(DisclosureLevel::from_str_or_level("full"), Some(DisclosureLevel::Full));
-        assert_eq!(DisclosureLevel::from_str_or_level("3"), Some(DisclosureLevel::Full));
-        assert_eq!(DisclosureLevel::from_str_or_level("complete"), Some(DisclosureLevel::Complete));
-        assert_eq!(DisclosureLevel::from_str_or_level("4"), Some(DisclosureLevel::Complete));
+        assert_eq!(
+            DisclosureLevel::from_str_or_level("minimal"),
+            Some(DisclosureLevel::Minimal)
+        );
+        assert_eq!(
+            DisclosureLevel::from_str_or_level("0"),
+            Some(DisclosureLevel::Minimal)
+        );
+        assert_eq!(
+            DisclosureLevel::from_str_or_level("overview"),
+            Some(DisclosureLevel::Overview)
+        );
+        assert_eq!(
+            DisclosureLevel::from_str_or_level("1"),
+            Some(DisclosureLevel::Overview)
+        );
+        assert_eq!(
+            DisclosureLevel::from_str_or_level("standard"),
+            Some(DisclosureLevel::Standard)
+        );
+        assert_eq!(
+            DisclosureLevel::from_str_or_level("2"),
+            Some(DisclosureLevel::Standard)
+        );
+        assert_eq!(
+            DisclosureLevel::from_str_or_level("full"),
+            Some(DisclosureLevel::Full)
+        );
+        assert_eq!(
+            DisclosureLevel::from_str_or_level("3"),
+            Some(DisclosureLevel::Full)
+        );
+        assert_eq!(
+            DisclosureLevel::from_str_or_level("complete"),
+            Some(DisclosureLevel::Complete)
+        );
+        assert_eq!(
+            DisclosureLevel::from_str_or_level("4"),
+            Some(DisclosureLevel::Complete)
+        );
         assert_eq!(DisclosureLevel::from_str_or_level("invalid"), None);
     }
 
@@ -599,10 +680,22 @@ mod tests {
     #[test]
     fn test_pack_mode_from_str() {
         assert_eq!(PackMode::from_str("balanced"), Some(PackMode::Balanced));
-        assert_eq!(PackMode::from_str("utility_first"), Some(PackMode::UtilityFirst));
-        assert_eq!(PackMode::from_str("utility-first"), Some(PackMode::UtilityFirst));
-        assert_eq!(PackMode::from_str("coverage_first"), Some(PackMode::CoverageFirst));
-        assert_eq!(PackMode::from_str("pitfall_safe"), Some(PackMode::PitfallSafe));
+        assert_eq!(
+            PackMode::from_str("utility_first"),
+            Some(PackMode::UtilityFirst)
+        );
+        assert_eq!(
+            PackMode::from_str("utility-first"),
+            Some(PackMode::UtilityFirst)
+        );
+        assert_eq!(
+            PackMode::from_str("coverage_first"),
+            Some(PackMode::CoverageFirst)
+        );
+        assert_eq!(
+            PackMode::from_str("pitfall_safe"),
+            Some(PackMode::PitfallSafe)
+        );
         assert_eq!(PackMode::from_str("invalid"), None);
     }
 

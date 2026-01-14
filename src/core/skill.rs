@@ -331,18 +331,38 @@ pub struct SlicePredicate {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PredicateType {
-    PackageVersion { package: String, op: VersionOp, version: String },
-    EnvVar { var: String },
-    FileExists { pattern: String },
-    RustEdition { op: VersionOp, edition: String },
-    ToolVersion { tool: String, op: VersionOp, version: String },
+    PackageVersion {
+        package: String,
+        op: VersionOp,
+        version: String,
+    },
+    EnvVar {
+        var: String,
+    },
+    FileExists {
+        pattern: String,
+    },
+    RustEdition {
+        op: VersionOp,
+        edition: String,
+    },
+    ToolVersion {
+        tool: String,
+        op: VersionOp,
+        version: String,
+    },
 }
 
 /// Version comparison operators
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum VersionOp {
-    Eq, Ne, Lt, Le, Gt, Ge,
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
 }
 
 // =============================================================================
@@ -474,6 +494,9 @@ pub struct PackContract {
     pub required_groups: Vec<String>,
     /// Mandatory slice IDs
     pub mandatory_slices: Vec<String>,
+    /// Optional max slices per coverage group
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_per_group: Option<usize>,
 }
 
 // =============================================================================
@@ -540,7 +563,14 @@ mod tests {
 
     #[test]
     fn test_version_op_variants() {
-        let ops = [VersionOp::Eq, VersionOp::Ne, VersionOp::Lt, VersionOp::Le, VersionOp::Gt, VersionOp::Ge];
+        let ops = [
+            VersionOp::Eq,
+            VersionOp::Ne,
+            VersionOp::Lt,
+            VersionOp::Le,
+            VersionOp::Gt,
+            VersionOp::Ge,
+        ];
         for op in ops {
             let json = serde_json::to_string(&op).unwrap();
             let parsed: VersionOp = serde_json::from_str(&json).unwrap();
