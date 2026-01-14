@@ -69,7 +69,7 @@ impl UbsClient {
         let files = String::from_utf8_lossy(&output.stdout)
             .lines()
             .filter(|line| !line.trim().is_empty())
-            .map(PathBuf::from)
+            .map(|line| repo_root.join(line))
             .collect::<Vec<_>>();
 
         if files.is_empty() {
