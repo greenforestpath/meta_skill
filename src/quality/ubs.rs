@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use once_cell::sync::Lazy;
 use regex::Regex;
 
 use crate::error::{MsError, Result};
@@ -154,14 +155,17 @@ fn command_string(cmd: &Command) -> String {
     }
 }
 
+/// Static regex for parsing UBS findings (compiled once).
+static ISSUE_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"^(?P<file>[^:]+):(?P<line>\d+):(?P<col>\d+)\s*-\s*(?P<msg>.+)$")
+        .expect("invalid UBS issue regex")
+});
+
 fn parse_findings(output: &str) -> Vec<UbsFinding> {
     let mut findings = Vec::new();
     let mut current_category = String::new();
     let mut current_severity = UbsSeverity::Contextual;
     let mut last_index: Option<usize> = None;
-
-    let issue_re = Regex::new(r"^(?P<file>[^:]+):(?P<line>\d+):(?P<col>\d+)\s*-\s*(?P<msg>.+)$")
-        .unwrap();
 
     for raw_line in output.lines() {
         let line = raw_line.trim();
@@ -184,7 +188,7 @@ fn parse_findings(output: &str) -> Vec<UbsFinding> {
             }
         }
 
-        if let Some(caps) = issue_re.captures(line) {
+        if let Some(caps) = ISSUE_RE.captures(line) {
             let file = caps["file"].to_string();
             let line_num = caps["line"].parse::<u32>().unwrap_or(0);
             let col_num = caps["col"].parse::<u32>().unwrap_or(0);

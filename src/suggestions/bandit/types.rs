@@ -56,8 +56,21 @@ impl Default for BetaDistribution {
 
 impl BetaDistribution {
     pub fn sample(&self, rng: &mut ThreadRng) -> f64 {
-        let beta = Beta::new(self.alpha.max(0.0001), self.beta.max(0.0001))
-            .expect("beta distribution");
+        // Ensure finite, positive values for Beta distribution parameters.
+        // Fall back to uniform prior (1.0) if values are NaN, infinite, or non-positive.
+        let alpha = if self.alpha.is_finite() && self.alpha > 0.0 {
+            self.alpha
+        } else {
+            1.0
+        };
+        let beta_param = if self.beta.is_finite() && self.beta > 0.0 {
+            self.beta
+        } else {
+            1.0
+        };
+
+        // Beta::new only fails for non-positive, NaN, or infinite params (now impossible)
+        let beta = Beta::new(alpha, beta_param).expect("beta distribution with validated params");
         beta.sample(rng)
     }
 }

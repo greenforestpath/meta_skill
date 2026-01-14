@@ -130,6 +130,10 @@ pub struct BundleInstallArgs {
     /// Skip signature and checksum verification (not recommended)
     #[arg(long)]
     pub no_verify: bool,
+
+    /// Force reinstallation if bundle is already installed
+    #[arg(long, short = 'f')]
+    pub force: bool,
 }
 
 #[derive(Args, Debug)]
@@ -206,6 +210,11 @@ fn run_create(ctx: &AppContext, args: &BundleCreateArgs) -> Result<()> {
         return Err(MsError::ValidationFailed(
             "bundle create requires --skills or --from-dir".to_string(),
         ));
+    }
+
+    // Warn about unimplemented signing feature
+    if args.sign {
+        eprintln!("Warning: --sign is not yet implemented; bundle will be created unsigned");
     }
 
     let bundle_id = args.id.clone().unwrap_or_else(|| slugify(&args.name));
@@ -392,9 +401,9 @@ fn run_install(ctx: &AppContext, args: &BundleInstallArgs) -> Result<()> {
 
     // Check if already installed
     let mut registry = BundleRegistry::open(ctx.git.root())?;
-    if registry.is_installed(&bundle_id) && !args.no_verify {
+    if registry.is_installed(&bundle_id) && !args.force {
         return Err(MsError::ValidationFailed(format!(
-            "bundle {} is already installed; use ms bundle remove first",
+            "bundle {} is already installed; use --force to reinstall or ms bundle remove first",
             bundle_id
         )));
     }
@@ -458,7 +467,7 @@ fn run_remove(ctx: &AppContext, args: &BundleRemoveArgs) -> Result<()> {
             eprintln!("Warning: --remove-skills will also delete installed skill files");
         }
         eprint!("Continue? [y/N] ");
-        std::io::stdout().flush()?;
+        std::io::stderr().flush()?;
         let mut input = String::new();
         std::io::stdin().read_line(&mut input)?;
         if !input.trim().eq_ignore_ascii_case("y") {

@@ -68,7 +68,7 @@ pub fn install_with_options<V: SignatureVerifier>(
     let signature_verified = if package.manifest.signatures.is_empty() {
         if !options.allow_unsigned {
             return Err(MsError::ValidationFailed(
-                "bundle is unsigned; use --allow-unsigned to install unsigned bundles".to_string(),
+                "bundle is unsigned; use --no-verify to install unsigned bundles".to_string(),
             ));
         }
         false

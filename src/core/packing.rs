@@ -512,6 +512,15 @@ fn try_improve(
     if candidate.token_estimate > tokens_after {
         return false;
     }
+
+    // Update group counts BEFORE can_add_slice check to account for the removal.
+    // This allows same-group swaps where the candidate replaces the removed slice.
+    if let Some(group) = &removed_group {
+        if let Some(count) = group_counts.get_mut(group) {
+            *count = count.saturating_sub(1);
+        }
+    }
+
     if !can_add_slice(candidate, excluded, &group_counts, max_per_group) {
         return false;
     }
@@ -523,11 +532,6 @@ fn try_improve(
 
     selected_ids.remove(&removed_id);
     selected.remove(remove_idx);
-    if let Some(group) = &removed_group {
-        if let Some(count) = group_counts.get_mut(group) {
-            *count = count.saturating_sub(1);
-        }
-    }
 
     selected.push(candidate.clone());
     selected_ids.insert(candidate.id.clone());

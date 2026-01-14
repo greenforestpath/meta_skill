@@ -290,11 +290,9 @@ impl UpdateDownloader {
     }
 }
 
-impl Default for UpdateDownloader {
-    fn default() -> Self {
-        Self::new().expect("failed to create temp directory")
-    }
-}
+// NOTE: Intentionally not implementing Default for UpdateDownloader.
+// Creating a temp directory can fail, so callers must use UpdateDownloader::new()
+// which properly returns a Result for error handling.
 
 /// Installer for atomic binary replacement.
 pub struct UpdateInstaller {

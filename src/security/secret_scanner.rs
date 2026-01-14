@@ -132,7 +132,7 @@ static SECRET_PATTERNS: Lazy<Vec<SecretPattern>> = Lazy::new(|| {
         // AWS Access Key ID (starts with AKIA, ABIA, ACCA, ASIA)
         SecretPattern {
             secret_type: SecretType::AwsAccessKey,
-            regex: Regex::new(r"(?:^|[^A-Z0-9])(A[KBS]IA[0-9A-Z]{16})(?:[^A-Z0-9]|$)")
+            regex: Regex::new(r"(?:^|[^A-Z0-9])(A[KBSC]IA[0-9A-Z]{16}|ACCA[0-9A-Z]{16})(?:[^A-Z0-9]|$)")
                 .expect("invalid AWS access key regex"),
             confidence: 0.95,
         },
@@ -250,9 +250,15 @@ pub fn scan_secrets(content: &str) -> Vec<SecretMatch> {
     // Also check for high-entropy strings
     for entropy_match in scan_high_entropy(content) {
         // Don't duplicate if already matched by a pattern
+        // Check for any overlap: either endpoint is inside the other range,
+        // or one range fully contains the other
         let overlaps = matches.iter().any(|m| {
+            // entropy_match.start is inside m
             (entropy_match.start >= m.start && entropy_match.start < m.end)
+                // entropy_match.end is inside m
                 || (entropy_match.end > m.start && entropy_match.end <= m.end)
+                // entropy_match fully contains m
+                || (entropy_match.start <= m.start && entropy_match.end >= m.end)
         });
         if !overlaps {
             matches.push(entropy_match);
@@ -318,11 +324,13 @@ fn calculate_entropy(s: &str) -> f64 {
     }
 
     let mut freq = std::collections::HashMap::new();
+    let mut char_count = 0usize;
     for c in s.chars() {
         *freq.entry(c).or_insert(0usize) += 1;
+        char_count += 1;
     }
 
-    let len = s.len() as f64;
+    let len = char_count as f64;
     freq.values()
         .map(|&count| {
             let p = count as f64 / len;
