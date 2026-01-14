@@ -44,6 +44,7 @@ struct RepoRef {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[allow(dead_code)] // Fields from GitHub API response
 struct Release {
     id: u64,
     tag_name: String,
@@ -53,6 +54,7 @@ struct Release {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[allow(dead_code)] // Fields from GitHub API response
 struct ReleaseAsset {
     id: u64,
     name: String,

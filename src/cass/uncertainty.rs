@@ -14,6 +14,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::error::Result;
+
 use super::mining::ExtractedPattern;
 use super::transformation::{
     GeneralizationValidation, InstanceCluster, RefinementCritique, SpecificInstance,
@@ -263,7 +265,7 @@ pub struct SuggestedQuery {
 }
 
 /// Type of query for evidence gathering
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QueryType {
     /// Looking for positive examples
@@ -332,6 +334,7 @@ pub trait QueryGenerator: Send + Sync {
 }
 
 /// Default query generator using pattern analysis
+#[allow(dead_code)] // Field used for configuration, implementation pending
 pub struct DefaultQueryGenerator {
     queries_per_type: usize,
 }
@@ -1022,7 +1025,7 @@ impl UncertaintyQueueSink for UncertaintyQueue {
         validation: &GeneralizationValidation,
         cluster: &InstanceCluster,
         critique: Option<&RefinementCritique>,
-    ) {
+    ) -> Result<String> {
         // Determine reason for uncertainty
         let reason = self.determine_uncertainty_reason(validation, critique);
 
@@ -1031,40 +1034,33 @@ impl UncertaintyQueueSink for UncertaintyQueue {
 
         // Create source instance info
         let source_info = SourceInstanceInfo {
-            session_id: instance.session_id.clone(),
-            description: instance.description.clone().unwrap_or_default(),
-            tool_signatures: instance
-                .context
-                .tool_signatures
-                .iter()
-                .map(|t| t.name.clone())
-                .collect(),
+            session_id: instance.source.session_id.clone(),
+            description: instance.context.description.clone().unwrap_or_default(),
+            // Use tags from context as a proxy for tool signatures
+            tool_signatures: instance.context.tags.clone(),
         };
+
+        // Derive common file types from cluster instances
+        let common_file_types: Vec<String> = cluster
+            .instances
+            .iter()
+            .filter_map(|ci| ci.instance.context.file_type.clone())
+            .take(5)
+            .collect();
 
         // Create cluster summary
         let cluster_summary = ClusterSummary {
             cluster_id: cluster.id.clone(),
             instance_count: cluster.instances.len(),
-            common_tools: cluster
-                .common
-                .common_tool_sequences
-                .iter()
-                .flatten()
-                .take(5)
-                .cloned()
-                .collect(),
-            common_file_types: cluster
-                .common
-                .common_file_types
-                .iter()
-                .take(5)
-                .cloned()
-                .collect(),
+            // Use context_conditions as a proxy for common tools
+            common_tools: cluster.context_conditions.iter().take(5).cloned().collect(),
+            common_file_types,
         };
 
         // Build the uncertainty item
+        let item_id = Uuid::new_v4().to_string();
         let item = UncertaintyItem {
-            id: Uuid::new_v4().to_string(),
+            id: item_id.clone(),
             pattern_candidate: pattern,
             reason,
             confidence: validation.confidence,
@@ -1080,6 +1076,7 @@ impl UncertaintyQueueSink for UncertaintyQueue {
         };
 
         self.enqueue(item);
+        Ok(item_id)
     }
 }
 
@@ -1142,20 +1139,17 @@ impl UncertaintyQueue {
     fn create_pattern_from_cluster(&self, cluster: &InstanceCluster) -> ExtractedPattern {
         use super::mining::{EvidenceRef, PatternType, WorkflowStep};
 
-        // Extract workflow steps from common elements
+        // Extract workflow steps from context_conditions
         let steps: Vec<WorkflowStep> = cluster
-            .common
-            .common_tool_sequences
+            .context_conditions
             .iter()
             .enumerate()
-            .flat_map(|(seq_idx, seq)| {
-                seq.iter().enumerate().map(move |(i, tool)| WorkflowStep {
-                    order: seq_idx * 10 + i,
-                    action: tool.clone(),
-                    description: format!("Step {} in sequence {}", i + 1, seq_idx + 1),
-                    optional: false,
-                    conditions: vec![],
-                })
+            .map(|(i, condition)| WorkflowStep {
+                order: i,
+                action: condition.clone(),
+                description: format!("Condition {} from cluster", i + 1),
+                optional: false,
+                conditions: vec![],
             })
             .take(10)
             .collect();
@@ -1164,26 +1158,53 @@ impl UncertaintyQueue {
         let evidence: Vec<EvidenceRef> = cluster
             .instances
             .iter()
-            .map(|inst| EvidenceRef {
-                session_id: inst.session_id.clone(),
-                message_indices: vec![],
-                relevance: inst.similarity,
-                snippet: inst.summary.clone(),
+            .map(|inst| {
+                // Convert distance_to_centroid to similarity (closer = more similar)
+                let similarity = 1.0 / (1.0 + inst.distance_to_centroid);
+                // Use content truncated as snippet
+                let snippet = inst
+                    .instance
+                    .content
+                    .chars()
+                    .take(100)
+                    .collect::<String>();
+                EvidenceRef {
+                    session_id: inst.instance.source.session_id.clone(),
+                    message_indices: vec![],
+                    relevance: similarity,
+                    snippet: Some(snippet),
+                }
             })
             .collect();
+
+        // Derive file types from instances
+        let file_types: Vec<String> = cluster
+            .instances
+            .iter()
+            .filter_map(|i| i.instance.context.file_type.clone())
+            .collect();
+
+        // Create description from first instance content
+        let description = cluster
+            .instances
+            .first()
+            .map(|i| {
+                let truncated: String = i.instance.content.chars().take(200).collect();
+                format!("Pattern from cluster {} instances: {}", cluster.instances.len(), truncated)
+            });
 
         ExtractedPattern {
             id: format!("uncertain-{}", Uuid::new_v4()),
             pattern_type: PatternType::WorkflowPattern {
                 steps,
-                triggers: cluster.common.common_problem_indicators.clone(),
-                outcomes: cluster.common.shared_outcomes.clone(),
+                triggers: cluster.context_conditions.clone(),
+                outcomes: vec![], // Derived outcomes not available
             },
             evidence,
             confidence: 0.0, // Will be set from validation
             frequency: cluster.instances.len(),
-            tags: cluster.common.common_file_types.clone(),
-            description: cluster.common.abstracted_description.clone(),
+            tags: file_types,
+            description,
             taint_label: None,
         }
     }

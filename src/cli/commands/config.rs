@@ -2,7 +2,7 @@
 
 use clap::Args;
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::cli::output;
 use crate::app::AppContext;

@@ -3,7 +3,8 @@
 use std::path::{Component, Path, PathBuf};
 
 use crate::bundler::blob::BlobStore;
-use crate::bundler::package::{BundlePackage};
+use crate::bundler::manifest::SignatureVerifier;
+use crate::bundler::package::BundlePackage;
 use crate::error::{MsError, Result};
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -12,15 +13,74 @@ pub struct InstallReport {
     pub installed: Vec<String>,
     pub skipped: Vec<String>,
     pub blobs_written: usize,
+    pub signature_verified: bool,
 }
 
-/// Install a bundle into the git archive root.
-pub fn install(
+/// Options for bundle installation.
+pub struct InstallOptions<'a, V: SignatureVerifier = crate::bundler::manifest::NoopSignatureVerifier>
+{
+    /// Allow installing unsigned bundles. Default: false (signatures required).
+    pub allow_unsigned: bool,
+    /// Signature verifier for signed bundles.
+    pub verifier: Option<&'a V>,
+}
+
+impl<'a, V: SignatureVerifier> Default for InstallOptions<'a, V> {
+    fn default() -> Self {
+        Self {
+            allow_unsigned: false,
+            verifier: None,
+        }
+    }
+}
+
+impl<'a, V: SignatureVerifier> InstallOptions<'a, V> {
+    /// Create options that allow unsigned bundles (for development/testing).
+    pub fn allow_unsigned() -> Self {
+        Self {
+            allow_unsigned: true,
+            verifier: None,
+        }
+    }
+
+    /// Create options with a signature verifier.
+    pub fn with_verifier(verifier: &'a V) -> Self {
+        Self {
+            allow_unsigned: false,
+            verifier: Some(verifier),
+        }
+    }
+}
+
+/// Install a bundle into the git archive root with signature enforcement.
+///
+/// By default, bundles must be signed. Use `InstallOptions::allow_unsigned()`
+/// for development/testing scenarios where unsigned bundles are acceptable.
+pub fn install_with_options<V: SignatureVerifier>(
     package: &BundlePackage,
     archive_root: &Path,
     only_skills: &[String],
+    options: &InstallOptions<'_, V>,
 ) -> Result<InstallReport> {
     package.verify()?;
+
+    // Signature verification (enforced by default)
+    let signature_verified = if package.manifest.signatures.is_empty() {
+        if !options.allow_unsigned {
+            return Err(MsError::ValidationFailed(
+                "bundle is unsigned; use --allow-unsigned to install unsigned bundles".to_string(),
+            ));
+        }
+        false
+    } else {
+        let verifier = options.verifier.ok_or_else(|| {
+            MsError::ValidationFailed(
+                "bundle is signed but no signature verifier configured".to_string(),
+            )
+        })?;
+        package.verify_signatures(verifier)?;
+        true
+    };
 
     let store = BlobStore::open(archive_root.join("bundles"))?;
     let blobs_written = package.write_missing_blobs(&store)?;
@@ -40,10 +100,9 @@ pub fn install(
             .blobs
             .iter()
             .find(|b| &b.hash == hash)
-            .ok_or_else(|| MsError::ValidationFailed(format!(
-                "bundle missing blob {} for {}",
-                hash, skill.name
-            )))?;
+            .ok_or_else(|| {
+                MsError::ValidationFailed(format!("bundle missing blob {} for {}", hash, skill.name))
+            })?;
 
         let target = resolve_target_path(archive_root, &skill.path, &skill.name)?;
         if target.exists() {
@@ -65,7 +124,25 @@ pub fn install(
         installed,
         skipped,
         blobs_written,
+        signature_verified,
     })
+}
+
+/// Install a bundle into the git archive root (allows unsigned bundles).
+///
+/// This is a convenience wrapper for development/testing. For production use,
+/// prefer `install_with_options` with proper signature verification.
+pub fn install(
+    package: &BundlePackage,
+    archive_root: &Path,
+    only_skills: &[String],
+) -> Result<InstallReport> {
+    install_with_options(
+        package,
+        archive_root,
+        only_skills,
+        &InstallOptions::<crate::bundler::manifest::NoopSignatureVerifier>::allow_unsigned(),
+    )
 }
 
 fn resolve_target_path(root: &Path, path: &Path, fallback_id: &str) -> Result<PathBuf> {

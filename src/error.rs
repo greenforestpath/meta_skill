@@ -75,6 +75,9 @@ pub enum MsError {
 
     #[error("Not implemented: {0}")]
     NotImplemented(String),
+
+    #[error("Not found: {0}")]
+    NotFound(String),
 }
 
 pub type Result<T> = std::result::Result<T, MsError>;

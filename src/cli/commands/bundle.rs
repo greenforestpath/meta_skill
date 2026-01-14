@@ -116,7 +116,7 @@ pub fn run(_ctx: &AppContext, _args: &BundleArgs) -> Result<()> {
         BundleCommand::Create(create) => run_create(ctx, create),
         BundleCommand::Install(install) => run_install(ctx, install),
         BundleCommand::Publish(publish) => run_publish(ctx, publish),
-        _ => Ok(()),
+        BundleCommand::List => run_list(ctx),
     }
 }
 
@@ -297,6 +297,53 @@ fn run_publish(ctx: &AppContext, args: &BundlePublishArgs) -> Result<()> {
     Ok(())
 }
 
+fn run_list(ctx: &AppContext) -> Result<()> {
+    let bundles_dir = ctx.git.root().join("bundles");
+
+    if !bundles_dir.exists() {
+        if ctx.robot_mode {
+            return emit_json(&BundleListReport {
+                bundles: vec![],
+                count: 0,
+            });
+        }
+        println!("No bundles installed.");
+        return Ok(());
+    }
+
+    // List .msb files in bundles directory
+    let mut bundles = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&bundles_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().map_or(false, |ext| ext == "msb") {
+                if let Some(name) = path.file_stem().and_then(|s| s.to_str()) {
+                    bundles.push(name.to_string());
+                }
+            }
+        }
+    }
+    bundles.sort();
+
+    if ctx.robot_mode {
+        return emit_json(&BundleListReport {
+            count: bundles.len(),
+            bundles,
+        });
+    }
+
+    if bundles.is_empty() {
+        println!("No bundles installed.");
+    } else {
+        println!("Installed bundles:");
+        for bundle in &bundles {
+            println!("  - {}", bundle);
+        }
+        println!("\n{} bundle(s) total.", bundles.len());
+    }
+    Ok(())
+}
+
 fn normalize_skill_list(values: &[String]) -> Vec<String> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
@@ -390,4 +437,10 @@ struct BundleCreateReport {
     output: String,
     manifest_path: Option<String>,
     checksum: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct BundleListReport {
+    bundles: Vec<String>,
+    count: usize,
 }
