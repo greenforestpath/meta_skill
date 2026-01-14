@@ -12,5 +12,5 @@ pub use client::{
     CassCapabilities, CassClient, CassHealth, FingerprintCache, Session, SessionExpanded,
     SessionMatch, SessionMessage, SessionMetadata, ToolCall, ToolResult,
 };
-pub use mining::{ExtractedPattern, Pattern, PatternIR, PatternType};
+pub use mining::{Pattern, PatternType};
 pub use synthesis::SkillDraft;

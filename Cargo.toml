@@ -89,6 +89,8 @@ textwrap = "0.16"
 semver = "1.0"
 fs2 = "0.4"
 hostname = "0.4"
+libc = "0.2.180"
+tempfile = "3.14"
 
 [build-dependencies]
 vergen-gix = { version = "1.0", features = ["build", "cargo", "rustc"] }

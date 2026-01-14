@@ -455,6 +455,12 @@ impl Database {
         Ok(())
     }
 
+    /// Run SQLite integrity check
+    pub fn integrity_check(&self) -> Result<bool> {
+        let result: String = self.conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+        Ok(result == "ok")
+    }
+
     fn configure_pragmas(conn: &Connection) -> Result<()> {
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;

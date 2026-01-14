@@ -78,6 +78,14 @@ Additionally:
 - JUnit/TAP output for CI dashboards
 - Failing tests block release
 
+## UBS Installation Requirements
+
+UBS must be available on the PATH as `ubs` for pre-commit and validation.
+
+- Source repo: `/data/projects/ultimate_bug_scanner`
+- Install example: `cargo install --path /data/projects/ultimate_bug_scanner`
+- Verify: `ubs --help` should exit 0
+
 ## Acceptance Criteria (for this strategy bead)
 
 - Testing philosophy is documented and referenced by child test beads.

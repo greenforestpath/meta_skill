@@ -56,6 +56,11 @@ impl GitArchive {
         &self.root
     }
 
+    /// Get the path to a skill directory in the archive
+    pub fn skill_path(&self, skill_id: &str) -> PathBuf {
+        self.root.join("skills/by-id").join(skill_id)
+    }
+
     pub fn list_skill_ids(&self) -> Result<Vec<String>> {
         let base = self.root.join("skills/by-id");
         if !base.exists() {
