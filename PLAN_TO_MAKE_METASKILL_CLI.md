@@ -87,6 +87,18 @@ requirements:
   env:
     - GITHUB_TOKEN
   network: required
+fixes:  # Error codes/patterns this skill helps resolve
+  - "clippy::unwrap_used"
+  - "ubs:nil_dereference"
+policies:  # Machine-readable constraints for external tooling (declarative, not enforced by ms)
+  - pattern_type: command
+    pattern: "rm -rf"
+    severity: block
+    message: "Use trash-cli instead per safety-policy skill"
+  - pattern_type: ast-grep
+    pattern: "console.log($$$)"
+    severity: warn
+    message: "Use structured logger (see observability skill)"
 ---
 
 # Skill Title
@@ -102,6 +114,16 @@ Brief overview of what this skill enables.
 
 The main instructional content...
 
+::: block id="middleware-v15" condition="package:next < 16.0.0"
+### Middleware (Next.js 15 and earlier)
+Create `src/middleware.ts` for request interception...
+:::
+
+::: block id="proxy-v16" condition="package:next >= 16.0.0"
+### Proxy Handler (Next.js 16+)
+Create `src/proxy.ts` using the new proxy API...
+:::
+
 ## Examples
 
 Concrete examples with code...
@@ -110,6 +132,8 @@ Concrete examples with code...
 
 Common errors and resolutions...
 ```
+
+**Conditional blocks:** The `::: block` syntax allows version-specific content. At load time, `ms` evaluates predicates against the project environment (package.json, Cargo.toml, etc.) and strips blocks whose conditions evaluate false. The agent never sees irrelevant version-specific content.
 
 **How skills are loaded:** Claude Code discovers skills from configured paths (e.g., `~/.claude/skills/`, `.claude/skills/` in projects). When a user invokes a skill (explicitly or via auto-suggestion), its content is injected into the conversation context.
 
@@ -264,6 +288,7 @@ ntm send myproject --cc "Implement auth"     # Send to all Claude agents
 **Integration point:** ms should provide:
 ```bash
 ms suggest --for-ntm myproject  # Skills for multi-agent session
+ms suggest --for-ntm myproject --agents 6 --budget 800 --objective coverage_first
 ms load ntm --level 2           # Appropriate for split attention
 ```
 
@@ -724,12 +749,16 @@ meta_skill/
 │   │   │   ├── search.rs          # ms search
 │   │   │   ├── load.rs            # ms load
 │   │   │   ├── suggest.rs         # ms suggest
+│   │   │   ├── edit.rs            # ms edit
+│   │   │   ├── fmt.rs             # ms fmt
+│   │   │   ├── diff.rs            # ms diff
 │   │   │   ├── alias.rs           # ms alias
 │   │   │   ├── requirements.rs    # ms requirements
 │   │   │   ├── build.rs           # ms build (CASS integration)
 │   │   │   ├── bundle.rs          # ms bundle
 │   │   │   ├── update.rs          # ms update
 │   │   │   ├── doctor.rs          # ms doctor
+│   │   │   ├── prune.rs           # ms prune
 │   │   │   ├── init.rs            # ms init
 │   │   │   └── config.rs          # ms config
 │   │   └── output.rs              # Robot mode, human mode formatting
@@ -738,7 +767,9 @@ meta_skill/
 │   │   ├── skill.rs               # Skill struct and parsing
 │   │   ├── registry.rs            # Skill registry management
 │   │   ├── disclosure.rs          # Progressive disclosure logic
+│   │   ├── safety.rs              # Destructive ops policy + approvals
 │   │   ├── requirements.rs        # Environment requirement checks
+│   │   ├── spec_lens.rs           # Round-trip spec ↔ markdown mapping
 │   │   └── validation.rs          # Skill validation
 │   ├── storage/
 │   │   ├── mod.rs
@@ -863,6 +894,21 @@ pub enum SkillBlockSpec {
     Note { text: String },
 }
 
+/// Mapping from compiled markdown back to spec blocks
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpecLens {
+    pub format_version: String,
+    pub blocks: Vec<BlockLens>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlockLens {
+    pub block_id: String,
+    pub section: String,
+    pub block_type: String,
+    pub byte_range: (u32, u32),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillMetadata {
     pub name: String,
@@ -900,6 +946,29 @@ pub struct SkillMetadata {
 
     #[serde(default)]
     pub requirements: SkillRequirements,  // Tooling/OS/environment requirements
+
+    #[serde(default)]
+    pub fixes: Vec<String>,  // Error codes/patterns this skill addresses (e.g., "clippy::unwrap_used", "ubs:nil_dereference")
+
+    #[serde(default)]
+    pub policies: Vec<SkillPolicy>,  // Machine-readable policy constraints for external tooling
+}
+
+/// Machine-readable policy declaration for external tool integration
+/// Note: These are declarative hints, not runtime enforcement (enforcement belongs in NTM/UBS)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillPolicy {
+    /// Pattern type: "regex", "ast-grep", "command", "file_pattern"
+    pub pattern_type: String,
+
+    /// The pattern to match
+    pub pattern: String,
+
+    /// Severity: "block", "warn", "info"
+    pub severity: String,
+
+    /// Human-readable explanation
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1082,8 +1151,47 @@ pub struct SkillSlice {
     /// Optional dependencies on other slices (by id)
     pub requires: Vec<String>,
 
+    /// Optional predicate condition for conditional inclusion
+    /// Examples: "package:next >= 16.0.0", "rust:edition == 2021", "env:CI"
+    /// When present, slice is stripped at load time if condition evaluates false
+    pub condition: Option<SlicePredicate>,
+
     /// Content payload (markdown)
     pub content: String,
+}
+
+/// Predicate for conditional slice inclusion based on project environment
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SlicePredicate {
+    /// Predicate expression: "package:<name> <op> <version>" | "env:<var>" | "file:<glob>"
+    pub expr: String,
+
+    /// Pre-parsed predicate type for fast evaluation
+    pub predicate_type: PredicateType,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PredicateType {
+    /// Package version check: package:next >= 16.0.0
+    PackageVersion { package: String, op: VersionOp, version: String },
+    /// Environment variable presence: env:CI
+    EnvVar { var: String },
+    /// File/glob existence: file:src/middleware.ts
+    FileExists { pattern: String },
+    /// Rust edition check: rust:edition == 2021
+    RustEdition { op: VersionOp, edition: String },
+    /// Toolchain version: tool:node >= 18.0.0
+    ToolVersion { tool: String, op: VersionOp, version: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum VersionOp {
+    Eq,   // ==
+    Ne,   // !=
+    Lt,   // <
+    Le,   // <=
+    Gt,   // >
+    Ge,   // >=
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1227,8 +1335,23 @@ CREATE VIRTUAL TABLE skills_fts USING fts5(
     content_rowid='rowid'
 );
 
--- Triggers to keep FTS in sync
+-- Triggers to keep FTS in sync (INSERT, UPDATE, DELETE)
 CREATE TRIGGER skills_ai AFTER INSERT ON skills BEGIN
+    INSERT INTO skills_fts(rowid, name, description, body, tags)
+    VALUES (NEW.rowid, NEW.name, NEW.description, NEW.body,
+            (SELECT json_extract(NEW.metadata_json, '$.tags')));
+END;
+
+CREATE TRIGGER skills_ad AFTER DELETE ON skills BEGIN
+    INSERT INTO skills_fts(skills_fts, rowid, name, description, body, tags)
+    VALUES ('delete', OLD.rowid, OLD.name, OLD.description, OLD.body,
+            (SELECT json_extract(OLD.metadata_json, '$.tags')));
+END;
+
+CREATE TRIGGER skills_au AFTER UPDATE ON skills BEGIN
+    INSERT INTO skills_fts(skills_fts, rowid, name, description, body, tags)
+    VALUES ('delete', OLD.rowid, OLD.name, OLD.description, OLD.body,
+            (SELECT json_extract(OLD.metadata_json, '$.tags')));
     INSERT INTO skills_fts(rowid, name, description, body, tags)
     VALUES (NEW.rowid, NEW.name, NEW.description, NEW.body,
             (SELECT json_extract(NEW.metadata_json, '$.tags')));
@@ -1434,6 +1557,7 @@ CREATE INDEX idx_usage_time ON skill_usage(used_at);
 │   │   ├── ntm/
 │   │   │   ├── metadata.yaml
 │   │   │   ├── skill.spec.json
+│   │   │   ├── spec.lens.json
 │   │   │   ├── SKILL.md
 │   │   │   ├── evidence.json
 │   │   │   ├── evidence/
@@ -1446,6 +1570,7 @@ CREATE INDEX idx_usage_time ON skill_usage(used_at);
 │   │   └── planning-workflow/
 │   │       ├── metadata.yaml
 │   │       ├── skill.spec.json
+│   │       ├── spec.lens.json
 │   │       ├── SKILL.md
 │   │       ├── evidence.json
 │   │       ├── slices.json
@@ -1460,6 +1585,7 @@ CREATE INDEX idx_usage_time ON skill_usage(used_at);
 │   │   ├── evidence.json
 │   │   ├── redaction-report.json
 │   │   ├── skill.spec.json
+│   │   ├── spec.lens.json
 │   │   ├── draft-v1.md
 │   │   ├── draft-v2.md
 │   │   └── final.md
@@ -1562,6 +1688,8 @@ impl AliasResolver {
 - `ms load legacy-id` resolves to canonical skill and emits a warning if deprecated.
 - `ms search` and `ms suggest` exclude deprecated skills by default unless explicitly requested.
 - If `deprecated.replaced_by` is set, ms highlights the replacement in output.
+- Indexing upserts alias records from `metadata.aliases` and from `deprecated.replaced_by`
+  (alias_type = `deprecated`), and rejects collisions with existing skill ids.
 
 ### 3.5 Layering and Conflict Resolution
 
@@ -1615,6 +1743,14 @@ pub enum ConflictStrategy {
     Interactive,
 }
 
+/// How to merge non-identical sections before falling back to strategy
+pub enum MergeStrategy {
+    /// Merge only when sections are non-overlapping
+    Auto,
+    /// Prefer higher-layer rules/pitfalls, lower-layer examples/references
+    PreferSections,
+}
+
 pub enum ConflictResolution {
     UseHigher,
     UseLower,
@@ -1628,6 +1764,8 @@ pub enum ConflictResolution {
   - Prefer higher layer by default
   - If both edit the same section, record a conflict detail
   - If conflict strategy is `interactive`, require explicit choice
+  - If merge strategy is `prefer_sections`, keep higher-layer rules/pitfalls but
+    append or preserve lower-layer examples/references when non-identical
 
 **Conflict Auto-Diff and Merge Policies:**
 
@@ -1643,14 +1781,23 @@ impl ConflictMerger {
         higher: &SkillSpec,
         lower: &SkillSpec,
         strategy: ConflictStrategy,
+        merge_strategy: MergeStrategy,
     ) -> Result<ResolvedSkill> {
         let diffs = section_diff(higher, lower);
 
         // Auto-merge if changes are non-overlapping
-        if diffs.non_overlapping() {
+        if matches!(merge_strategy, MergeStrategy::Auto) && diffs.non_overlapping() {
             return Ok(ResolvedSkill {
                 skill: merge_sections(higher, lower)?,
                 conflicts: vec![],
+            });
+        }
+
+        // Prefer sections across layers to keep lower-layer examples
+        if matches!(merge_strategy, MergeStrategy::PreferSections) {
+            return Ok(ResolvedSkill {
+                skill: merge_by_section_preference(higher, lower)?,
+                conflicts: diffs.to_conflicts(SkillLayer::User, SkillLayer::Project),
             });
         }
 
@@ -1670,10 +1817,124 @@ impl ConflictMerger {
 
 fn section_diff(higher: &SkillSpec, lower: &SkillSpec) -> SectionDiff { unimplemented!() }
 fn merge_sections(higher: &SkillSpec, lower: &SkillSpec) -> Result<Skill> { unimplemented!() }
+fn merge_by_section_preference(higher: &SkillSpec, lower: &SkillSpec) -> Result<Skill> { unimplemented!() }
 ```
 
 When conflicts remain, ms surfaces a guided diff in `ms resolve` showing the
 exact section differences and suggested merges.
+
+**Block-Level Overlays:**
+
+Beyond whole-skill overrides, higher layers can provide **overlay files** that patch
+specific block IDs without copying the entire skill. This enables surgical policy
+additions and reduces duplication/drift.
+
+```rust
+/// Overlay operations for surgical skill modifications
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillOverlay {
+    /// Target skill id
+    pub skill_id: String,
+
+    /// Layer that provides this overlay
+    pub layer: SkillLayer,
+
+    /// Ordered list of patch operations
+    pub operations: Vec<OverlayOp>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum OverlayOp {
+    /// Replace a block's content entirely
+    ReplaceBlock { block_id: String, content: String },
+
+    /// Delete a block
+    DeleteBlock { block_id: String },
+
+    /// Insert a new block after an existing one
+    InsertAfter { after_block_id: String, new_block: SkillBlock },
+
+    /// Append items to a checklist block
+    AppendToChecklist { block_id: String, items: Vec<String> },
+
+    /// Prepend a critical rule (inserted at top of rules section)
+    PrependRule { rule: SkillBlock },
+
+    /// Override metadata fields
+    PatchMetadata { patches: HashMap<String, serde_json::Value> },
+}
+
+impl LayeredRegistry {
+    /// Apply overlays from higher layers to base skill
+    pub fn apply_overlays(&self, skill: &Skill, overlays: &[SkillOverlay]) -> Result<Skill> {
+        let mut spec = skill.to_spec()?;
+
+        for overlay in overlays {
+            for op in &overlay.operations {
+                match op {
+                    OverlayOp::ReplaceBlock { block_id, content } => {
+                        spec.replace_block(block_id, content)?;
+                    }
+                    OverlayOp::DeleteBlock { block_id } => {
+                        spec.delete_block(block_id)?;
+                    }
+                    OverlayOp::InsertAfter { after_block_id, new_block } => {
+                        spec.insert_after(after_block_id, new_block.clone())?;
+                    }
+                    OverlayOp::AppendToChecklist { block_id, items } => {
+                        spec.append_checklist_items(block_id, items)?;
+                    }
+                    OverlayOp::PrependRule { rule } => {
+                        spec.prepend_rule(rule.clone())?;
+                    }
+                    OverlayOp::PatchMetadata { patches } => {
+                        spec.patch_metadata(patches)?;
+                    }
+                }
+            }
+        }
+
+        spec.compile()
+    }
+}
+```
+
+**Overlay File Format:**
+
+Overlays are stored in the layer's skill directory as `skill.overlay.json`:
+
+```json
+{
+  "skill_id": "nextjs-patterns",
+  "operations": [
+    {
+      "type": "replace_block",
+      "block_id": "rule-3",
+      "content": "NEVER use transition-all; prefer specific properties per new policy."
+    },
+    {
+      "type": "append_to_checklist",
+      "block_id": "checklist-pre-deploy",
+      "items": ["Run compliance audit: `audit-tool check`"]
+    },
+    {
+      "type": "prepend_rule",
+      "rule": {
+        "id": "org-rule-1",
+        "type": "rule",
+        "content": "All API routes must use the org auth middleware."
+      }
+    }
+  ]
+}
+```
+
+**Benefits:**
+
+- **No duplication:** Org/user layers don't copy entire skills
+- **Drift prevention:** Base skill updates propagate automatically
+- **Surgical policy:** Add compliance rules without rewriting
+- **Clear provenance:** Each block records which layer modified it
 
 ### 3.6 Skill Spec and Deterministic Compilation
 
@@ -1703,6 +1964,14 @@ impl SkillCompiler {
 
 By default, `ms build` outputs `skill.spec.json`, then compiles it to SKILL.md.
 Manual edits should update the spec, not the rendered artifact.
+
+**Round-Trip Editing (Spec ↔ Markdown):**
+- `ms edit <skill>` opens a structured view, parses edits back into `SkillSpec`,
+  and re-renders `SKILL.md` deterministically.
+- The compiler emits `spec.lens.json` to map block IDs to byte ranges so edits
+  can be attributed to the correct spec blocks.
+- If parsing fails, `--allow-lossy` permits a best-effort import with warnings.
+- `ms fmt` re-renders from spec; `ms diff --semantic` compares spec blocks.
 
 ### 3.7 Two-Phase Commit for Dual Persistence
 
@@ -1745,6 +2014,190 @@ pub struct TxRecord {
 ```
 
 Recovery is automatic on startup and via `ms doctor --fix`.
+
+### 3.7.1 Global File Locking
+
+While SQLite handles internal concurrency with WAL mode, the dual-persistence
+pattern (SQLite + Git) requires coordination when multiple `ms` processes run
+concurrently (e.g., parallel agent invocations, IDE background indexer + CLI).
+
+```rust
+use std::fs::{File, OpenOptions};
+use std::io;
+use std::path::PathBuf;
+
+#[cfg(unix)]
+use std::os::unix::fs::FileExt;
+
+/// Advisory file lock for coordinating dual-persistence writes
+pub struct GlobalLock {
+    lock_file: File,
+    lock_path: PathBuf,
+}
+
+impl GlobalLock {
+    const LOCK_FILENAME: &'static str = ".ms/ms.lock";
+
+    /// Acquire exclusive lock (blocking)
+    pub fn acquire(ms_root: &Path) -> io::Result<Self> {
+        let lock_path = ms_root.join(Self::LOCK_FILENAME);
+        std::fs::create_dir_all(lock_path.parent().unwrap())?;
+
+        let lock_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&lock_path)?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = lock_file.as_raw_fd();
+            // LOCK_EX = exclusive, blocks until acquired
+            unsafe { libc::flock(fd, libc::LOCK_EX) };
+        }
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            use winapi::um::fileapi::LockFileEx;
+            use winapi::um::minwinbase::LOCKFILE_EXCLUSIVE_LOCK;
+            let handle = lock_file.as_raw_handle();
+            unsafe {
+                let mut overlapped = std::mem::zeroed();
+                LockFileEx(
+                    handle as *mut _,
+                    LOCKFILE_EXCLUSIVE_LOCK,
+                    0,
+                    !0,
+                    !0,
+                    &mut overlapped,
+                );
+            }
+        }
+
+        Ok(Self { lock_file, lock_path })
+    }
+
+    /// Try to acquire lock without blocking
+    pub fn try_acquire(ms_root: &Path) -> io::Result<Option<Self>> {
+        let lock_path = ms_root.join(Self::LOCK_FILENAME);
+        std::fs::create_dir_all(lock_path.parent().unwrap())?;
+
+        let lock_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&lock_path)?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = lock_file.as_raw_fd();
+            // LOCK_NB = non-blocking
+            let result = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+            if result != 0 {
+                return Ok(None); // Lock held by another process
+            }
+        }
+
+        Ok(Some(Self { lock_file, lock_path }))
+    }
+
+    /// Acquire with timeout (polling fallback for portability)
+    pub fn acquire_timeout(ms_root: &Path, timeout: Duration) -> io::Result<Option<Self>> {
+        let start = std::time::Instant::now();
+        let poll_interval = Duration::from_millis(50);
+
+        while start.elapsed() < timeout {
+            if let Some(lock) = Self::try_acquire(ms_root)? {
+                return Ok(Some(lock));
+            }
+            std::thread::sleep(poll_interval);
+        }
+
+        Ok(None)
+    }
+}
+
+impl Drop for GlobalLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = self.lock_file.as_raw_fd();
+            unsafe { libc::flock(fd, libc::LOCK_UN) };
+        }
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            use winapi::um::fileapi::UnlockFileEx;
+            let handle = self.lock_file.as_raw_handle();
+            unsafe {
+                let mut overlapped = std::mem::zeroed();
+                UnlockFileEx(handle as *mut _, 0, !0, !0, &mut overlapped);
+            }
+        }
+    }
+}
+```
+
+**Locked TxManager:**
+
+```rust
+impl TxManager {
+    /// Write skill with global lock coordination
+    pub fn write_skill_locked(&self, skill: &SkillSpec) -> Result<()> {
+        let _lock = GlobalLock::acquire_timeout(&self.ms_root, Duration::from_secs(30))
+            .map_err(|e| anyhow!("Failed to acquire lock: {}", e))?
+            .ok_or_else(|| anyhow!("Timeout waiting for global lock"))?;
+
+        self.write_skill(skill)
+        // Lock released on drop
+    }
+
+    /// Batch write with single lock acquisition
+    pub fn write_skills_batch(&self, skills: &[SkillSpec]) -> Result<()> {
+        let _lock = GlobalLock::acquire(&self.ms_root)?;
+
+        for skill in skills {
+            self.write_skill(skill)?;
+        }
+
+        Ok(())
+    }
+}
+```
+
+**Lock behavior by command:**
+
+| Command | Lock Type | Rationale |
+|---------|-----------|-----------|
+| `ms index` | Exclusive | Bulk writes to both stores |
+| `ms load` | None (read-only) | SQLite WAL handles read concurrency |
+| `ms search` | None (read-only) | FTS queries are read-only |
+| `ms suggest` | None (read-only) | Query-only operation |
+| `ms edit` | Exclusive | Modifies SKILL.md and SQLite |
+| `ms mine` | Exclusive | Writes new skills |
+| `ms calibrate` | Exclusive | Updates rule strengths |
+| `ms doctor --fix` | Exclusive | May modify both stores |
+
+**Diagnostics:**
+
+```bash
+# Check lock status
+ms doctor --check-lock
+
+# Force break stale lock (with pid check)
+ms doctor --break-lock
+
+# Show lock holder
+ms lock status
+```
+
+The lock file includes a JSON payload with holder PID and timestamp, enabling
+stale lock detection (process no longer running) and diagnostics.
 
 ---
 
@@ -1794,12 +2247,20 @@ ms suggest --query "how to handle async errors"
 ms suggest --pack 800  # Suggest packed slices within token budget
 ms suggest --explain   # Include signal breakdown
 ms suggest --pack 800 --mode pitfall_safe --max-per-group 2
+ms suggest --include-deprecated
+ms suggest --for-ntm myproject --agents 6 --budget 800 --objective coverage_first
 
 # Show skill details
 ms show ntm
 ms show ntm --usage  # Include usage stats
 ms show ntm --deps   # Show dependency graph
 ms show ntm --layer user  # show a specific layer
+
+# Round-trip editing (Spec ↔ Markdown)
+ms edit ntm
+ms edit ntm --allow-lossy  # Allow lossy edits if parse fails
+ms fmt ntm                 # Re-render deterministically
+ms diff ntm --semantic      # Spec-level diff, not raw markdown
 
 # Manage aliases and deprecations
 ms alias list ntm
@@ -1820,6 +2281,7 @@ ms deps ntm --graph --format json
 ms resolve ntm
 ms resolve ntm --strategy interactive
 ms resolve ntm --diff  # show section-level diffs
+ms resolve ntm --merge-strategy prefer_sections
 
 # Inspect rule-level evidence and provenance
 ms evidence ntm
@@ -1845,6 +2307,8 @@ ms build --from-cass "auth mistakes" --no-antipatterns  # skip counter-examples
 ms build --from-cass "error handling" --output-spec skill.spec.json
 ms build --from-cass "error handling" --min-session-quality 0.6
 ms build --from-cass "auth issues" --no-injection-filter  # only if you explicitly accept risk
+ms build --from-cass "error handling" --generalize heuristic
+ms build --from-cass "error handling" --generalize llm --llm-critique
 
 # Resume existing build session
 ms build --resume session-abc123
@@ -1915,6 +2379,15 @@ ms doctor --check=transactions
 ms doctor --check=security
 ms doctor --check=requirements
 
+# Prune tombstoned data (requires approval)
+ms prune --scope archive
+
+# Skill pruning/evolution proposals (non-destructive by default)
+ms prune --scope skills --dry-run
+ms prune --scope skills --min-uses 5 --window 30d
+ms prune --scope skills --similarity 0.8 --emit-beads
+ms prune --scope skills --apply --require-confirmation
+
 # Configuration
 ms config show
 ms config set search.default_limit 20
@@ -1935,6 +2408,11 @@ ms stale --min-severity medium
 ms test ntm
 ms test ntm --report junit
 ms test --all
+
+# Skill simulation sandbox
+ms simulate ntm
+ms simulate ntm --project /data/projects/my-rust-project
+ms simulate ntm --report json
 ```
 
 ### 4.5 Robot Mode (Comprehensive Specification)
@@ -2043,6 +2521,7 @@ pub struct RegistryStatus {
 pub struct SuggestResponse {
     pub context: SuggestionContext,
     pub suggestions: Vec<SuggestionItem>,
+    pub swarm_plan: Option<SwarmPlan>,
     pub explain: Option<SuggestionExplain>,
 }
 
@@ -2291,6 +2770,7 @@ pub enum HealthStatus {
 │  ☐ Prompt-injection filter enabled                                         │
 │  ☐ Quarantine directory writable                                           │
 │  ☐ No high-severity injection findings in last N builds                    │
+│  ☐ Destructive ops policy enforced (approval required)                     │
 │                                                                             │
 │ SECURITY                                                                    │
 │  ☐ Bundle signature verification enabled                                   │
@@ -2431,6 +2911,10 @@ _ms() {
         'show:Show skill details'
         'alias:Manage skill aliases'
         'requirements:Check environment requirements'
+        'edit:Edit skill with round-trip spec'
+        'fmt:Format skill deterministically'
+        'diff:Diff skill semantics'
+        'prune:Prune tombstoned data'
         'load:Load skill content'
         'suggest:Get contextual suggestions'
         'build:Build new skill'
@@ -2479,11 +2963,46 @@ _ms() {
                         '--project[Project path for environment check]:path:_files' \
                         '*:skill:_ms_skills'
                     ;;
+                suggest)
+                    _arguments \
+                        '--cwd[Working directory]:path:_files' \
+                        '--file[Current file]:file:_files' \
+                        '--query[Explicit query]:query' \
+                        '--pack[Token budget]:tokens' \
+                        '--mode[Pack mode]:mode:(balanced coverage_first pitfall_safe)' \
+                        '--max-per-group[Max slices per group]:number' \
+                        '--explain[Include signal breakdown]' \
+                        '--include-deprecated[Include deprecated skills]' \
+                        '--for-ntm[Swarm-aware suggestions for NTM]:project' \
+                        '--agents[Agent count]:number' \
+                        '--budget[Token budget per agent]:tokens' \
+                        '--objective[Swarm objective]:objective:(coverage_first redundancy_min safety_first)'
+                    ;;
                 load)
                     _arguments \
                         '--level[Disclosure level]:level:(minimal overview standard full complete)' \
                         '--format[Output format]:format:(markdown json yaml)' \
                         '*:skill:_ms_skills'
+                    ;;
+                edit)
+                    _arguments \
+                        '--allow-lossy[Allow lossy edits if parse fails]' \
+                        '*:skill:_ms_skills'
+                    ;;
+                fmt)
+                    _arguments \
+                        '--check[Check formatting without changes]' \
+                        '*:skill:_ms_skills'
+                    ;;
+                diff)
+                    _arguments \
+                        '--semantic[Spec-level diff]' \
+                        '*:skill:_ms_skills'
+                    ;;
+                prune)
+                    _arguments \
+                        '--scope[Prune scope]:scope:(archive bundles cache)' \
+                        '--approve[Verbatim approval string]:cmd'
                     ;;
                 build)
                     _arguments \
@@ -2505,6 +3024,147 @@ _ms_skills() {
 }
 
 compdef _ms ms
+```
+
+### 4.8 MCP Server Mode
+
+Beyond CLI, ms provides a **Model Context Protocol (MCP) server** for native agent
+tool-use integration. This eliminates subprocess overhead, PATH issues, JSON parsing
+brittleness, and platform differences.
+
+**Why MCP matters:** CLI + JSON parsing works but is brittle. MCP is the native
+interface for agent tool calling. Every modern agent (Claude Code, Codex CLI, Cursor)
+can consume ms via MCP with dramatically less friction.
+
+**Server Commands:**
+
+```bash
+# Start MCP server (stdio mode for Claude Code integration)
+ms mcp serve
+
+# Start with TCP for multi-agent access
+ms mcp serve --tcp 127.0.0.1:9847
+
+# Health check
+ms mcp health
+```
+
+**MCP Tool Definitions:**
+
+```rust
+pub mod mcp_tools {
+    use crate::prelude::*;
+
+    /// Search skills by query with optional filters
+    #[derive(Serialize, Deserialize, JsonSchema)]
+    pub struct MsSearch {
+        pub query: String,
+        #[serde(default)]
+        pub filters: SearchFilters,
+        #[serde(default = "default_limit")]
+        pub limit: usize,
+    }
+
+    /// Get context-aware skill suggestions
+    #[derive(Serialize, Deserialize, JsonSchema)]
+    pub struct MsSuggest {
+        pub context: SuggestContext,
+        #[serde(default)]
+        pub budget_tokens: Option<usize>,
+    }
+
+    /// Load skill content with optional packing
+    #[derive(Serialize, Deserialize, JsonSchema)]
+    pub struct MsLoad {
+        pub skill_id: String,
+        #[serde(default)]
+        pub pack_budget: Option<usize>,
+        #[serde(default)]
+        pub level: Option<DisclosureLevel>,
+    }
+
+    /// Get evidence for a specific rule
+    #[derive(Serialize, Deserialize, JsonSchema)]
+    pub struct MsEvidence {
+        pub skill_id: String,
+        pub rule_id: String,
+        #[serde(default)]
+        pub expand_context: usize,
+    }
+
+    /// Check build status for a skill
+    #[derive(Serialize, Deserialize, JsonSchema)]
+    pub struct MsBuildStatus {
+        pub skill_id: String,
+    }
+
+    /// Pack slices optimally for token budget
+    #[derive(Serialize, Deserialize, JsonSchema)]
+    pub struct MsPack {
+        pub skill_ids: Vec<String>,
+        pub budget_tokens: usize,
+        #[serde(default)]
+        pub mode: PackMode,
+    }
+}
+```
+
+**Server Architecture:**
+
+```rust
+pub struct McpServer {
+    /// Shared registry handle (hot indices)
+    registry: Arc<SkillRegistry>,
+
+    /// LRU cache for frequent queries
+    cache: Arc<RwLock<LruCache<String, CachedResult>>>,
+
+    /// Protocol handler
+    protocol: McpProtocol,
+}
+
+impl McpServer {
+    pub async fn serve_stdio(&self) -> Result<()> {
+        let stdin = tokio::io::stdin();
+        let stdout = tokio::io::stdout();
+        self.protocol.run(stdin, stdout, self).await
+    }
+
+    pub async fn serve_tcp(&self, addr: SocketAddr) -> Result<()> {
+        let listener = TcpListener::bind(addr).await?;
+        loop {
+            let (stream, _) = listener.accept().await?;
+            let server = self.clone();
+            tokio::spawn(async move {
+                let (read, write) = stream.into_split();
+                server.protocol.run(read, write, &server).await
+            });
+        }
+    }
+}
+```
+
+**Benefits over CLI:**
+
+| Aspect | CLI Mode | MCP Mode |
+|--------|----------|----------|
+| Latency | ~50-100ms subprocess | ~1-5ms in-process |
+| Caching | Per-invocation | Shared across requests |
+| Streaming | Not supported | Partial results supported |
+| Error handling | Exit codes + stderr | Structured error responses |
+| Type safety | JSON schema drift risk | Schema-validated tools |
+
+**Claude Code Integration:**
+
+```json
+// ~/.claude/mcp_servers.json
+{
+  "ms": {
+    "command": "ms",
+    "args": ["mcp", "serve"],
+    "env": {}
+  }
+}
 ```
 
 ---
@@ -3036,6 +3696,12 @@ The same pipeline is applied to counter-examples to produce "Avoid / When NOT to
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
+**Optional LLM-Assisted Refinement (Pluggable):**
+- If configured, a local model critiques the candidate generalization for overreach,
+  ambiguous scope, or missing counter-examples.
+- Critique summaries are stored with the uncertainty item so humans can adjudicate.
+- If no model is available, the pipeline remains heuristic-only.
+
 **The Algorithm:**
 
 ```rust
@@ -3044,8 +3710,18 @@ pub struct SpecificToGeneralTransformer {
     cass: CassClient,
     embedder: HashEmbedder,
     uncertainty_queue: UncertaintyQueue,
+    refiner: Option<Box<dyn GeneralizationRefiner>>,
     min_instances: usize,       // Minimum instances to generalize (default: 3)
     confidence_threshold: f32,  // Minimum generalization confidence (default: 0.7)
+}
+
+pub trait GeneralizationRefiner {
+    fn critique(&self, common: &CommonElements, cluster: &InstanceCluster) -> Result<RefinementCritique>;
+}
+
+pub struct RefinementCritique {
+    pub summary: String,
+    pub flags_overgeneralization: bool,
 }
 
 impl SpecificToGeneralTransformer {
@@ -3073,11 +3749,20 @@ impl SpecificToGeneralTransformer {
         let validation = self.validate_generalization(&common, &primary_cluster)?;
 
         if validation.confidence < self.confidence_threshold {
-            self.queue_uncertainty(instance, &validation, &primary_cluster).ok();
+            self.queue_uncertainty(instance, &validation, &primary_cluster, None).ok();
             return Err(anyhow!("Generalization confidence too low: {}", validation.confidence));
         }
 
-        // Step 6: Generate general pattern
+        // Step 6: Optional refinement/critique (LLM-assisted if configured)
+        if let Some(refiner) = &self.refiner {
+            let critique = refiner.critique(&common, &primary_cluster)?;
+            if critique.flags_overgeneralization {
+                self.queue_uncertainty(instance, &validation, &primary_cluster, Some(&critique)).ok();
+                return Err(anyhow!("Generalization critique failed: {}", critique.summary));
+            }
+        }
+
+        // Step 7: Generate general pattern
         Ok(GeneralPattern {
             principle: common.abstracted_description,
             examples: primary_cluster.instances.iter()
@@ -3157,12 +3842,17 @@ impl SpecificToGeneralTransformer {
         instance: &SpecificInstance,
         validation: &GeneralizationValidation,
         cluster: &InstanceCluster,
+        critique: Option<&RefinementCritique>,
     ) -> Result<()> {
         let suggested_queries = self.suggest_queries(instance, cluster)?;
+        let mut reason = format!("Low confidence: {:.2}", validation.confidence);
+        if let Some(c) = critique {
+            reason = format!("{reason} | critique: {}", c.summary);
+        }
         let item = UncertaintyItem {
             id: uuid::Uuid::new_v4().to_string(),
             pattern_candidate: instance.to_pattern_candidate(),
-            reason: format!("Low confidence: {:.2}", validation.confidence),
+            reason,
             confidence: validation.confidence,
             suggested_queries,
             status: UncertaintyStatus::Pending,
@@ -4624,6 +5314,107 @@ ms evidence nextjs-accessibility --timeline
 ms evidence nextjs-accessibility --open
 ```
 
+**Actionable Evidence Navigation:**
+
+Provenance is only valuable if humans can quickly validate and refine rules.
+ms provides direct jump-to-source workflows that call CASS to expand context.
+
+```rust
+pub struct EvidenceNavigator {
+    cass_client: CassClient,
+    evidence_cache: PathBuf,  // Git archive cache for redacted excerpts
+}
+
+impl EvidenceNavigator {
+    /// Jump to source session and expand context around evidence
+    pub async fn expand_evidence(
+        &self,
+        skill_id: &str,
+        rule_id: &str,
+        context_lines: usize,
+    ) -> Result<ExpandedEvidence> {
+        let skill = self.registry.get(skill_id)?;
+        let evidence = skill.evidence.get(rule_id)
+            .ok_or_else(|| anyhow!("No evidence for rule: {}", rule_id))?;
+
+        let mut expanded = Vec::new();
+        for ref_item in &evidence.refs {
+            // Call CASS to expand context
+            let cass_result = self.cass_client
+                .expand(&ref_item.session_id, ref_item.message_range.0, context_lines)
+                .await?;
+
+            expanded.push(ExpandedEvidenceItem {
+                session_id: ref_item.session_id.clone(),
+                message_range: ref_item.message_range,
+                context_before: cass_result.before,
+                matched_content: cass_result.matched,
+                context_after: cass_result.after,
+                session_metadata: cass_result.metadata,
+            });
+        }
+
+        Ok(ExpandedEvidence {
+            skill_id: skill_id.to_string(),
+            rule_id: rule_id.to_string(),
+            items: expanded,
+        })
+    }
+
+    /// Cache redacted excerpts in Git archive for offline access
+    pub fn cache_evidence(&self, skill_id: &str, rule_id: &str) -> Result<PathBuf> {
+        let expanded = self.expand_evidence(skill_id, rule_id, 5).await?;
+        let cache_path = self.evidence_cache
+            .join("excerpts")
+            .join(skill_id)
+            .join(format!("{}.md", rule_id));
+
+        std::fs::create_dir_all(cache_path.parent().unwrap())?;
+
+        let content = render_evidence_excerpt(&expanded);
+        std::fs::write(&cache_path, content)?;
+
+        Ok(cache_path)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExpandedEvidence {
+    pub skill_id: String,
+    pub rule_id: String,
+    pub items: Vec<ExpandedEvidenceItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExpandedEvidenceItem {
+    pub session_id: String,
+    pub message_range: (u32, u32),
+    pub context_before: Vec<String>,
+    pub matched_content: String,
+    pub context_after: Vec<String>,
+    pub session_metadata: SessionMetadata,
+}
+```
+
+**Jump-to-Source CLI:**
+
+```bash
+# Expand evidence with CASS context (5 lines before/after)
+ms evidence nextjs-accessibility --rule rule-7 --expand -C 5
+
+# Open evidence in editor (caches redacted excerpt first)
+ms evidence nextjs-accessibility --rule rule-7 --open-editor
+
+# Show CASS session info for evidence
+ms evidence nextjs-accessibility --rule rule-7 --cass-info
+
+# Validate evidence still exists in CASS (detect stale refs)
+ms evidence nextjs-accessibility --validate
+
+# Refresh evidence cache from CASS
+ms evidence nextjs-accessibility --refresh-cache
+```
+
 ### 5.13 Redaction and Privacy Guard
 
 All CASS transcripts pass through a redaction pipeline before pattern extraction.
@@ -4706,6 +5497,140 @@ ms doctor --check=redaction
 
 # Emit redaction report for a build
 ms build --from-cass "auth tokens" --redaction-report
+```
+
+**Taint Tracking Through Mining Pipeline:**
+
+Beyond binary redaction, ms tracks **taint labels** through the entire extraction →
+clustering → synthesis pipeline. This ensures unsafe provenance never leaks into
+high-leverage artifacts (prompts, rules, scripts).
+
+```rust
+/// Taint sources for session content
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum TaintSource {
+    /// Tool output (file reads, command results) - untrusted external data
+    ToolOutput,
+    /// User-provided text - may contain typos, bad advice, or injection
+    UserText,
+    /// Contains detected secrets (post-redaction risk)
+    ContainsSecret,
+    /// Contains potential prompt injection patterns
+    ContainsInjection,
+    /// Contains PII (even if redacted, provenance is tainted)
+    ContainsPii,
+    /// Assistant-generated content (relatively safer, still needs verification)
+    AssistantGenerated,
+}
+
+/// Taint set attached to each extracted snippet
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TaintSet {
+    pub sources: HashSet<TaintSource>,
+    pub propagated_from: Vec<String>,  // IDs of parent snippets
+}
+
+impl TaintSet {
+    pub fn is_safe_for_prompt(&self) -> bool {
+        !self.sources.contains(&TaintSource::ToolOutput)
+            && !self.sources.contains(&TaintSource::ContainsInjection)
+            && !self.sources.contains(&TaintSource::ContainsSecret)
+    }
+
+    pub fn is_safe_for_evidence(&self) -> bool {
+        !self.sources.contains(&TaintSource::ContainsSecret)
+            && !self.sources.contains(&TaintSource::ContainsPii)
+    }
+}
+
+/// Taint-aware snippet extraction
+pub struct TaintedSnippet {
+    pub content: String,
+    pub taint: TaintSet,
+    pub source_location: SourceLocation,
+}
+
+pub struct TaintTracker;
+
+impl TaintTracker {
+    /// Classify message role and content to assign initial taint
+    pub fn classify_message(&self, msg: &Message) -> TaintSet {
+        let mut taint = TaintSet::default();
+
+        match msg.role.as_str() {
+            "tool" => { taint.sources.insert(TaintSource::ToolOutput); }
+            "user" => { taint.sources.insert(TaintSource::UserText); }
+            "assistant" => { taint.sources.insert(TaintSource::AssistantGenerated); }
+            _ => {}
+        }
+
+        // Check for injection patterns
+        if self.detect_injection_patterns(&msg.content) {
+            taint.sources.insert(TaintSource::ContainsInjection);
+        }
+
+        // Check for residual secrets (post-redaction audit)
+        if self.detect_secret_patterns(&msg.content) {
+            taint.sources.insert(TaintSource::ContainsSecret);
+        }
+
+        taint
+    }
+
+    /// Propagate taint through synthesis (union of input taints)
+    pub fn propagate(&self, inputs: &[&TaintSet]) -> TaintSet {
+        let mut result = TaintSet::default();
+        for input in inputs {
+            result.sources.extend(&input.sources);
+        }
+        result
+    }
+}
+```
+
+**Taint Policy Enforcement:**
+
+```rust
+pub struct TaintPolicy;
+
+impl TaintPolicy {
+    /// Validate that a skill block meets taint requirements
+    pub fn validate_block(&self, block: &SkillBlock, taint: &TaintSet) -> Result<()> {
+        match block.block_type {
+            BlockType::Rule | BlockType::Prompt => {
+                if !taint.is_safe_for_prompt() {
+                    return Err(anyhow!(
+                        "Block '{}' has unsafe taint for prompt: {:?}",
+                        block.id, taint.sources
+                    ));
+                }
+            }
+            BlockType::Evidence => {
+                if !taint.is_safe_for_evidence() {
+                    return Err(anyhow!(
+                        "Block '{}' has unsafe taint for evidence: {:?}",
+                        block.id, taint.sources
+                    ));
+                }
+            }
+            _ => {} // Examples, references have looser requirements
+        }
+        Ok(())
+    }
+}
+```
+
+**CLI Integration:**
+
+```bash
+# Check for taint policy violations
+ms doctor --check=security
+
+# Show taint provenance for a skill
+ms evidence rust-patterns --show-taint
+
+# Build with strict taint enforcement
+ms build --from-cass "auth" --strict-taint
 ```
 
 ### 5.14 Anti-Pattern Mining and Counter-Examples
@@ -4887,6 +5812,72 @@ pub enum InjectionSeverity {
 ```bash
 ms doctor --check=safety
 ms build --from-cass "auth issues" --no-injection-filter
+```
+
+---
+
+### 5.18 Safety Invariant Layer (No Destructive Ops)
+
+ms enforces a hard invariant: destructive filesystem or git operations are never
+executed without explicit, verbatim approval. This mirrors the global agent
+rules and prevents ms from becoming a footgun.
+
+**Safety Policy Model:**
+
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum SafetyTier {
+    Safe,
+    Caution,
+    Dangerous,
+    Critical,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SafetyPolicy {
+    pub destructive_ops: DestructiveOpsPolicy, // deny | confirm | allow
+    pub require_verbatim_approval: bool,
+    pub tombstone_deletes: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum DestructiveOpsPolicy {
+    Deny,
+    Confirm,
+    Allow,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApprovalRequest {
+    pub command: String,
+    pub tier: SafetyTier,
+    pub reason: String,
+    pub approve_hint: String,
+}
+```
+
+**Behavior:**
+- Destructive commands (delete/overwrite/reset) are blocked by default.
+- In robot mode, ms returns `approval_required` with the exact approve hint.
+- In human mode, ms prompts for the exact verbatim command string.
+- In ms-managed directories, deletions become **tombstones** (content-addressed
+  markers); actual pruning is only performed when explicitly invoked.
+
+**Robot Approval Example:**
+
+```json
+{
+  "status": {
+    "approval_required": true,
+    "approve_command": "ms prune --approve \"ms prune --scope archive\"",
+    "tier": "critical",
+    "reason": "destructive operation"
+  },
+  "timestamp": "2026-01-13T16:00:00Z",
+  "version": "0.1.0",
+  "data": null,
+  "warnings": []
+}
 ```
 
 ---
@@ -5089,63 +6080,171 @@ that fit within a token budget.
 - Estimate tokens per slice using a fast tokenizer heuristic
 - Assign utility score from quality signals + usage frequency + evidence coverage
 
-**Token Packer (Greedy + Coverage):**
+**Token Packer (Constrained Optimization):**
+
+The packer treats slice selection as a constrained optimization problem, not just
+greedy selection. This ensures predictable coverage, safer packs, and stable behavior.
+
+**Constraints:**
+- Total tokens ≤ budget
+- Dependencies satisfied before dependents
+- Coverage quotas (e.g., at least 1 from "critical-rules" group)
+- Max per group (avoid over-representing one category)
+- Risk tier constraints (always include safety warnings)
+
+**Objective:** Maximize total utility with diminishing returns per group.
 
 ```rust
-pub fn pack_slices(index: &SkillSliceIndex, budget: TokenBudget) -> Vec<String> {
-    let mut remaining = budget.tokens;
-    let mut selected: Vec<&SkillSlice> = Vec::new();
-    let mut group_counts: HashMap<String, usize> = HashMap::new();
+#[derive(Debug, Clone)]
+pub struct PackConstraints {
+    pub budget: usize,
+    pub max_per_group: usize,
+    /// Required groups that MUST have at least min_count slices
+    pub required_coverage: Vec<CoverageQuota>,
+    /// Groups that should never be included
+    pub excluded_groups: Vec<String>,
+    /// Maximum improvement iterations
+    pub max_improvement_passes: usize,
+}
 
-    // Always include Overview slice if it fits
-    if let Some(overview) = index.slices.iter()
-        .find(|s| matches!(s.slice_type, SliceType::Overview)) {
-        if overview.token_estimate <= remaining {
-            selected.push(overview);
-            remaining -= overview.token_estimate;
-        }
-    }
+#[derive(Debug, Clone)]
+pub struct CoverageQuota {
+    pub group: String,
+    pub min_count: usize,
+}
 
-    // Score slices for the selected mode
-    let mut scored: Vec<(&SkillSlice, f32)> = index.slices.iter()
-        .filter(|s| !selected.iter().any(|x| x.id == s.id))
-        .map(|s| (s, score_slice(s, budget.mode)))
-        .collect();
+pub struct ConstrainedPacker;
 
-    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+impl ConstrainedPacker {
+    pub fn pack(&self, slices: &[SkillSlice], constraints: &PackConstraints) -> PackResult {
+        // Phase 1: Coverage seeding - satisfy required groups first
+        let mut selected = self.seed_required_coverage(slices, constraints);
+        let mut remaining = constraints.budget - selected.iter().map(|s| s.token_estimate).sum::<usize>();
 
-    for (slice, _score) in scored {
-        if slice.token_estimate > remaining {
-            continue;
-        }
+        // Phase 2: Greedy fill with utility density + diminishing returns
+        let mut group_counts = self.count_groups(&selected);
+        let candidates: Vec<_> = slices.iter()
+            .filter(|s| !selected.iter().any(|x| x.id == s.id))
+            .filter(|s| self.satisfies_constraints(s, &selected, constraints))
+            .collect();
 
-        if let Some(group) = &slice.coverage_group {
-            let count = *group_counts.get(group).unwrap_or(&0);
-            if count >= budget.max_per_group {
+        for slice in self.rank_by_density(&candidates, &group_counts) {
+            if slice.token_estimate > remaining {
                 continue;
+            }
+            if !self.deps_satisfied(slice, &selected) {
+                continue;
+            }
+
+            selected.push(slice.clone());
+            remaining -= slice.token_estimate;
+            if let Some(g) = &slice.coverage_group {
+                *group_counts.entry(g.clone()).or_insert(0) += 1;
             }
         }
 
-        // Ensure dependencies are included first
-        if !slice.requires.is_empty() {
-            let deps_ok = slice.requires.iter()
-                .all(|id| selected.iter().any(|s| &s.id == id));
-            if !deps_ok {
-                continue;
+        // Phase 3: Local improvement - swap low-utility for high-utility
+        for _ in 0..constraints.max_improvement_passes {
+            if !self.try_improve(&mut selected, slices, constraints) {
+                break;
             }
         }
 
-        selected.push(slice);
-        remaining -= slice.token_estimate;
-        if let Some(group) = &slice.coverage_group {
-            *group_counts.entry(group.clone()).or_insert(0) += 1;
-        }
-        if remaining == 0 {
-            break;
+        PackResult {
+            slices: selected,
+            total_tokens: constraints.budget - remaining,
+            coverage_satisfied: self.check_coverage(&selected, constraints),
         }
     }
 
-    selected.into_iter().map(|s| s.content.clone()).collect()
+    /// Seed required coverage groups with highest utility slices
+    fn seed_required_coverage(&self, slices: &[SkillSlice], constraints: &PackConstraints) -> Vec<SkillSlice> {
+        let mut selected = Vec::new();
+        let mut remaining = constraints.budget;
+
+        // Always include Overview first
+        if let Some(overview) = slices.iter().find(|s| matches!(s.slice_type, SliceType::Overview)) {
+            if overview.token_estimate <= remaining {
+                selected.push(overview.clone());
+                remaining -= overview.token_estimate;
+            }
+        }
+
+        // Satisfy required coverage quotas
+        for quota in &constraints.required_coverage {
+            let group_slices: Vec<_> = slices.iter()
+                .filter(|s| s.coverage_group.as_ref() == Some(&quota.group))
+                .filter(|s| !selected.iter().any(|x| x.id == s.id))
+                .collect();
+
+            // Sort by utility/token ratio (density)
+            let mut ranked: Vec<_> = group_slices.iter()
+                .map(|s| (*s, s.utility_score / s.token_estimate as f32))
+                .collect();
+            ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+            let mut count = 0;
+            for (slice, _) in ranked {
+                if count >= quota.min_count || slice.token_estimate > remaining {
+                    break;
+                }
+                selected.push((*slice).clone());
+                remaining -= slice.token_estimate;
+                count += 1;
+            }
+        }
+
+        selected
+    }
+
+    /// Rank candidates by utility density with diminishing returns per group
+    fn rank_by_density<'a>(&self, candidates: &[&'a SkillSlice], group_counts: &HashMap<String, usize>) -> Vec<&'a SkillSlice> {
+        let mut scored: Vec<_> = candidates.iter()
+            .map(|s| {
+                let base_density = s.utility_score / s.token_estimate as f32;
+                // Apply diminishing returns: each additional slice in group worth less
+                let group_penalty = s.coverage_group.as_ref()
+                    .map(|g| group_counts.get(g).unwrap_or(&0))
+                    .map(|c| 0.8_f32.powi(*c as i32))
+                    .unwrap_or(1.0);
+                (*s, base_density * group_penalty)
+            })
+            .collect();
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        scored.into_iter().map(|(s, _)| s).collect()
+    }
+
+    /// Local improvement: try swapping low-utility slice for higher-utility one
+    fn try_improve(&self, selected: &mut Vec<SkillSlice>, all: &[SkillSlice], constraints: &PackConstraints) -> bool {
+        let current_tokens: usize = selected.iter().map(|s| s.token_estimate).sum();
+        let slack = constraints.budget - current_tokens;
+
+        // Find lowest-utility non-required slice
+        let (worst_idx, worst) = selected.iter().enumerate()
+            .filter(|(_, s)| !self.is_required_for_coverage(s, selected, constraints))
+            .min_by(|a, b| a.1.utility_score.partial_cmp(&b.1.utility_score).unwrap())?;
+
+        // Find better replacement that fits
+        let replacement = all.iter()
+            .filter(|s| !selected.iter().any(|x| x.id == s.id))
+            .filter(|s| s.token_estimate <= worst.token_estimate + slack)
+            .filter(|s| s.utility_score > worst.utility_score)
+            .max_by(|a, b| a.utility_score.partial_cmp(&b.utility_score).unwrap());
+
+        if let Some(better) = replacement {
+            selected.remove(worst_idx);
+            selected.push(better.clone());
+            return true;
+        }
+        false
+    }
+}
+
+#[derive(Debug)]
+pub struct PackResult {
+    pub slices: Vec<SkillSlice>,
+    pub total_tokens: usize,
+    pub coverage_satisfied: bool,
 }
 
 fn estimate_packed_tokens_with_constraints(
@@ -5186,6 +6285,229 @@ fn score_slice(slice: &SkillSlice, mode: PackMode) -> f32 {
 ```bash
 ms load ntm --pack 800
 ```
+
+### 6.5 Conditional Block Predicates
+
+Skills often contain version-specific or environment-specific content. Rather than
+maintaining separate skills or relying on the agent to reason about versions,
+ms supports **block-level predicates** that strip irrelevant content at load time.
+
+**Markdown Syntax:**
+
+```markdown
+::: block id="unique-id" condition="<predicate>"
+Content only included when predicate evaluates true...
+:::
+```
+
+**Predicate Types:**
+
+| Predicate | Example | Evaluates |
+|-----------|---------|-----------|
+| `package:<name> <op> <version>` | `package:next >= 16.0.0` | package.json / Cargo.toml version |
+| `tool:<name> <op> <version>` | `tool:node >= 18.0.0` | Installed tool version |
+| `rust:edition <op> <year>` | `rust:edition == 2021` | Cargo.toml rust edition |
+| `env:<var>` | `env:CI` | Environment variable presence |
+| `file:<pattern>` | `file:src/middleware.ts` | File/glob existence |
+
+**Operators:** `==`, `!=`, `<`, `<=`, `>`, `>=` (semver-aware for versions)
+
+**Evaluation Flow:**
+
+```rust
+pub fn evaluate_predicate(pred: &SlicePredicate, ctx: &ProjectContext) -> bool {
+    match &pred.predicate_type {
+        PredicateType::PackageVersion { package, op, version } => {
+            ctx.package_versions
+                .get(package)
+                .map(|v| compare_versions(v, op, version))
+                .unwrap_or(false)  // Missing package = false
+        }
+        PredicateType::EnvVar { var } => std::env::var(var).is_ok(),
+        PredicateType::FileExists { pattern } => {
+            glob::glob(&ctx.root.join(pattern).to_string_lossy())
+                .map(|mut g| g.next().is_some())
+                .unwrap_or(false)
+        }
+        PredicateType::RustEdition { op, edition } => {
+            ctx.rust_edition
+                .as_ref()
+                .map(|e| compare_editions(e, op, edition))
+                .unwrap_or(false)
+        }
+        PredicateType::ToolVersion { tool, op, version } => {
+            detect_tool_version(tool)
+                .map(|v| compare_versions(&v, op, version))
+                .unwrap_or(false)
+        }
+    }
+}
+
+pub fn filter_slices_by_predicates(
+    slices: &[SkillSlice],
+    ctx: &ProjectContext,
+) -> Vec<SkillSlice> {
+    slices
+        .iter()
+        .filter(|s| {
+            s.condition
+                .as_ref()
+                .map(|p| evaluate_predicate(p, ctx))
+                .unwrap_or(true)  // No condition = always include
+        })
+        .cloned()
+        .collect()
+}
+```
+
+**Why This Matters:**
+
+The agent *cannot* hallucinate using deprecated patterns because those patterns
+are physically absent from its context window. This directly addresses the
+version drift problem (e.g., Next.js middleware.ts vs proxy.ts) mentioned in
+AGENTS.md without requiring separate skills or complex agent reasoning.
+
+**CLI Example:**
+
+```bash
+# Force predicate evaluation with explicit context
+ms load nextjs-routing --eval-predicates --package-version next=16.1.0
+
+# Show which blocks would be filtered
+ms load nextjs-routing --dry-run --show-filtered
+```
+
+### 6.6 Meta-Skills: Composed Slice Bundles
+
+Agents rarely need a single skill—they need **task kits** combining slices from
+multiple related skills. Meta-skills are first-class compositions that persist
+and evolve.
+
+**Why Meta-Skills:**
+
+| Without Meta-Skills | With Meta-Skills |
+|---------------------|------------------|
+| `ms load nextjs-ui && ms load a11y && ms load react-patterns` | `ms load frontend-polish` |
+| Manual coordination of 4+ skills | Single load, optimal packing |
+| Repeated setup per session | Battle-tested bundle |
+
+**Data Model:**
+
+```rust
+/// A curated composition of slices from multiple skills
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetaSkill {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+
+    /// Ordered slice references from source skills
+    pub slices: Vec<MetaSkillSliceRef>,
+
+    /// Version pinning strategy
+    pub pin_strategy: PinStrategy,
+
+    /// When this meta-skill was last validated
+    pub validated_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetaSkillSliceRef {
+    /// Source skill id
+    pub skill_id: String,
+
+    /// Slice id within the skill
+    pub slice_id: String,
+
+    /// Optional content hash for reproducibility (when pinned)
+    pub content_hash: Option<String>,
+
+    /// Override utility score for packing priority
+    pub priority_override: Option<f32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PinStrategy {
+    /// Always use latest slice content
+    Float,
+    /// Pin to specific content hashes
+    Pinned,
+    /// Pin major version, float patches
+    SemverFloat { major: u32 },
+}
+```
+
+**CLI Commands:**
+
+```bash
+# Create a meta-skill from multiple sources
+ms meta create frontend-polish \
+  --from nextjs-ui-polish:rule-*,checklist-* \
+  --from a11y-css:rule-1,rule-2,example-1 \
+  --from react-patterns:hooks-rules
+
+# Load meta-skill with unified packing
+ms load frontend-polish --pack 1200
+
+# Edit slice composition
+ms meta edit frontend-polish --add tailwind-responsive:rule-* --remove a11y-css:example-1
+
+# Validate all slice references still exist
+ms meta doctor frontend-polish
+
+# List meta-skills
+ms meta list
+
+# Show meta-skill composition
+ms meta show frontend-polish --slices
+```
+
+**Resolution and Packing:**
+
+```rust
+impl MetaSkillLoader {
+    pub fn resolve(&self, meta: &MetaSkill, registry: &SkillRegistry) -> Result<Vec<SkillSlice>> {
+        let mut resolved = Vec::new();
+
+        for slice_ref in &meta.slices {
+            let skill = registry.get(&slice_ref.skill_id)?;
+            let slice = skill.slices.get(&slice_ref.slice_id)
+                .ok_or_else(|| anyhow!("Slice {} not found in {}", slice_ref.slice_id, slice_ref.skill_id))?;
+
+            // Verify hash if pinned
+            if let Some(expected_hash) = &slice_ref.content_hash {
+                let actual_hash = hash_content(&slice.content);
+                if &actual_hash != expected_hash {
+                    return Err(anyhow!(
+                        "Content drift detected for {}:{} (expected {}, got {})",
+                        slice_ref.skill_id, slice_ref.slice_id, expected_hash, actual_hash
+                    ));
+                }
+            }
+
+            let mut resolved_slice = slice.clone();
+            if let Some(priority) = slice_ref.priority_override {
+                resolved_slice.utility_score = priority;
+            }
+            resolved.push(resolved_slice);
+        }
+
+        Ok(resolved)
+    }
+
+    pub fn load_packed(&self, meta: &MetaSkill, budget: usize) -> Result<String> {
+        let slices = self.resolve(meta, &self.registry)?;
+        let packed = pack_slices(&slices, TokenBudget { tokens: budget, ..Default::default() });
+        Ok(packed.join("\n\n"))
+    }
+}
+```
+
+**Use Cases:**
+
+- **NTM integration:** Define meta-skills per bead type (e.g., `ui-polish-bead`, `api-refactor-bead`)
+- **Onboarding:** Ship `team-standards` meta-skill bundling all org-required rules
+- **Tech stack kits:** `rust-cli-complete`, `nextjs-fullstack`, `go-microservice`
 
 ---
 
@@ -5302,6 +6624,12 @@ impl Suggester {
                     .map(|c| c.section.clone())
                     .collect();
 
+                if skill.metadata.deprecated.is_some() && !context.include_deprecated {
+                    result.score = 0.0;
+                    result.reason = "deprecated".to_string();
+                    continue;
+                }
+
                 let req_status = self.requirements.check(skill, context);
                 result.requirements = Some(req_status.clone());
                 if !req_status.is_satisfied() {
@@ -5337,6 +6665,7 @@ impl Suggester {
             }
         }
 
+        results.retain(|r| r.score > 0.0);
         results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
 
         Ok(results.into_iter().take(5).map(Into::into).collect())
@@ -5385,6 +6714,9 @@ impl Suggester {
 }
 ```
 
+When `--for-ntm` is used, `ms suggest` returns `swarm_plan` in robot mode so
+each agent can load a complementary slice pack instead of duplicating content.
+
 **Suggestion Context (partial):**
 
 ```rust
@@ -5398,6 +6730,8 @@ pub struct SuggestionContext {
     pub pack_mode: Option<PackMode>,
     pub max_per_group: Option<usize>,
     pub environment: Option<EnvironmentSnapshot>,
+    pub include_deprecated: bool,
+    pub swarm: Option<SwarmContext>,
 }
 ```
 
@@ -5504,6 +6838,370 @@ impl RequirementChecker {
     }
 }
 ```
+
+**Collective Pack Planning (Swarm / NTM):**
+
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SwarmContext {
+    pub agent_count: usize,
+    pub budget_per_agent: usize,
+    pub objective: PackObjective,
+    pub replicate_pitfalls: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PackObjective {
+    CoverageFirst,
+    RedundancyMin,
+    SafetyFirst,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SwarmPlan {
+    pub agents: Vec<AgentPack>,
+    pub objective: PackObjective,
+    pub total_tokens: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentPack {
+    pub agent_id: usize,
+    pub slice_ids: Vec<String>,
+    pub token_estimate: usize,
+}
+
+impl Suggester {
+    pub fn plan_swarm_packs(
+        &self,
+        skill: &Skill,
+        context: &SwarmContext,
+    ) -> SwarmPlan {
+        // Greedy assignment: maximize marginal coverage, minimize duplicate groups
+        // Ensure CRITICAL RULE slices appear in >= 1 agent
+        // Optionally replicate Pitfall slices across all agents
+        unimplemented!()
+    }
+}
+```
+
+### 7.2.1 Context Fingerprints & Suggestion Cooldowns
+
+To prevent `ms suggest` from spamming the same skills repeatedly when context hasn't meaningfully changed, we compute a **context fingerprint** and maintain a cooldown cache.
+
+```rust
+use std::hash::{Hash, Hasher};
+use std::collections::hash_map::DefaultHasher;
+
+/// Compact fingerprint of suggestion context for deduplication
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ContextFingerprint {
+    pub repo_root: Option<String>,
+    pub git_head: Option<String>,      // HEAD commit SHA (first 8 chars)
+    pub diff_hash: Option<u64>,        // hash of `git diff` output
+    pub open_files_hash: u64,          // hash of sorted open file paths
+    pub recent_commands_hash: u64,     // hash of last N commands
+}
+
+impl ContextFingerprint {
+    pub fn compute(context: &SuggestionContext) -> Self {
+        let repo_root = context.cwd.as_ref()
+            .and_then(|p| find_repo_root(p))
+            .map(|p| p.to_string_lossy().into_owned());
+
+        let git_head = repo_root.as_ref()
+            .and_then(|_| git_head_short().ok());
+
+        let diff_hash = repo_root.as_ref()
+            .and_then(|_| git_diff_hash().ok());
+
+        let open_files_hash = hash_string_list(
+            &context.open_files.iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        );
+
+        let recent_commands_hash = hash_string_list(&context.recent_commands);
+
+        Self {
+            repo_root,
+            git_head,
+            diff_hash,
+            open_files_hash,
+            recent_commands_hash,
+        }
+    }
+
+    /// Returns true if context has meaningfully changed
+    pub fn differs_from(&self, other: &Self) -> bool {
+        // Git HEAD change = definitely new context
+        if self.git_head != other.git_head {
+            return true;
+        }
+        // Diff hash change = working tree changed
+        if self.diff_hash != other.diff_hash {
+            return true;
+        }
+        // Open files changed significantly
+        if self.open_files_hash != other.open_files_hash {
+            return true;
+        }
+        // Different commands issued
+        if self.recent_commands_hash != other.recent_commands_hash {
+            return true;
+        }
+        false
+    }
+
+    pub fn fingerprint_hash(&self) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        self.hash(&mut hasher);
+        hasher.finish()
+    }
+}
+
+fn hash_string_list(items: &[String]) -> u64 {
+    let mut sorted = items.to_vec();
+    sorted.sort();
+    let mut hasher = DefaultHasher::new();
+    for item in sorted {
+        item.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+fn git_head_short() -> Result<String> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--short=8", "HEAD"])
+        .output()?;
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn git_diff_hash() -> Result<u64> {
+    let output = std::process::Command::new("git")
+        .args(["diff", "HEAD"])
+        .output()?;
+    let mut hasher = DefaultHasher::new();
+    output.stdout.hash(&mut hasher);
+    hasher.finish().pipe(Ok)
+}
+```
+
+**Cooldown Cache:**
+
+```rust
+use std::time::{Duration, SystemTime};
+
+/// Tracks recent suggestions to implement cooldowns
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SuggestionCooldownCache {
+    /// Map from fingerprint hash -> (skill_ids, timestamp)
+    entries: HashMap<u64, CooldownEntry>,
+    /// Maximum cache entries before LRU eviction
+    max_entries: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CooldownEntry {
+    skill_ids: Vec<String>,
+    suggested_at: SystemTime,
+    fingerprint: ContextFingerprint,
+}
+
+impl SuggestionCooldownCache {
+    const CACHE_PATH: &'static str = "ms/suggest-cooldowns.json";
+    const DEFAULT_COOLDOWN: Duration = Duration::from_secs(300); // 5 minutes
+    const MAX_ENTRIES: usize = 100;
+
+    pub fn load() -> Self {
+        let cache_dir = dirs::cache_dir()
+            .unwrap_or_else(|| PathBuf::from(".cache"));
+        let cache_path = cache_dir.join(Self::CACHE_PATH);
+
+        if let Ok(data) = std::fs::read_to_string(&cache_path) {
+            if let Ok(cache) = serde_json::from_str(&data) {
+                return cache;
+            }
+        }
+
+        Self {
+            entries: HashMap::new(),
+            max_entries: Self::MAX_ENTRIES,
+        }
+    }
+
+    pub fn save(&self) -> Result<()> {
+        let cache_dir = dirs::cache_dir()
+            .unwrap_or_else(|| PathBuf::from(".cache"));
+        let cache_path = cache_dir.join(Self::CACHE_PATH);
+
+        std::fs::create_dir_all(cache_path.parent().unwrap())?;
+        let data = serde_json::to_string_pretty(self)?;
+        std::fs::write(&cache_path, data)?;
+        Ok(())
+    }
+
+    /// Check if we should suppress these suggestions due to cooldown
+    pub fn should_suppress(
+        &self,
+        fingerprint: &ContextFingerprint,
+        skill_ids: &[String],
+        cooldown: Duration,
+    ) -> bool {
+        let fp_hash = fingerprint.fingerprint_hash();
+
+        if let Some(entry) = self.entries.get(&fp_hash) {
+            // Same fingerprint = same context, check cooldown
+            if let Ok(elapsed) = entry.suggested_at.elapsed() {
+                if elapsed < cooldown {
+                    // Check if skills overlap significantly (>50%)
+                    let overlap = skill_ids.iter()
+                        .filter(|id| entry.skill_ids.contains(id))
+                        .count();
+                    let overlap_ratio = overlap as f32 / skill_ids.len().max(1) as f32;
+                    return overlap_ratio > 0.5;
+                }
+            }
+        }
+
+        false
+    }
+
+    /// Record a suggestion for cooldown tracking
+    pub fn record(
+        &mut self,
+        fingerprint: ContextFingerprint,
+        skill_ids: Vec<String>,
+    ) {
+        let fp_hash = fingerprint.fingerprint_hash();
+
+        // LRU eviction if at capacity
+        if self.entries.len() >= self.max_entries {
+            self.evict_oldest();
+        }
+
+        self.entries.insert(fp_hash, CooldownEntry {
+            skill_ids,
+            suggested_at: SystemTime::now(),
+            fingerprint,
+        });
+    }
+
+    fn evict_oldest(&mut self) {
+        if let Some((oldest_key, _)) = self.entries.iter()
+            .min_by_key(|(_, e)| e.suggested_at)
+            .map(|(k, e)| (*k, e.clone()))
+        {
+            self.entries.remove(&oldest_key);
+        }
+    }
+
+    /// Clear expired entries
+    pub fn gc(&mut self, max_age: Duration) {
+        let now = SystemTime::now();
+        self.entries.retain(|_, entry| {
+            entry.suggested_at.elapsed()
+                .map(|e| e < max_age)
+                .unwrap_or(false)
+        });
+    }
+}
+```
+
+**Integration with Suggester:**
+
+```rust
+impl Suggester {
+    pub async fn suggest_with_cooldown(
+        &self,
+        context: &SuggestionContext,
+        cooldown_config: &CooldownConfig,
+    ) -> Result<SuggestionResult> {
+        let fingerprint = ContextFingerprint::compute(context);
+        let mut cache = SuggestionCooldownCache::load();
+
+        // Get raw suggestions
+        let suggestions = self.suggest(context).await?;
+        let skill_ids: Vec<_> = suggestions.iter()
+            .map(|s| s.skill_id.clone())
+            .collect();
+
+        // Check cooldown
+        let suppressed = if cooldown_config.enabled {
+            cache.should_suppress(
+                &fingerprint,
+                &skill_ids,
+                cooldown_config.duration,
+            )
+        } else {
+            false
+        };
+
+        if suppressed {
+            return Ok(SuggestionResult {
+                suggestions: vec![],
+                suppressed: true,
+                reason: Some("Same context, suggestions on cooldown".into()),
+                fingerprint: Some(fingerprint),
+            });
+        }
+
+        // Record for future cooldown checks
+        cache.record(fingerprint.clone(), skill_ids);
+        cache.gc(Duration::from_secs(3600)); // 1 hour max age
+        let _ = cache.save(); // Best effort persist
+
+        Ok(SuggestionResult {
+            suggestions,
+            suppressed: false,
+            reason: None,
+            fingerprint: Some(fingerprint),
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CooldownConfig {
+    pub enabled: bool,
+    pub duration: Duration,
+}
+
+impl Default for CooldownConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            duration: SuggestionCooldownCache::DEFAULT_COOLDOWN,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct SuggestionResult {
+    pub suggestions: Vec<Suggestion>,
+    pub suppressed: bool,
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<ContextFingerprint>,
+}
+```
+
+**CLI flags:**
+
+```bash
+# Disable cooldown for this invocation
+ms suggest --no-cooldown
+
+# Custom cooldown duration
+ms suggest --cooldown=60s
+
+# Show fingerprint in output (for debugging)
+ms suggest --show-fingerprint
+
+# Clear cooldown cache
+ms suggest --clear-cache
+```
+
+This mechanism prevents suggestion spam in tight loops (e.g., IDE integrations calling `ms suggest` on every keystroke) while still responding to meaningful context changes like new commits, file edits, or command history.
 
 ### 7.3 Hash-Based Embeddings (From xf)
 
@@ -6041,6 +7739,37 @@ pub fn filter_by_quality(
 ```
 
 ---
+
+### 7.5 Skill Pruning & Evolution
+
+As the registry grows, ms must keep skills lean and current without destructive
+deletions. Pruning is **proposal-first**: identify candidates, suggest merges
+or deprecations, and require explicit confirmation before applying changes.
+
+**Signals:**
+- Low recent usage (e.g., <5 uses in 30 days)
+- Low quality score (e.g., <0.3)
+- High similarity to another skill (e.g., >= 0.8)
+- Persistent toolchain mismatch or stale indicators
+
+**Actions (non-destructive by default):**
+- Propose merge: "Combine X and Y into Z" with auto-generated draft
+- Propose deprecate: mark as deprecated + replacement alias
+- Propose split: break overly broad skills into focused children
+- Emit BV beads for review and scheduling
+
+**CLI Example:**
+
+```bash
+# Dry run analysis
+ms prune --scope skills --dry-run
+
+# Emit BV beads for human review
+ms prune --scope skills --emit-beads
+
+# Apply only after explicit confirmation (no deletion)
+ms prune --scope skills --apply --require-confirmation
+```
 
 ## 8. Bundle & Distribution System
 
@@ -7394,6 +9123,12 @@ order = ["base", "org", "project", "user"]
 # Conflict strategy: prefer_higher | prefer_lower | interactive
 conflict_strategy = "prefer_higher"
 
+# Merge strategy: auto | prefer_sections
+merge_strategy = "auto"
+
+# Section preferences when merge_strategy = "prefer_sections"
+section_preference = { rules = "higher", pitfalls = "higher", examples = "lower", references = "lower" }
+
 # If true, conflict details are emitted in --robot responses
 emit_conflicts = true
 
@@ -7465,6 +9200,16 @@ min_session_quality = 0.5
 # Incremental session scan (uses fingerprint cache)
 incremental_scan = true
 
+[generalization]
+# Generalization engine: heuristic | llm (uses local model if available)
+engine = "heuristic"
+
+# If true, run critique round and push low-quality results to uncertainty queue
+llm_critique = true
+
+# Max time allowed for local refinement (ms)
+llm_timeout_ms = 3000
+
 [uncertainty]
 # Enable uncertainty queue for low-confidence generalizations
 enabled = true
@@ -7474,6 +9219,19 @@ min_confidence = 0.7
 
 # Max pending items before throttling
 max_pending = 500
+
+[prune]
+# Usage window for pruning analysis (days)
+window_days = 30
+
+# Minimum uses within window to keep without review
+min_uses = 5
+
+# Similarity threshold for merge proposals
+merge_similarity = 0.8
+
+# Require explicit confirmation before applying any changes
+require_confirmation = true
 
 [privacy]
 # Redaction enabled for all CASS ingestion
@@ -7508,6 +9266,15 @@ prompt_injection_patterns = [
 
 # Quarantine directory for flagged excerpts
 quarantine_dir = "~/.local/share/ms/quarantine"
+
+# Destructive operation policy: deny | confirm | allow
+destructive_ops = "deny"
+
+# Require verbatim approval for destructive ops
+require_verbatim_approval = true
+
+# Tombstone deletes in ms-managed dirs (never rm)
+tombstone_deletes = true
 
 [security]
 # Verify bundle signatures on install/update
@@ -7586,6 +9353,7 @@ skill_paths = [
 │ ☐ SQLite storage layer with migrations                                     │
 │ ☐ Git archive layer (following mcp_agent_mail pattern)                     │
 │ ☐ Skill struct and YAML/Markdown parsing                                   │
+│ ☐ Alias + deprecation metadata support                                     │
 │ ☐ Basic CRUD operations (index, show, list)                                │
 │ ☐ Robot mode output formatting                                             │
 │ ☐ Config system (TOML parsing, paths)                                      │
@@ -7628,6 +9396,7 @@ skill_paths = [
 │ ☐ Trigger matching system                                                  │
 │ ☐ Suggestion ranking with context boosting                                 │
 │ ☐ Requirement-aware suggestions (platform/tools/env gating)                │
+│ ☐ Collective pack planning for swarms (NTM)                                │
 │ ☐ Usage tracking                                                           │
 │                                                                             │
 │ Deliverable: ms load, ms suggest work                                      │
@@ -8743,6 +10512,145 @@ steps:
 ```bash
 ms test rust-error-handling
 ms test --all --report junit
+```
+
+**Extended Test Types:**
+
+Beyond basic schema/script tests, ms supports **retrieval tests** and **packing tests**
+to enable regression testing of search quality and token efficiency.
+
+```yaml
+# tests/retrieval.yaml - Verify skill appears for expected queries
+name: "retrieval-accuracy"
+skill: "rust-error-handling"
+type: retrieval
+tests:
+  - context:
+      cwd: "/data/projects/rust-cli"
+      files: ["src/main.rs", "Cargo.toml"]
+      keywords: ["Result", "anyhow"]
+    query: "error handling patterns"
+    expect:
+      top_k: 3                    # Must appear in top 3 results
+      score_min: 0.6              # Minimum relevance score
+
+  - context:
+      diff: "- panic!(\"failed\")\n+ return Err(anyhow!(\"failed\"))"
+    query: null                   # Use diff-based suggestion
+    expect:
+      suggested: true             # Must be auto-suggested for this diff
+```
+
+```yaml
+# tests/packing.yaml - Verify packing behavior
+name: "packing-coverage"
+skill: "rust-error-handling"
+type: packing
+tests:
+  - budget: 500
+    expect_contains:
+      - "rule-1"                  # Critical rule must be included
+      - "rule-2"
+    expect_excludes:
+      - "example-verbose"         # Long example should be cut
+
+  - budget: 1500
+    expect_coverage_groups:
+      - "critical-rules"          # All critical rules at this budget
+      - "core-examples"
+    expect_min_utility: 0.7       # Minimum average utility of packed slices
+
+  - budget: 200
+    expect_contains:
+      - "overview"                # Overview always included
+    expect_max_slices: 3          # At tight budget, only essentials
+```
+
+**Test Harness Implementation:**
+
+```rust
+pub struct SkillTestHarness {
+    registry: SkillRegistry,
+    searcher: HybridSearcher,
+    packer: SlicePacker,
+}
+
+impl SkillTestHarness {
+    pub fn run_retrieval_test(&self, test: &RetrievalTest) -> TestResult {
+        let context = SuggestContext::from_test(&test.context);
+        let results = if let Some(query) = &test.query {
+            self.searcher.search(query, &context.to_filters(), 10).unwrap()
+        } else {
+            self.searcher.suggest(&context, 10).unwrap()
+        };
+
+        let skill_rank = results.iter().position(|r| r.skill_id == test.skill);
+        let skill_score = results.iter().find(|r| r.skill_id == test.skill).map(|r| r.score);
+
+        TestResult {
+            passed: match &test.expect {
+                RetrievalExpect::TopK(k) => skill_rank.map(|r| r < *k).unwrap_or(false),
+                RetrievalExpect::Suggested => skill_rank.is_some(),
+                RetrievalExpect::ScoreMin(min) => skill_score.map(|s| s >= *min).unwrap_or(false),
+            },
+            actual_rank: skill_rank,
+            actual_score: skill_score,
+        }
+    }
+
+    pub fn run_packing_test(&self, test: &PackingTest) -> TestResult {
+        let skill = self.registry.get(&test.skill).unwrap();
+        let packed = pack_slices(&skill.slices, TokenBudget { tokens: test.budget, ..Default::default() });
+        let packed_ids: Vec<_> = packed.iter().map(|s| s.id.clone()).collect();
+
+        let contains_ok = test.expect_contains.iter().all(|id| packed_ids.contains(id));
+        let excludes_ok = test.expect_excludes.iter().all(|id| !packed_ids.contains(id));
+        let coverage_ok = test.expect_coverage_groups.iter().all(|group| {
+            packed.iter().any(|s| s.coverage_group.as_ref() == Some(group))
+        });
+
+        TestResult {
+            passed: contains_ok && excludes_ok && coverage_ok,
+            packed_slice_ids: packed_ids,
+            total_tokens: packed.iter().map(|s| s.token_estimate).sum(),
+        }
+    }
+}
+```
+
+**CI Integration:**
+
+```bash
+# Run all test types
+ms test --all --report junit > test-results.xml
+
+# Run only retrieval tests (fast, no model needed)
+ms test --type retrieval
+
+# Run packing tests with specific budget range
+ms test --type packing --budget-range 200-2000
+```
+
+---
+
+### 18.10 Skill Simulation Sandbox
+
+Simulate a skill end-to-end in a controlled workspace before publishing. This
+catches broken commands, missing assumptions, and brittle steps without touching
+real projects.
+
+**Behavior:**
+- Create a temporary workspace with mock files/tools
+- Execute skill steps (or mapped test steps) in order
+- Capture stdout/stderr and compare against expected assertions
+- Emit a simulation report and optional example transcript
+
+**CLI:**
+
+```bash
+ms simulate rust-error-handling
+ms simulate rust-error-handling --project /data/projects/demo
+ms simulate rust-error-handling --report json
 ```
 
 ---
