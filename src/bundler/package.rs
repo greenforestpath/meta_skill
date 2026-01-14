@@ -91,6 +91,39 @@ impl BundlePackage {
         Ok(out)
     }
 
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let mut cursor = 0;
+        let header = b"MSBUNDLE1\0";
+        if bytes.len() < header.len() || &bytes[..header.len()] != header {
+            return Err(MsError::ValidationFailed(
+                "invalid bundle header".to_string(),
+            ));
+        }
+        cursor += header.len();
+
+        let manifest_len = read_u64(bytes, &mut cursor)? as usize;
+        let manifest_bytes = read_slice(bytes, &mut cursor, manifest_len)?;
+        let manifest_str = std::str::from_utf8(manifest_bytes).map_err(|_| {
+            MsError::ValidationFailed("manifest is not valid UTF-8".to_string())
+        })?;
+        let manifest = BundleManifest::from_toml_str(manifest_str)?;
+
+        let blob_count = read_u64(bytes, &mut cursor)? as usize;
+        let mut blobs = Vec::with_capacity(blob_count);
+        for _ in 0..blob_count {
+            let hash_len = read_u64(bytes, &mut cursor)? as usize;
+            let hash_bytes = read_slice(bytes, &mut cursor, hash_len)?;
+            let hash = std::str::from_utf8(hash_bytes)
+                .map_err(|_| MsError::ValidationFailed("invalid blob hash".to_string()))?
+                .to_string();
+            let blob_len = read_u64(bytes, &mut cursor)? as usize;
+            let blob_bytes = read_slice(bytes, &mut cursor, blob_len)?.to_vec();
+            blobs.push(BundleBlob { hash, bytes: blob_bytes });
+        }
+
+        Ok(Self { manifest, blobs })
+    }
+
     pub fn verify(&self) -> Result<()> {
         self.manifest.validate()?;
         let blob_hashes = self
@@ -222,6 +255,35 @@ fn write_u64(out: &mut Vec<u8>, value: u64) {
     out.extend_from_slice(&value.to_be_bytes());
 }
 
+fn read_u64(input: &[u8], cursor: &mut usize) -> Result<u64> {
+    let end = cursor.checked_add(8).ok_or_else(|| {
+        MsError::ValidationFailed("bundle parse overflow".to_string())
+    })?;
+    if end > input.len() {
+        return Err(MsError::ValidationFailed(
+            "bundle parse truncated".to_string(),
+        ));
+    }
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(&input[*cursor..end]);
+    *cursor = end;
+    Ok(u64::from_be_bytes(buf))
+}
+
+fn read_slice<'a>(input: &'a [u8], cursor: &mut usize, len: usize) -> Result<&'a [u8]> {
+    let end = cursor.checked_add(len).ok_or_else(|| {
+        MsError::ValidationFailed("bundle parse overflow".to_string())
+    })?;
+    if end > input.len() {
+        return Err(MsError::ValidationFailed(
+            "bundle parse truncated".to_string(),
+        ));
+    }
+    let slice = &input[*cursor..end];
+    *cursor = end;
+    Ok(slice)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -313,5 +375,43 @@ mod tests {
         assert_eq!(count, 1);
         let count = package.write_missing_blobs(&store).unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn roundtrip_bundle_bytes() {
+        let dir = tempdir().unwrap();
+        let skill_dir = dir.path().join("skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(skill_dir.join("SKILL.md"), "content").unwrap();
+
+        let manifest = BundleManifest {
+            bundle: BundleInfo {
+                id: "bundle".to_string(),
+                name: "Bundle".to_string(),
+                version: "1.0.0".to_string(),
+                description: None,
+                authors: vec![],
+                license: None,
+                repository: None,
+                keywords: vec![],
+                ms_version: None,
+            },
+            skills: vec![BundledSkill {
+                name: "skill".to_string(),
+                path: PathBuf::from("skill"),
+                version: Some("1.0.0".to_string()),
+                hash: None,
+                optional: false,
+            }],
+            dependencies: vec![],
+            checksum: None,
+            signatures: vec![],
+        };
+
+        let bundle = Bundle::new(manifest, dir.path());
+        let package = bundle.package().unwrap();
+        let bytes = package.to_bytes().unwrap();
+        let parsed = BundlePackage::from_bytes(&bytes).unwrap();
+        parsed.verify().unwrap();
     }
 }

@@ -180,6 +180,9 @@ fn index_human(ctx: &AppContext, paths: &[PathBuf], args: &IndexArgs) -> Result<
 
     pb.finish_and_clear();
 
+    // Commit Tantivy index
+    ctx.search.commit()?;
+
     let elapsed = start.elapsed();
 
     println!();
@@ -229,6 +232,9 @@ fn index_robot(ctx: &AppContext, paths: &[PathBuf], args: &IndexArgs) -> Result<
             }
         }
     }
+
+    // Commit Tantivy index
+    ctx.search.commit()?;
 
     let elapsed = start.elapsed();
 
@@ -300,6 +306,11 @@ fn index_skill_file(
 
     // Write using 2PC transaction manager
     tx_mgr.write_skill(&spec)?;
+
+    // Also update Tantivy search index
+    if let Ok(Some(skill_record)) = ctx.db.get_skill(&spec.metadata.id) {
+        ctx.search.index_skill(&skill_record)?;
+    }
 
     Ok(())
 }

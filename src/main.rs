@@ -8,7 +8,7 @@ use clap::Parser;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use ms::app::AppContext;
-use ms::cli::Cli;
+use ms::cli::{Cli, Commands};
 use ms::Result;
 
 fn main() -> ExitCode {
@@ -34,6 +34,9 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: &Cli) -> Result<()> {
+    if let Commands::Init(args) = &cli.command {
+        return ms::cli::commands::init::run_without_context(cli.robot, args);
+    }
     let ctx = AppContext::from_cli(cli)?;
     ms::cli::commands::run(&ctx, &cli.command)
 }
