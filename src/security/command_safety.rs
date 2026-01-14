@@ -91,15 +91,25 @@ impl SafetyGate {
     }
 
     pub fn enforce(&self, command: &str, session_id: Option<&str>) -> Result<()> {
-        let mut decision = match self.guard.evaluate_command(command) {
-            Ok(decision) => decision,
+        let (mut decision, dcg_unavailable) = match self.guard.evaluate_command(command) {
+            Ok(decision) => (decision, false),
             Err(err) => {
                 warn!("dcg unavailable: {err}");
-                DcgDecision::unavailable(format!("dcg unavailable: {err}"))
+                (DcgDecision::unavailable(format!("dcg unavailable: {err}")), true)
             }
         };
 
         if !decision.allowed {
+            // If DCG is unavailable, provide a specific error explaining the situation
+            if dcg_unavailable {
+                self.log_event(command, &decision, session_id)?;
+                return Err(MsError::DestructiveBlocked(format!(
+                    "command blocked (safety system unavailable): {}. {}",
+                    decision.reason,
+                    decision.remediation.as_deref().unwrap_or("Install DCG to enable command evaluation")
+                )));
+            }
+
             if self.require_verbatim_approval && decision.tier >= SafetyTier::Danger {
                 if approval_matches(command) {
                     decision.approved = true;

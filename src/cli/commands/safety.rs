@@ -326,9 +326,10 @@ fn format_tier(tier: &SafetyTier) -> colored::ColoredString {
 }
 
 fn truncate_command(cmd: &str, max_len: usize) -> String {
-    if cmd.len() <= max_len {
+    if cmd.chars().count() <= max_len {
         cmd.to_string()
     } else {
-        format!("{}...", &cmd[..max_len - 3])
+        let truncated: String = cmd.chars().take(max_len.saturating_sub(3)).collect();
+        format!("{}...", truncated)
     }
 }

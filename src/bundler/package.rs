@@ -10,6 +10,22 @@ use crate::bundler::blob::BlobStore;
 use crate::bundler::manifest::{BundleManifest, SignatureVerifier};
 use crate::error::{MsError, Result};
 
+/// Maximum size for bundle manifest in bytes (1 MB).
+/// This is generous for TOML metadata; manifests should typically be <10KB.
+const MAX_MANIFEST_SIZE: usize = 1024 * 1024;
+
+/// Maximum number of blobs in a bundle.
+/// 10,000 skills in a single bundle is an extremely generous upper bound.
+const MAX_BLOB_COUNT: usize = 10_000;
+
+/// Maximum size for a single blob in bytes (100 MB).
+/// Individual skills should not exceed this; larger content should be split.
+const MAX_BLOB_SIZE: usize = 100 * 1024 * 1024;
+
+/// Maximum size for a blob hash string (128 bytes).
+/// SHA256 with prefix is ~70 bytes; this allows for future hash algorithms.
+const MAX_HASH_SIZE: usize = 128;
+
 /// A skill bundle definition with a source root.
 #[derive(Debug, Clone)]
 pub struct Bundle {
@@ -103,6 +119,12 @@ impl BundlePackage {
         cursor += header.len();
 
         let manifest_len = read_u64(bytes, &mut cursor)? as usize;
+        if manifest_len > MAX_MANIFEST_SIZE {
+            return Err(MsError::ValidationFailed(format!(
+                "manifest size {} exceeds maximum {}",
+                manifest_len, MAX_MANIFEST_SIZE
+            )));
+        }
         let manifest_bytes = read_slice(bytes, &mut cursor, manifest_len)?;
         let manifest_str = std::str::from_utf8(manifest_bytes).map_err(|_| {
             MsError::ValidationFailed("manifest is not valid UTF-8".to_string())
@@ -110,14 +132,32 @@ impl BundlePackage {
         let manifest = BundleManifest::from_toml_str(manifest_str)?;
 
         let blob_count = read_u64(bytes, &mut cursor)? as usize;
+        if blob_count > MAX_BLOB_COUNT {
+            return Err(MsError::ValidationFailed(format!(
+                "blob count {} exceeds maximum {}",
+                blob_count, MAX_BLOB_COUNT
+            )));
+        }
         let mut blobs = Vec::with_capacity(blob_count);
         for _ in 0..blob_count {
             let hash_len = read_u64(bytes, &mut cursor)? as usize;
+            if hash_len > MAX_HASH_SIZE {
+                return Err(MsError::ValidationFailed(format!(
+                    "hash size {} exceeds maximum {}",
+                    hash_len, MAX_HASH_SIZE
+                )));
+            }
             let hash_bytes = read_slice(bytes, &mut cursor, hash_len)?;
             let hash = std::str::from_utf8(hash_bytes)
                 .map_err(|_| MsError::ValidationFailed("invalid blob hash".to_string()))?
                 .to_string();
             let blob_len = read_u64(bytes, &mut cursor)? as usize;
+            if blob_len > MAX_BLOB_SIZE {
+                return Err(MsError::ValidationFailed(format!(
+                    "blob size {} exceeds maximum {}",
+                    blob_len, MAX_BLOB_SIZE
+                )));
+            }
             let blob_bytes = read_slice(bytes, &mut cursor, blob_len)?.to_vec();
             blobs.push(BundleBlob { hash, bytes: blob_bytes });
         }
@@ -413,5 +453,81 @@ mod tests {
         let bytes = package.to_bytes().unwrap();
         let parsed = BundlePackage::from_bytes(&bytes).unwrap();
         parsed.verify().unwrap();
+    }
+
+    #[test]
+    fn rejects_oversized_manifest() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"MSBUNDLE1\0");
+        // Claim manifest is larger than MAX_MANIFEST_SIZE
+        let oversized: u64 = (super::MAX_MANIFEST_SIZE + 1) as u64;
+        bytes.extend_from_slice(&oversized.to_be_bytes());
+
+        let result = BundlePackage::from_bytes(&bytes);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("manifest size") && err.contains("exceeds maximum"));
+    }
+
+    #[test]
+    fn rejects_excessive_blob_count() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"MSBUNDLE1\0");
+        // Valid manifest (minimal TOML)
+        let manifest = b"[bundle]\nid = \"test\"\nname = \"Test\"\nversion = \"1.0.0\"\n";
+        bytes.extend_from_slice(&(manifest.len() as u64).to_be_bytes());
+        bytes.extend_from_slice(manifest);
+        // Excessive blob count
+        let excessive_count: u64 = (super::MAX_BLOB_COUNT + 1) as u64;
+        bytes.extend_from_slice(&excessive_count.to_be_bytes());
+
+        let result = BundlePackage::from_bytes(&bytes);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("blob count") && err.contains("exceeds maximum"));
+    }
+
+    #[test]
+    fn rejects_oversized_hash() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"MSBUNDLE1\0");
+        // Valid manifest
+        let manifest = b"[bundle]\nid = \"test\"\nname = \"Test\"\nversion = \"1.0.0\"\n";
+        bytes.extend_from_slice(&(manifest.len() as u64).to_be_bytes());
+        bytes.extend_from_slice(manifest);
+        // 1 blob
+        bytes.extend_from_slice(&1u64.to_be_bytes());
+        // Oversized hash length
+        let oversized_hash: u64 = (super::MAX_HASH_SIZE + 1) as u64;
+        bytes.extend_from_slice(&oversized_hash.to_be_bytes());
+
+        let result = BundlePackage::from_bytes(&bytes);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("hash size") && err.contains("exceeds maximum"));
+    }
+
+    #[test]
+    fn rejects_oversized_blob() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"MSBUNDLE1\0");
+        // Valid manifest
+        let manifest = b"[bundle]\nid = \"test\"\nname = \"Test\"\nversion = \"1.0.0\"\n";
+        bytes.extend_from_slice(&(manifest.len() as u64).to_be_bytes());
+        bytes.extend_from_slice(manifest);
+        // 1 blob
+        bytes.extend_from_slice(&1u64.to_be_bytes());
+        // Valid hash length
+        let hash = b"sha256:0000000000000000000000000000000000000000000000000000000000000000";
+        bytes.extend_from_slice(&(hash.len() as u64).to_be_bytes());
+        bytes.extend_from_slice(hash);
+        // Oversized blob length
+        let oversized_blob: u64 = (super::MAX_BLOB_SIZE + 1) as u64;
+        bytes.extend_from_slice(&oversized_blob.to_be_bytes());
+
+        let result = BundlePackage::from_bytes(&bytes);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("blob size") && err.contains("exceeds maximum"));
     }
 }

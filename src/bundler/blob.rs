@@ -24,7 +24,7 @@ impl BlobStore {
 
     pub fn write_blob(&self, bytes: &[u8]) -> Result<String> {
         let hash = hash_bytes(bytes);
-        let path = self.blob_path(&hash);
+        let path = self.blob_path(&hash)?;
         if !path.exists() {
             fs::write(&path, bytes).map_err(|err| {
                 MsError::Config(format!("write blob {}: {err}", path.display()))
@@ -34,14 +34,14 @@ impl BlobStore {
     }
 
     pub fn read_blob(&self, hash: &str) -> Result<Vec<u8>> {
-        let path = self.blob_path(hash);
+        let path = self.blob_path(hash)?;
         fs::read(&path).map_err(|err| {
             MsError::Config(format!("read blob {}: {err}", path.display()))
         })
     }
 
     pub fn has_blob(&self, hash: &str) -> bool {
-        self.blob_path(hash).exists()
+        self.blob_path(hash).map(|p| p.exists()).unwrap_or(false)
     }
 
     pub fn verify_blob(&self, hash: &str) -> Result<bool> {
@@ -83,8 +83,43 @@ impl BlobStore {
         Ok(format!("sha256:{}", hex::encode(digest)))
     }
 
-    fn blob_path(&self, hash: &str) -> PathBuf {
-        self.root.join("blobs").join(hash)
+    /// Get the path for a blob hash, validating against path traversal attacks.
+    ///
+    /// # Security
+    /// This function validates that the hash doesn't contain path traversal
+    /// sequences (../, ..\, /, \) or null bytes that could be used to
+    /// read/write files outside the blob store.
+    fn blob_path(&self, hash: &str) -> Result<PathBuf> {
+        // Validate hash doesn't contain path traversal sequences
+        if hash.contains('/') || hash.contains('\\') || hash.contains('\0') {
+            return Err(MsError::ValidationFailed(format!(
+                "invalid blob hash: contains path separator or null byte"
+            )));
+        }
+        if hash.contains("..") {
+            return Err(MsError::ValidationFailed(format!(
+                "invalid blob hash: contains path traversal sequence"
+            )));
+        }
+        if hash.is_empty() {
+            return Err(MsError::ValidationFailed(
+                "invalid blob hash: empty".to_string()
+            ));
+        }
+        // Additional validation: hash should match expected format (sha256:hex)
+        if !hash.starts_with("sha256:") {
+            return Err(MsError::ValidationFailed(format!(
+                "invalid blob hash format: expected sha256:hex, got {}",
+                hash.chars().take(20).collect::<String>()
+            )));
+        }
+        let hex_part = &hash[7..];
+        if hex_part.len() != 64 || !hex_part.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(MsError::ValidationFailed(format!(
+                "invalid blob hash: malformed hex component"
+            )));
+        }
+        Ok(self.root.join("blobs").join(hash))
     }
 }
 
@@ -145,5 +180,43 @@ mod tests {
         let hash = store.write_blob(b"bundle-data").unwrap();
         assert!(store.has_blob(&hash));
         assert!(store.verify_blob(&hash).unwrap());
+    }
+
+    #[test]
+    fn blob_path_rejects_path_traversal() {
+        let dir = tempdir().unwrap();
+        let store = BlobStore::open(dir.path()).unwrap();
+
+        // Path traversal with ..
+        assert!(store.blob_path("../../../etc/passwd").is_err());
+        assert!(store.blob_path("sha256:../abc").is_err());
+
+        // Path separators
+        assert!(store.blob_path("sha256:abc/def").is_err());
+        assert!(store.blob_path("sha256:abc\\def").is_err());
+
+        // Null byte injection
+        assert!(store.blob_path("sha256:abc\0def").is_err());
+
+        // Empty hash
+        assert!(store.blob_path("").is_err());
+
+        // Invalid format (not sha256:)
+        assert!(store.blob_path("md5:abcdef").is_err());
+        assert!(store.blob_path("plain-hash").is_err());
+
+        // Invalid hex (wrong length or non-hex chars)
+        assert!(store.blob_path("sha256:abc").is_err());
+        assert!(store.blob_path("sha256:gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg").is_err());
+    }
+
+    #[test]
+    fn blob_path_accepts_valid_hash() {
+        let dir = tempdir().unwrap();
+        let store = BlobStore::open(dir.path()).unwrap();
+
+        // Valid sha256 hash (64 hex chars)
+        let valid_hash = "sha256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+        assert!(store.blob_path(valid_hash).is_ok());
     }
 }

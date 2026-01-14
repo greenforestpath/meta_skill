@@ -212,6 +212,15 @@ impl TombstoneManager {
         let content = fs::read_to_string(&meta_path)?;
         let record: TombstoneRecord = serde_json::from_str(&content)?;
 
+        // Verify tombstone content exists
+        if !tombstone_path.exists() {
+            return Err(MsError::NotFound(format!(
+                "tombstone content missing for {}: metadata exists but content at {} not found",
+                id,
+                tombstone_path.display()
+            )));
+        }
+
         // Compute original path
         let original_full_path = self.ms_root.join(&record.original_path);
 
@@ -228,8 +237,8 @@ impl TombstoneManager {
             fs::create_dir_all(parent)?;
         }
 
-        // Move back
-        if tombstone_path.is_dir() {
+        // Move back - use record.is_directory for correctness
+        if record.is_directory {
             self.copy_dir_recursive(&tombstone_path, &original_full_path)?;
             fs::remove_dir_all(&tombstone_path)?;
         } else {

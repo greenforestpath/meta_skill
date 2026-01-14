@@ -44,12 +44,18 @@ impl DcgDecision {
         }
     }
 
+    /// Create a decision for when DCG is unavailable.
+    ///
+    /// # Security
+    /// This returns `allowed: false` (fail-closed) because when the safety
+    /// system cannot evaluate a command, we must assume it could be dangerous.
+    /// This is a fundamental security principle: fail-closed, not fail-open.
     pub fn unavailable(reason: String) -> Self {
         Self {
-            allowed: true,
-            tier: SafetyTier::Caution,
+            allowed: false,
+            tier: SafetyTier::Critical,
             reason,
-            remediation: None,
+            remediation: Some("Install or configure DCG (Destructive Command Guard) to enable command safety evaluation".to_string()),
             rule_id: None,
             pack: None,
             approved: false,
