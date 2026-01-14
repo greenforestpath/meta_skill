@@ -1,0 +1,104 @@
+name: E2E Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  RUST_LOG: debug
+
+jobs:
+  e2e:
+    name: End-to-End Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Run E2E tests
+        run: |
+          export PATH="$PWD/target/release:$PATH"
+          cargo test --test '*' -- --nocapture 2>&1 | tee e2e-output.log
+
+      - name: Upload E2E logs
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e2e-logs
+          path: |
+            e2e-output.log
+            tests/e2e/*.log
+          retention-days: 7
+
+  robot-mode:
+    name: Robot Mode Validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Test robot mode JSON output
+        run: |
+          export PATH="$PWD/target/release:$PATH"
+
+          # Initialize ms in temp directory
+          TEMP_MS=$(mktemp -d)
+          cd "$TEMP_MS"
+
+          # Test ms init --robot
+          echo "Testing: ms init --robot"
+          ms init --robot 2>&1 | tee init.json
+          if ! jq -e '.status' init.json > /dev/null 2>&1; then
+            echo "ERROR: ms init --robot did not produce valid JSON"
+            exit 1
+          fi
+
+          # Test ms doctor --robot
+          echo "Testing: ms doctor --robot"
+          ms doctor --robot 2>&1 | tee doctor.json
+          if ! jq -e '.' doctor.json > /dev/null 2>&1; then
+            echo "ERROR: ms doctor --robot did not produce valid JSON"
+            exit 1
+          fi
+
+          # Test ms search --robot (may return empty but should be valid JSON)
+          echo "Testing: ms search --robot"
+          ms search "test" --robot 2>&1 | tee search.json || true
+          if ! jq -e '.' search.json > /dev/null 2>&1; then
+            echo "ERROR: ms search --robot did not produce valid JSON"
+            exit 1
+          fi
+
+          echo "All robot mode tests passed!"
+
+      - name: Upload robot mode logs
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: robot-mode-logs
+          path: |
+            *.json
+          retention-days: 7
