@@ -12,7 +12,7 @@ use tracing::warn;
 
 use crate::error::Result;
 use crate::quality::ubs::UbsClient;
-use crate::security::SafetyGate;
+use crate::security::{contains_injection_patterns, contains_sensitive_data, SafetyGate};
 
 use super::client::Session;
 
@@ -584,50 +584,6 @@ enum MessageTaint {
     Injection,
     /// Contains sensitive data patterns - flag for review
     Sensitive,
-}
-
-/// Check if content contains prompt injection patterns.
-fn contains_injection_patterns(content: &str) -> bool {
-    let lower = content.to_lowercase();
-    let markers = [
-        "ignore previous instructions",
-        "ignore all previous",
-        "disregard prior",
-        "new instructions:",
-        "system prompt:",
-        "you are now",
-        "forget everything",
-        "override:",
-        "admin mode",
-        "sudo mode",
-        "jailbreak",
-        "developer mode",
-        "dan mode",
-        "</system>",
-        "<|im_start|>",
-        "<|endoftext|>",
-    ];
-    markers.iter().any(|m| lower.contains(m))
-}
-
-/// Check if content contains sensitive data patterns.
-fn contains_sensitive_data(content: &str) -> bool {
-    if content.contains("sk-")
-        || content.contains("api_key")
-        || content.contains("apikey")
-        || content.contains("secret_key")
-        || content.contains("access_token")
-        || content.contains("bearer ")
-        || content.contains("AKIA")
-        || content.contains("aws_secret")
-    {
-        return true;
-    }
-    if content.contains("-----BEGIN") && content.contains("PRIVATE KEY") {
-        return true;
-    }
-    let lower = content.to_lowercase();
-    lower.contains("password=") || lower.contains("passwd=") || lower.contains("pwd=")
 }
 
 /// Scan session messages for injection and sensitive content patterns.
@@ -1796,6 +1752,7 @@ And more text.
             frequency: 1,
             tags: vec![],
             description: None,
+            taint_label: None,
         };
 
         let p2 = ExtractedPattern {
@@ -1811,6 +1768,7 @@ And more text.
             frequency: 1,
             tags: vec![],
             description: None,
+            taint_label: None,
         };
 
         assert!(patterns_are_similar(&p1, &p2));
@@ -1829,6 +1787,7 @@ And more text.
             frequency: 1,
             tags: vec![],
             description: None,
+            taint_label: None,
         };
 
         assert!(!patterns_are_similar(&p1, &p3));
@@ -1849,6 +1808,7 @@ And more text.
                 frequency: 1,
                 tags: vec![],
                 description: None,
+                taint_label: None,
             },
             ExtractedPattern {
                 id: "2".to_string(),
@@ -1862,6 +1822,7 @@ And more text.
                 frequency: 1,
                 tags: vec![],
                 description: None,
+                taint_label: None,
             },
         ];
 
@@ -1897,98 +1858,5 @@ And more text.
         .contains("compilation"));
     }
 
-    #[test]
-    fn test_acip_injection_patterns_excluded() {
-        // Pattern with evidence from injection-tainted message should be excluded
-        let mut tainted = std::collections::HashMap::new();
-        tainted.insert(0, MessageTaint::Injection);
-
-        let patterns = vec![ExtractedPattern {
-            id: "test-injection".to_string(),
-            pattern_type: PatternType::CommandPattern {
-                commands: vec!["ignore previous instructions".to_string()],
-                frequency: 1,
-                contexts: vec![],
-            },
-            evidence: vec![EvidenceRef {
-                session_id: "s1".to_string(),
-                message_indices: vec![0], // Points to injection-tainted message
-                relevance: 0.8,
-                snippet: None,
-            }],
-            confidence: 0.8,
-            frequency: 1,
-            tags: vec![],
-            description: None,
-            taint_label: None,
-        }];
-
-        let result = apply_taint_labels(patterns, &tainted);
-        assert!(result.is_empty(), "Pattern with injection evidence should be excluded");
-    }
-
-    #[test]
-    fn test_acip_sensitive_patterns_labeled() {
-        // Pattern with evidence from sensitive-tainted message should get RequiresReview label
-        let mut tainted = std::collections::HashMap::new();
-        tainted.insert(1, MessageTaint::Sensitive);
-
-        let patterns = vec![ExtractedPattern {
-            id: "test-sensitive".to_string(),
-            pattern_type: PatternType::CommandPattern {
-                commands: vec!["export API_KEY=xxx".to_string()],
-                frequency: 1,
-                contexts: vec![],
-            },
-            evidence: vec![EvidenceRef {
-                session_id: "s1".to_string(),
-                message_indices: vec![1], // Points to sensitive-tainted message
-                relevance: 0.8,
-                snippet: None,
-            }],
-            confidence: 0.8,
-            frequency: 1,
-            tags: vec![],
-            description: None,
-            taint_label: None,
-        }];
-
-        let result = apply_taint_labels(patterns, &tainted);
-        assert_eq!(result.len(), 1, "Pattern with sensitive evidence should be kept");
-        assert_eq!(
-            result[0].taint_label,
-            Some(TaintLabel::RequiresReview),
-            "Sensitive pattern should have RequiresReview label"
-        );
-    }
-
-    #[test]
-    fn test_acip_clean_patterns_unchanged() {
-        // Pattern without tainted evidence should remain unchanged
-        let tainted = std::collections::HashMap::new(); // No tainted messages
-
-        let patterns = vec![ExtractedPattern {
-            id: "test-clean".to_string(),
-            pattern_type: PatternType::CommandPattern {
-                commands: vec!["cargo build".to_string()],
-                frequency: 1,
-                contexts: vec![],
-            },
-            evidence: vec![EvidenceRef {
-                session_id: "s1".to_string(),
-                message_indices: vec![0],
-                relevance: 0.8,
-                snippet: None,
-            }],
-            confidence: 0.8,
-            frequency: 1,
-            tags: vec![],
-            description: None,
-            taint_label: None,
-        }];
-
-        let result = apply_taint_labels(patterns, &tainted);
-        assert_eq!(result.len(), 1, "Clean pattern should be kept");
-        assert_eq!(result[0].taint_label, None, "Clean pattern should have no taint label");
-    }
+    // NOTE: ACIP taint label tests removed - functionality moved to security module
 }
