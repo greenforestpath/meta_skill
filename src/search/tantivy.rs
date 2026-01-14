@@ -19,7 +19,6 @@ pub struct Bm25Index {
     index: Index,
     reader: IndexReader,
     writer: RwLock<IndexWriter>,
-    schema: Schema,
     // Field handles for fast access
     fields: BM25Fields,
 }
@@ -80,7 +79,6 @@ impl Bm25Index {
             index,
             reader,
             writer: RwLock::new(writer),
-            schema,
             fields,
         })
     }
@@ -90,7 +88,7 @@ impl Bm25Index {
         let schema = build_schema();
         let fields = extract_fields(&schema)?;
 
-        let index = Index::create_in_ram(schema.clone());
+        let index = Index::create_in_ram(schema);
         let reader = index
             .reader_builder()
             .reload_policy(ReloadPolicy::Manual)
@@ -101,7 +99,6 @@ impl Bm25Index {
             index,
             reader,
             writer: RwLock::new(writer),
-            schema,
             fields,
         })
     }

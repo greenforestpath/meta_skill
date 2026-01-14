@@ -7,7 +7,7 @@ use clap::{Args, Subcommand};
 
 use crate::app::AppContext;
 use crate::bundler::{Bundle, BundleInfo, BundleManifest, BundledSkill};
-use crate::bundler::blob::BlobStore;
+use crate::bundler::install::{install as install_bundle, InstallReport};
 use crate::error::{MsError, Result};
 use crate::cli::output::emit_json;
 
@@ -69,6 +69,10 @@ pub struct BundlePublishArgs {
 pub struct BundleInstallArgs {
     /// Bundle source (path or URL)
     pub source: String,
+
+    /// Skills to install (defaults to all)
+    #[arg(long)]
+    pub skills: Vec<String>,
 }
 
 pub fn run(_ctx: &AppContext, _args: &BundleArgs) -> Result<()> {
@@ -77,6 +81,7 @@ pub fn run(_ctx: &AppContext, _args: &BundleArgs) -> Result<()> {
 
     match &args.command {
         BundleCommand::Create(create) => run_create(ctx, create),
+        BundleCommand::Install(install) => run_install(ctx, install),
         _ => Ok(()),
     }
 }
@@ -112,13 +117,11 @@ fn run_create(ctx: &AppContext, args: &BundleCreateArgs) -> Result<()> {
         } else {
             Some(metadata.version)
         };
-        let hash = BlobStore::hash_path(&skill_dir)?;
-
         entries.push(BundledSkill {
             name: skill_id,
             path: rel,
             version,
-            hash: Some(hash),
+            hash: None,
             optional: false,
         });
     }
@@ -198,6 +201,29 @@ fn run_create(ctx: &AppContext, args: &BundleCreateArgs) -> Result<()> {
     Ok(())
 }
 
+fn run_install(ctx: &AppContext, args: &BundleInstallArgs) -> Result<()> {
+    if args.source.starts_with("http://") || args.source.starts_with("https://") {
+        return Err(MsError::ValidationFailed(
+            "bundle install only supports local files for now".to_string(),
+        ));
+    }
+
+    let bytes = std::fs::read(&args.source).map_err(|err| {
+        MsError::Config(format!("read {}: {err}", args.source))
+    })?;
+    let package = crate::bundler::package::BundlePackage::from_bytes(&bytes)?;
+
+    let only = normalize_skill_list(&args.skills);
+    let report = install_bundle(&package, ctx.git.root(), &only)?;
+
+    if ctx.robot_mode {
+        return emit_json(&report);
+    }
+
+    print_install_report(&report);
+    Ok(())
+}
+
 fn normalize_skill_list(values: &[String]) -> Vec<String> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
@@ -234,6 +260,23 @@ fn slugify(input: &str) -> String {
     } else {
         trimmed.to_string()
     }
+}
+
+fn print_install_report(report: &InstallReport) {
+    println!("Bundle installed: {}", report.bundle_id);
+    if !report.installed.is_empty() {
+        println!("Installed:");
+        for skill in &report.installed {
+            println!("  - {}", skill);
+        }
+    }
+    if !report.skipped.is_empty() {
+        println!("Skipped:");
+        for skill in &report.skipped {
+            println!("  - {}", skill);
+        }
+    }
+    println!("Blobs written: {}", report.blobs_written);
 }
 
 #[derive(serde::Serialize)]

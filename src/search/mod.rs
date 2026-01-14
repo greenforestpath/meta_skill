@@ -32,7 +32,7 @@ pub mod tantivy;
 pub mod tantivy_index;
 
 // Re-export main types
-pub use context::SearchContext;
+pub use context::{FilterResult, SearchContext, SearchFilters, SearchLayer};
 pub use embeddings::{Embedder, HashEmbedder, VectorIndex};
 pub use hybrid::{fuse_results, fuse_simple, fuse_with_limit, HybridResult, RrfConfig};
 pub use tantivy::{Bm25Index, Bm25Result};

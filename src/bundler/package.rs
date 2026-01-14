@@ -1,5 +1,6 @@
 //! Bundle packaging
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -130,7 +131,7 @@ impl BundlePackage {
             .blobs
             .iter()
             .map(|blob| blob.hash.as_str())
-            .collect::<std::collections::HashSet<_>>();
+            .collect::<HashSet<_>>();
         for blob in &self.blobs {
             let hash = hash_bytes(&blob.bytes);
             if hash != blob.hash {
@@ -208,7 +209,6 @@ fn build_blob_bytes(path: &Path) -> Result<Vec<u8>> {
     }
 
     let mut entries = Vec::new();
-    super::blob::BlobStore::hash_path(path)?;
     super::blob::collect_files_for_bundle(path, path, &mut entries)?;
     entries.sort_by(|a, b| a.0.cmp(&b.0));
 
