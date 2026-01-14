@@ -1,4 +1,6 @@
+pub mod antipatterns;
 pub mod app;
+pub mod beads;
 pub mod bundler;
 pub mod cass;
 pub mod cm;
@@ -15,6 +17,7 @@ pub mod storage;
 pub mod test_utils;
 pub mod suggestions;
 pub mod testing;
+pub mod tui;
 pub mod updater;
 pub mod utils;
 

@@ -40,6 +40,9 @@ pub enum MsError {
     #[error("CM not available: {0}")]
     CmUnavailable(String),
 
+    #[error("Beads not available: {0}")]
+    BeadsUnavailable(String),
+
     #[error("Mining failed: {0}")]
     MiningFailed(String),
 

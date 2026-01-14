@@ -56,6 +56,10 @@ colored = "2.1"
 indicatif = "0.17"
 console = "0.15"
 
+# TUI
+ratatui = "0.29"
+crossterm = "0.28"
+
 # High-performance text processing
 regex = "1.10"
 memchr = "2.7"

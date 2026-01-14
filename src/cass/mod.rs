@@ -33,7 +33,7 @@ pub use uncertainty::{
     UncertaintyResolver, UncertaintyStatus,
 };
 pub use brenner::{
-    BrennerConfig, BrennerSkillDraft, BrennerWizard, CognitiveMove, CognitiveMoveTag,
-    MoveDecision, MoveEvidence, SelectedSession, SkillExample, SkillRule, TestResults,
-    WizardCheckpoint, WizardOutput, WizardState,
+    generate_skill_md, BrennerConfig, BrennerSkillDraft, BrennerWizard, CognitiveMove,
+    CognitiveMoveTag, MoveDecision, MoveEvidence, SelectedSession, SkillExample, SkillRule,
+    TestResults, WizardCheckpoint, WizardOutput, WizardState,
 };

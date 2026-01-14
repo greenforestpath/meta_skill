@@ -150,7 +150,24 @@ fn resolve_target_path(root: &Path, path: &Path, fallback_id: &str) -> Result<Pa
         ensure_relative(path)?;
         return Ok(root.join(path));
     }
+    // Validate fallback_id to prevent path traversal
+    ensure_safe_id(fallback_id)?;
     Ok(root.join("skills").join("by-id").join(fallback_id))
+}
+
+fn ensure_safe_id(id: &str) -> Result<()> {
+    if id.is_empty() {
+        return Err(MsError::ValidationFailed(
+            "skill id must not be empty".to_string(),
+        ));
+    }
+    if id.contains("..") || id.contains('/') || id.contains('\\') {
+        return Err(MsError::ValidationFailed(format!(
+            "skill id contains invalid characters: {}",
+            id
+        )));
+    }
+    Ok(())
 }
 
 fn ensure_relative(path: &Path) -> Result<()> {
@@ -288,5 +305,47 @@ mod tests {
             .path()
             .join("skills/by-id/demo/SKILL.md");
         assert!(installed_path.exists());
+    }
+
+    #[test]
+    fn ensure_safe_id_blocks_path_traversal() {
+        // Path traversal with ..
+        assert!(ensure_safe_id("../malicious").is_err());
+        assert!(ensure_safe_id("foo/../bar").is_err());
+        assert!(ensure_safe_id("..").is_err());
+
+        // Forward slashes
+        assert!(ensure_safe_id("foo/bar").is_err());
+        assert!(ensure_safe_id("/etc/passwd").is_err());
+
+        // Backslashes
+        assert!(ensure_safe_id("foo\\bar").is_err());
+        assert!(ensure_safe_id("..\\malicious").is_err());
+
+        // Empty
+        assert!(ensure_safe_id("").is_err());
+
+        // Valid IDs
+        assert!(ensure_safe_id("my-skill").is_ok());
+        assert!(ensure_safe_id("skill_123").is_ok());
+        assert!(ensure_safe_id("skill.v1").is_ok());
+    }
+
+    #[test]
+    fn resolve_target_path_blocks_malicious_skill_name() {
+        let root = Path::new("/archive");
+
+        // Empty path with malicious skill name should be rejected
+        let result = resolve_target_path(root, Path::new(""), "../../../tmp/malicious");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("invalid characters"));
+
+        // Valid skill name with empty path should work
+        let result = resolve_target_path(root, Path::new(""), "valid-skill");
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap(),
+            PathBuf::from("/archive/skills/by-id/valid-skill")
+        );
     }
 }

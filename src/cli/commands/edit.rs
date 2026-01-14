@@ -89,15 +89,39 @@ fn edit_spec_path(skill_dir: &std::path::Path) -> PathBuf {
 }
 
 fn run_editor(gate: &SafetyGate, editor: &str, path: &PathBuf) -> Result<()> {
-    let mut parts = editor.split_whitespace();
-    let cmd = parts
-        .next()
-        .ok_or_else(|| crate::error::MsError::Config("invalid editor".to_string()))?;
-    let command_str = format!("{editor} {}", path.display());
+    // Parse editor string into command and arguments
+    // Handle quoted paths for editors with spaces in path
+    let (cmd, args) = parse_editor_string(editor)?;
+
+    // Validate the editor executable exists
+    let cmd_path = std::path::Path::new(&cmd);
+    if !cmd_path.is_absolute() {
+        // For relative paths, use which to find the executable
+        if which::which(&cmd).is_err() {
+            return Err(crate::error::MsError::Config(format!(
+                "editor not found: {cmd}"
+            )));
+        }
+    } else if !cmd_path.exists() {
+        return Err(crate::error::MsError::Config(format!(
+            "editor not found: {cmd}"
+        )));
+    }
+
+    // Build the command that will actually be executed for safety check
+    // This ensures the safety gate sees exactly what we're going to run
+    let mut actual_args = args.clone();
+    actual_args.push(path.display().to_string());
+    let command_str = std::iter::once(cmd.clone())
+        .chain(actual_args.iter().cloned())
+        .collect::<Vec<_>>()
+        .join(" ");
     gate.enforce(&command_str, None)?;
-    let mut command = Command::new(cmd);
-    for part in parts {
-        command.arg(part);
+
+    // Execute the editor
+    let mut command = Command::new(&cmd);
+    for arg in &args {
+        command.arg(arg);
     }
     let status = command.arg(path).status().map_err(|err| {
         crate::error::MsError::Config(format!("launch editor: {err}"))
@@ -108,6 +132,57 @@ fn run_editor(gate: &SafetyGate, editor: &str, path: &PathBuf) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Parse an editor string into command and arguments.
+/// Handles simple quoting for paths with spaces.
+fn parse_editor_string(editor: &str) -> Result<(String, Vec<String>)> {
+    let editor = editor.trim();
+    if editor.is_empty() {
+        return Err(crate::error::MsError::Config("empty editor string".to_string()));
+    }
+
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut in_quote = false;
+    let mut quote_char = '"';
+
+    for ch in editor.chars() {
+        match ch {
+            '"' | '\'' if !in_quote => {
+                in_quote = true;
+                quote_char = ch;
+            }
+            c if c == quote_char && in_quote => {
+                in_quote = false;
+            }
+            ' ' | '\t' if !in_quote => {
+                if !current.is_empty() {
+                    parts.push(std::mem::take(&mut current));
+                }
+            }
+            _ => {
+                current.push(ch);
+            }
+        }
+    }
+
+    if !current.is_empty() {
+        parts.push(current);
+    }
+
+    if in_quote {
+        return Err(crate::error::MsError::Config(
+            "unclosed quote in editor string".to_string()
+        ));
+    }
+
+    if parts.is_empty() {
+        return Err(crate::error::MsError::Config("empty editor string".to_string()));
+    }
+
+    let cmd = parts.remove(0);
+    Ok((cmd, parts))
 }
 
 #[derive(serde::Serialize)]

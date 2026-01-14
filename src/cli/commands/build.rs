@@ -19,9 +19,10 @@ use serde_json::json;
 
 use crate::app::AppContext;
 use crate::cass::{
-    brenner::{run_interactive, BrennerConfig, BrennerWizard, WizardOutput},
+    brenner::{generate_skill_md, run_interactive, BrennerConfig, BrennerWizard, WizardOutput},
     CassClient, QualityScorer,
 };
+use crate::tui::build_tui::run_build_tui;
 use crate::cm::CmClient;
 use crate::error::{MsError, Result};
 
@@ -34,6 +35,10 @@ pub struct BuildArgs {
     /// Interactive guided build using Brenner Method
     #[arg(long)]
     pub guided: bool,
+
+    /// Use rich TUI interface for guided mode
+    #[arg(long)]
+    pub tui: bool,
 
     /// Skill name (required for non-interactive builds)
     #[arg(long)]
@@ -256,7 +261,7 @@ fn run_guided(ctx: &AppContext, args: &BuildArgs, cm_context: Option<&CmBuildCon
         output_dir: output_dir.clone(),
     };
 
-    let mut wizard = BrennerWizard::new(&query, config);
+    let mut wizard = BrennerWizard::new(&query, config.clone());
 
     // Show CM suggestions if available
     if let Some(cm_ctx) = cm_context {
@@ -289,38 +294,44 @@ fn run_guided(ctx: &AppContext, args: &BuildArgs, cm_context: Option<&CmBuildCon
         return Ok(());
     }
 
-    // Run interactive wizard
-    match run_interactive(&mut wizard, &client, &quality_scorer)? {
+    // Run interactive wizard - TUI or text mode
+    let result = if args.tui {
+        run_build_tui(&query, config, &client, &quality_scorer)?
+    } else {
+        run_interactive(&mut wizard, &client, &quality_scorer)?
+    };
+
+    match result {
         WizardOutput::Success {
             skill_path,
             manifest_path,
             calibration_path,
+            draft,
+            manifest_json,
         } => {
-            // Write outputs
-            if let Some(draft) = get_draft_from_wizard(&wizard) {
-                let skill_md = wizard.generate_skill_md(&draft);
-                fs::write(&skill_path, &skill_md)?;
+            // Write outputs using draft from WizardOutput
+            let skill_md = generate_skill_md(&draft);
+            fs::write(&skill_path, &skill_md)?;
 
-                let manifest = wizard.generate_manifest()?;
-                fs::write(&manifest_path, &manifest)?;
+            // Use the pre-generated manifest_json from WizardOutput
+            fs::write(&manifest_path, &manifest_json)?;
 
-                // Write calibration notes
-                let calibration = if draft.calibration.is_empty() {
-                    "# Calibration Notes\n\nNo calibration notes recorded.\n".to_string()
-                } else {
-                    let mut cal = "# Calibration Notes\n\n".to_string();
-                    for note in &draft.calibration {
-                        cal.push_str(&format!("- {}\n", note));
-                    }
-                    cal
-                };
-                fs::write(&calibration_path, calibration)?;
+            // Write calibration notes
+            let calibration = if draft.calibration.is_empty() {
+                "# Calibration Notes\n\nNo calibration notes recorded.\n".to_string()
+            } else {
+                let mut cal = "# Calibration Notes\n\n".to_string();
+                for note in &draft.calibration {
+                    cal.push_str(&format!("- {}\n", note));
+                }
+                cal
+            };
+            fs::write(&calibration_path, calibration)?;
 
-                println!("\n{} Build complete!", "Success:".green());
-                println!("  Skill: {}", skill_path.display());
-                println!("  Manifest: {}", manifest_path.display());
-                println!("  Calibration: {}", calibration_path.display());
-            }
+            println!("\n{} Build complete!", "Success:".green());
+            println!("  Skill: {}", skill_path.display());
+            println!("  Manifest: {}", manifest_path.display());
+            println!("  Calibration: {}", calibration_path.display());
         }
         WizardOutput::Cancelled {
             reason,
@@ -1243,14 +1254,3 @@ fn format_uncertainty_reason(reason: &crate::cass::UncertaintyReason) -> String 
     }
 }
 
-/// Extract draft from wizard state (helper)
-fn get_draft_from_wizard(
-    wizard: &BrennerWizard,
-) -> Option<crate::cass::brenner::BrennerSkillDraft> {
-    match wizard.state() {
-        crate::cass::brenner::WizardState::Complete { draft, .. } => Some(draft.clone()),
-        crate::cass::brenner::WizardState::SkillFormalization { draft, .. } => Some(draft.clone()),
-        crate::cass::brenner::WizardState::MaterializationTest { draft, .. } => Some(draft.clone()),
-        _ => None,
-    }
-}

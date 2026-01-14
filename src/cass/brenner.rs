@@ -280,11 +280,68 @@ pub enum WizardOutput {
         skill_path: PathBuf,
         manifest_path: PathBuf,
         calibration_path: PathBuf,
+        /// The completed draft for file generation
+        draft: BrennerSkillDraft,
+        /// Pre-generated manifest JSON
+        manifest_json: String,
     },
     Cancelled {
         reason: String,
         checkpoint_id: Option<String>,
     },
+}
+
+/// Generate SKILL.md content from a draft (standalone function)
+pub fn generate_skill_md(draft: &BrennerSkillDraft) -> String {
+    let mut md = String::new();
+
+    md.push_str(&format!("# {}\n\n", draft.name));
+    md.push_str(&format!("{}\n\n", draft.description));
+
+    if !draft.rules.is_empty() {
+        md.push_str("## Rules\n\n");
+        for rule in &draft.rules {
+            md.push_str(&format!(
+                "### {} (confidence: {:.0}%)\n\n",
+                rule.id,
+                rule.confidence * 100.0
+            ));
+            md.push_str(&format!("{}\n\n", rule.description));
+            if !rule.evidence.is_empty() {
+                md.push_str("**Evidence:**\n");
+                for ev in &rule.evidence {
+                    md.push_str(&format!("- {}\n", ev));
+                }
+                md.push_str("\n");
+            }
+        }
+    }
+
+    if !draft.examples.is_empty() {
+        md.push_str("## Examples\n\n");
+        for example in &draft.examples {
+            md.push_str(&format!("### {}\n\n", example.title));
+            md.push_str(&format!("**Context:** {}\n\n", example.context));
+            md.push_str(&format!("```\n{}\n```\n\n", example.content));
+        }
+    }
+
+    if !draft.avoid_when.is_empty() {
+        md.push_str("## Avoid When\n\n");
+        for avoid in &draft.avoid_when {
+            md.push_str(&format!("- {}\n", avoid));
+        }
+        md.push_str("\n");
+    }
+
+    if !draft.calibration.is_empty() {
+        md.push_str("## Calibration Notes\n\n");
+        for cal in &draft.calibration {
+            md.push_str(&format!("- {}\n", cal));
+        }
+    }
+
+    md
 }
 
 // =============================================================================
@@ -668,14 +725,19 @@ impl BrennerWizard {
             output_dir: output_dir.clone(),
             skill_path: skill_path.clone(),
             manifest_path: manifest_path.clone(),
-            draft,
+            draft: draft.clone(),
         };
         self.checkpoint.update(self.state.clone());
+
+        // Generate manifest JSON
+        let manifest_json = self.generate_manifest()?;
 
         Ok(WizardOutput::Success {
             skill_path,
             manifest_path,
             calibration_path,
+            draft,
+            manifest_json,
         })
     }
 
@@ -700,57 +762,9 @@ impl BrennerWizard {
     // Serialization
     // =========================================================================
 
-    /// Generate SKILL.md content
+    /// Generate SKILL.md content (delegates to standalone function)
     pub fn generate_skill_md(&self, draft: &BrennerSkillDraft) -> String {
-        let mut md = String::new();
-
-        md.push_str(&format!("# {}\n\n", draft.name));
-        md.push_str(&format!("{}\n\n", draft.description));
-
-        if !draft.rules.is_empty() {
-            md.push_str("## Rules\n\n");
-            for rule in &draft.rules {
-                md.push_str(&format!(
-                    "### {} (confidence: {:.0}%)\n\n",
-                    rule.id,
-                    rule.confidence * 100.0
-                ));
-                md.push_str(&format!("{}\n\n", rule.description));
-                if !rule.evidence.is_empty() {
-                    md.push_str("**Evidence:**\n");
-                    for ev in &rule.evidence {
-                        md.push_str(&format!("- {}\n", ev));
-                    }
-                    md.push_str("\n");
-                }
-            }
-        }
-
-        if !draft.examples.is_empty() {
-            md.push_str("## Examples\n\n");
-            for example in &draft.examples {
-                md.push_str(&format!("### {}\n\n", example.title));
-                md.push_str(&format!("**Context:** {}\n\n", example.context));
-                md.push_str(&format!("```\n{}\n```\n\n", example.content));
-            }
-        }
-
-        if !draft.avoid_when.is_empty() {
-            md.push_str("## Avoid When\n\n");
-            for avoid in &draft.avoid_when {
-                md.push_str(&format!("- {}\n", avoid));
-            }
-            md.push_str("\n");
-        }
-
-        if !draft.calibration.is_empty() {
-            md.push_str("## Calibration Notes\n\n");
-            for cal in &draft.calibration {
-                md.push_str(&format!("- {}\n", cal));
-            }
-        }
-
-        md
+        generate_skill_md(draft)
     }
 
     /// Generate mining manifest JSON
@@ -1111,17 +1125,20 @@ pub fn run_interactive(
                 }
             }
 
-            WizardState::Complete { skill_path, manifest_path, .. } => {
+            WizardState::Complete { skill_path, manifest_path, draft, .. } => {
                 println!("\n{}", "=".repeat(60));
                 println!("BRENNER WIZARD - Complete!");
                 println!("{}", "=".repeat(60));
                 println!("\nOutputs:");
                 println!("  Skill: {}", skill_path.display());
                 println!("  Manifest: {}", manifest_path.display());
+                let manifest_json = wizard.generate_manifest()?;
                 return Ok(WizardOutput::Success {
                     skill_path: skill_path.clone(),
                     manifest_path: manifest_path.clone(),
                     calibration_path: wizard.config.output_dir.join("calibration.md"),
+                    draft: draft.clone(),
+                    manifest_json,
                 });
             }
 
