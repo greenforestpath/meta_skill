@@ -101,6 +101,10 @@ All `ms security * --robot` commands should emit JSON only. Suggested shapes:
 { "ok": true, "acip_version": "1.3", "audit_mode": false }
 ```
 
+Review/replay behaviors:
+- `review` validates flags and records intent (persistence TBD).
+- `replay` returns safe excerpt only; raw content is never emitted.
+
 ```json
 {
   "scan": {

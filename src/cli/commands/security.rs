@@ -56,6 +56,25 @@ pub enum QuarantineCommand {
         /// Quarantine record id
         id: String,
     },
+    /// Review a quarantine record (mark injection or false-positive)
+    Review {
+        /// Quarantine record id
+        id: String,
+        /// Confirm this is a prompt-injection attempt
+        #[arg(long)]
+        confirm_injection: bool,
+        /// Mark as false-positive with a reason
+        #[arg(long)]
+        false_positive: Option<String>,
+    },
+    /// Replay a quarantined item (safe excerpt only)
+    Replay {
+        /// Quarantine record id
+        id: String,
+        /// Explicit acknowledgement to view content
+        #[arg(long)]
+        i_understand_the_risks: bool,
+    },
 }
 
 #[derive(Serialize)]
@@ -73,6 +92,23 @@ struct StatusOutput {
 struct VersionOutput {
     configured: String,
     detected: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ReviewOutput {
+    quarantine_id: String,
+    action: String,
+    reason: Option<String>,
+    persisted: bool,
+}
+
+#[derive(Serialize)]
+struct ReplayOutput {
+    quarantine_id: String,
+    session_id: String,
+    message_index: usize,
+    safe_excerpt: String,
+    note: String,
 }
 
 pub fn run(ctx: &AppContext, args: &SecurityArgs) -> Result<()> {
@@ -150,7 +186,76 @@ fn quarantine(ctx: &AppContext, args: &QuarantineArgs) -> Result<()> {
                 }
             }
         }
+        QuarantineCommand::Review {
+            id,
+            confirm_injection,
+            false_positive,
+        } => review_quarantine(ctx, id, *confirm_injection, false_positive.as_deref()),
+        QuarantineCommand::Replay {
+            id,
+            i_understand_the_risks,
+        } => replay_quarantine(ctx, id, *i_understand_the_risks),
     }
+}
+
+fn review_quarantine(
+    ctx: &AppContext,
+    id: &str,
+    confirm_injection: bool,
+    false_positive: Option<&str>,
+) -> Result<()> {
+    if confirm_injection && false_positive.is_some() {
+        return Err(MsError::Config(
+            "cannot use --confirm-injection with --false-positive".to_string(),
+        ));
+    }
+    if !confirm_injection && false_positive.is_none() {
+        return Err(MsError::Config(
+            "must set --confirm-injection or --false-positive <reason>".to_string(),
+        ));
+    }
+
+    let record = ctx
+        .db
+        .get_quarantine_record(id)?
+        .ok_or_else(|| MsError::Config(format!("quarantine record not found: {id}")))?;
+
+    let (action, reason) = if confirm_injection {
+        ("confirm_injection".to_string(), None)
+    } else {
+        (
+            "false_positive".to_string(),
+            false_positive.map(|value| value.to_string()),
+        )
+    };
+
+    let payload = ReviewOutput {
+        quarantine_id: record.quarantine_id,
+        action,
+        reason,
+        persisted: false,
+    };
+    emit_output(ctx, &payload)
+}
+
+fn replay_quarantine(ctx: &AppContext, id: &str, ack: bool) -> Result<()> {
+    if !ack {
+        return Err(MsError::ApprovalRequired(
+            "replay requires --i-understand-the-risks".to_string(),
+        ));
+    }
+    let record = ctx
+        .db
+        .get_quarantine_record(id)?
+        .ok_or_else(|| MsError::Config(format!("quarantine record not found: {id}")))?;
+    let payload = ReplayOutput {
+        quarantine_id: record.quarantine_id,
+        session_id: record.session_id,
+        message_index: record.message_index,
+        safe_excerpt: record.safe_excerpt,
+        note: "Replay shows safe excerpt only; raw content is withheld.".to_string(),
+    };
+    emit_output(ctx, &payload)
 }
 
 fn parse_source(raw: &str) -> Result<ContentSource> {
