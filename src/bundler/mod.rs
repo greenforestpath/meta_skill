@@ -6,9 +6,11 @@ pub mod install;
 pub mod local_safety;
 pub mod manifest;
 pub mod package;
+pub mod registry;
 
 pub use blob::BlobStore;
 pub use install::{install, install_with_options, InstallOptions, InstallReport};
+pub use registry::{BundleRegistry, InstallSource, InstalledBundle, ParsedSource};
 pub use local_safety::{
     detect_conflicts, detect_modifications, hash_directory, hash_file, ConflictDetail,
     ConflictStrategy, FileStatus, ModificationStatus, ModificationSummary, ResolutionResult,

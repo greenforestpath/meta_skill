@@ -7,8 +7,9 @@ use clap::{Args, Subcommand};
 
 use crate::app::AppContext;
 use crate::bundler::github::{download_bundle, download_url, publish_bundle, GitHubConfig};
-use crate::bundler::install::{install as install_bundle, InstallReport};
+use crate::bundler::install::InstallReport;
 use crate::bundler::local_safety::{detect_modifications, ModificationStatus, SkillModificationReport};
+use crate::bundler::registry::{BundleRegistry, InstallSource, InstalledBundle, ParsedSource};
 use crate::bundler::{Bundle, BundleInfo, BundleManifest, BundledSkill};
 use crate::cli::output::emit_json;
 use crate::error::{MsError, Result};
@@ -27,8 +28,12 @@ pub enum BundleCommand {
     Publish(BundlePublishArgs),
     /// Install a bundle
     Install(BundleInstallArgs),
+    /// Remove an installed bundle
+    Remove(BundleRemoveArgs),
     /// List installed bundles
     List,
+    /// Show details of a bundle
+    Show(BundleShowArgs),
     /// Check for local modifications and conflicts
     Conflicts(BundleConflictsArgs),
 }
@@ -109,6 +114,38 @@ pub struct BundleInstallArgs {
     /// Asset name to download
     #[arg(long)]
     pub asset_name: Option<String>,
+
+    /// Skip signature and checksum verification (not recommended)
+    #[arg(long)]
+    pub no_verify: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct BundleShowArgs {
+    /// Bundle source (path, URL, or repo)
+    pub source: String,
+
+    /// GitHub token (overrides env)
+    #[arg(long)]
+    pub token: Option<String>,
+
+    /// Release tag (for repo sources)
+    #[arg(long)]
+    pub tag: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct BundleRemoveArgs {
+    /// Bundle ID to remove
+    pub bundle_id: String,
+
+    /// Remove installed skills as well
+    #[arg(long)]
+    pub remove_skills: bool,
+
+    /// Force removal without confirmation
+    #[arg(long, short = 'f')]
+    pub force: bool,
 }
 
 #[derive(Args, Debug)]
@@ -137,8 +174,10 @@ pub fn run(_ctx: &AppContext, _args: &BundleArgs) -> Result<()> {
     match &args.command {
         BundleCommand::Create(create) => run_create(ctx, create),
         BundleCommand::Install(install) => run_install(ctx, install),
+        BundleCommand::Remove(remove) => run_remove(ctx, remove),
         BundleCommand::Publish(publish) => run_publish(ctx, publish),
         BundleCommand::List => run_list(ctx),
+        BundleCommand::Show(show) => run_show(ctx, show),
         BundleCommand::Conflicts(conflicts) => run_conflicts(ctx, conflicts),
     }
 }
@@ -261,32 +300,81 @@ fn run_create(ctx: &AppContext, args: &BundleCreateArgs) -> Result<()> {
 }
 
 fn run_install(ctx: &AppContext, args: &BundleInstallArgs) -> Result<()> {
-    let local_path = expand_local_path(&args.source);
-    let bytes = if local_path.exists() {
-        std::fs::read(&local_path).map_err(|err| {
-            MsError::Config(format!("read {}: {err}", local_path.display()))
-        })?
-    } else if looks_like_path(&args.source) {
-        return Err(MsError::ValidationFailed(format!(
-            "bundle source not found: {}",
-            local_path.display()
-        )));
-    } else if args.source.starts_with("http://") || args.source.starts_with("https://") {
-        download_url(&args.source, args.token.clone())?
-    } else if let Some((repo, tag)) = split_repo_tag(&args.source) {
-        let tag = args.tag.as_deref().or(tag);
-        let download = download_bundle(repo, tag, args.asset_name.as_deref(), args.token.clone())?;
-        download.bytes
-    } else {
-        return Err(MsError::ValidationFailed(format!(
-            "bundle source not found: {}",
-            args.source
-        )));
+    // Parse the source using the new ParsedSource
+    let parsed = ParsedSource::parse(&args.source)?;
+
+    // Override tag and asset from args if provided
+    let source = match parsed.source {
+        InstallSource::GitHub { repo, tag, asset } => InstallSource::GitHub {
+            repo,
+            tag: args.tag.clone().or(tag),
+            asset: args.asset_name.clone().or(asset),
+        },
+        other => other,
     };
+
+    // Download or read the bundle bytes
+    let bytes = match &source {
+        InstallSource::File { path } => {
+            let local_path = PathBuf::from(path);
+            if !local_path.exists() {
+                return Err(MsError::ValidationFailed(format!(
+                    "bundle source not found: {}",
+                    local_path.display()
+                )));
+            }
+            std::fs::read(&local_path).map_err(|err| {
+                MsError::Config(format!("read {}: {err}", local_path.display()))
+            })?
+        }
+        InstallSource::Url { url } => {
+            download_url(url, args.token.clone())?
+        }
+        InstallSource::GitHub { repo, tag, asset } => {
+            let download = download_bundle(
+                repo,
+                tag.as_deref(),
+                asset.as_deref(),
+                args.token.clone(),
+            )?;
+            download.bytes
+        }
+    };
+
     let package = crate::bundler::package::BundlePackage::from_bytes(&bytes)?;
+    let bundle_id = package.manifest.bundle.id.clone();
+    let bundle_version = package.manifest.bundle.version.clone();
+    let checksum = package.manifest.checksum.clone();
+
+    // Check if already installed
+    let mut registry = BundleRegistry::open(ctx.git.root())?;
+    if registry.is_installed(&bundle_id) && !args.no_verify {
+        return Err(MsError::ValidationFailed(format!(
+            "bundle {} is already installed; use ms bundle remove first",
+            bundle_id
+        )));
+    }
 
     let only = normalize_skill_list(&args.skills);
-    let report = install_bundle(&package, ctx.git.root(), &only)?;
+
+    // Install with verification (unless --no-verify is specified)
+    let options = if args.no_verify {
+        crate::bundler::InstallOptions::<crate::bundler::manifest::NoopSignatureVerifier>::allow_unsigned()
+    } else {
+        crate::bundler::InstallOptions::default()
+    };
+    let report = crate::bundler::install_with_options(&package, ctx.git.root(), &only, &options)?;
+
+    // Register the installation
+    let installed = InstalledBundle {
+        id: bundle_id,
+        version: bundle_version,
+        source: source.clone(),
+        installed_at: chrono::Utc::now(),
+        skills: report.installed.clone(),
+        checksum,
+    };
+    registry.register(installed)?;
 
     if ctx.robot_mode {
         return emit_json(&report);
@@ -490,6 +578,90 @@ fn run_list(ctx: &AppContext) -> Result<()> {
     Ok(())
 }
 
+fn run_show(ctx: &AppContext, args: &BundleShowArgs) -> Result<()> {
+    let local_path = expand_local_path(&args.source);
+    let bytes = if local_path.exists() {
+        std::fs::read(&local_path).map_err(|err| {
+            MsError::Config(format!("read {}: {err}", local_path.display()))
+        })?
+    } else if looks_like_path(&args.source) {
+        return Err(MsError::ValidationFailed(format!(
+            "bundle source not found: {}",
+            local_path.display()
+        )));
+    } else if args.source.starts_with("http://") || args.source.starts_with("https://") {
+        download_url(&args.source, args.token.clone())?
+    } else if let Some((repo, tag)) = split_repo_tag(&args.source) {
+        let tag = args.tag.as_deref().or(tag);
+        let download = download_bundle(repo, tag, None, args.token.clone())?;
+        download.bytes
+    } else {
+        return Err(MsError::ValidationFailed(format!(
+            "bundle source not found: {}",
+            args.source
+        )));
+    };
+    let package = crate::bundler::package::BundlePackage::from_bytes(&bytes)?;
+    let manifest = &package.manifest;
+
+    if ctx.robot_mode {
+        return emit_json(&BundleShowReport {
+            id: manifest.bundle.id.clone(),
+            name: manifest.bundle.name.clone(),
+            version: manifest.bundle.version.clone(),
+            description: manifest.bundle.description.clone(),
+            authors: manifest.bundle.authors.clone(),
+            license: manifest.bundle.license.clone(),
+            repository: manifest.bundle.repository.clone(),
+            keywords: manifest.bundle.keywords.clone(),
+            ms_version: manifest.bundle.ms_version.clone(),
+            skills: manifest.skills.iter().map(|s| s.name.clone()).collect(),
+            skill_count: manifest.skills.len(),
+            checksum: manifest.checksum.clone(),
+            signed: !manifest.signatures.is_empty(),
+        });
+    }
+
+    println!("Bundle: {} ({})", manifest.bundle.name, manifest.bundle.id);
+    println!("Version: {}", manifest.bundle.version);
+    if let Some(desc) = &manifest.bundle.description {
+        println!("Description: {}", desc);
+    }
+    if !manifest.bundle.authors.is_empty() {
+        println!("Authors: {}", manifest.bundle.authors.join(", "));
+    }
+    if let Some(license) = &manifest.bundle.license {
+        println!("License: {}", license);
+    }
+    if let Some(repo) = &manifest.bundle.repository {
+        println!("Repository: {}", repo);
+    }
+    if !manifest.bundle.keywords.is_empty() {
+        println!("Keywords: {}", manifest.bundle.keywords.join(", "));
+    }
+    if let Some(ms_ver) = &manifest.bundle.ms_version {
+        println!("MS Version: {}", ms_ver);
+    }
+
+    println!("\nSkills ({}):", manifest.skills.len());
+    for skill in &manifest.skills {
+        let version_str = skill.version.as_deref().unwrap_or("-");
+        let optional_str = if skill.optional { " (optional)" } else { "" };
+        println!("  - {} v{}{}", skill.name, version_str, optional_str);
+    }
+
+    if let Some(checksum) = &manifest.checksum {
+        println!("\nChecksum: {}", checksum);
+    }
+    if manifest.signatures.is_empty() {
+        println!("Signed: no");
+    } else {
+        println!("Signed: yes ({} signature(s))", manifest.signatures.len());
+    }
+
+    Ok(())
+}
+
 fn normalize_skill_list(values: &[String]) -> Vec<String> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
@@ -589,6 +761,23 @@ struct BundleCreateReport {
 struct BundleListReport {
     bundles: Vec<String>,
     count: usize,
+}
+
+#[derive(serde::Serialize)]
+struct BundleShowReport {
+    id: String,
+    name: String,
+    version: String,
+    description: Option<String>,
+    authors: Vec<String>,
+    license: Option<String>,
+    repository: Option<String>,
+    keywords: Vec<String>,
+    ms_version: Option<String>,
+    skills: Vec<String>,
+    skill_count: usize,
+    checksum: Option<String>,
+    signed: bool,
 }
 
 #[derive(serde::Serialize)]
