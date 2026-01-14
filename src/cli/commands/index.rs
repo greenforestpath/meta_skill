@@ -280,11 +280,18 @@ fn index_skill_file(
     let spec = parse_markdown(&content)
         .map_err(|e| MsError::InvalidSkill(format!("{}: {}", path.display(), e)))?;
 
+    if spec.metadata.id.trim().is_empty() {
+        return Err(MsError::InvalidSkill(format!(
+            "{}: missing skill id",
+            path.display()
+        )));
+    }
+
     // Check if already indexed (unless force)
     if !force {
         if let Ok(Some(existing)) = ctx.db.get_skill(&spec.metadata.id) {
             // Check content hash to skip unchanged skills
-            let new_hash = compute_content_hash(&content);
+            let new_hash = compute_spec_hash(&spec)?;
             if existing.content_hash == new_hash {
                 return Ok(()); // Skip unchanged
             }
@@ -297,11 +304,13 @@ fn index_skill_file(
     Ok(())
 }
 
-fn compute_content_hash(content: &str) -> String {
+fn compute_spec_hash(spec: &crate::core::SkillSpec) -> Result<String> {
     use sha2::{Digest, Sha256};
 
+    let json = serde_json::to_string(spec)
+        .map_err(|e| MsError::InvalidSkill(format!("serialize spec for hash: {e}")))?;
     let mut hasher = Sha256::new();
-    hasher.update(content.as_bytes());
+    hasher.update(json.as_bytes());
     let result = hasher.finalize();
-    hex::encode(result)
+    Ok(hex::encode(result))
 }

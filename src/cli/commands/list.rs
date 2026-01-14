@@ -12,7 +12,7 @@ pub struct ListArgs {
     #[arg(long, short)]
     pub tags: Vec<String>,
 
-    /// Filter by layer: system, global, project, session
+    /// Filter by layer: base, org, project, user
     #[arg(long)]
     pub layer: Option<String>,
 
@@ -39,9 +39,10 @@ pub fn run(ctx: &AppContext, args: &ListArgs) -> Result<()> {
 
     // Filter by layer if specified
     let skills: Vec<_> = if let Some(ref layer) = args.layer {
+        let normalized = normalize_layer(layer);
         skills
             .into_iter()
-            .filter(|s| s.source_layer == *layer)
+            .filter(|s| normalize_layer(&s.source_layer) == normalized)
             .collect()
     } else {
         skills
@@ -110,12 +111,12 @@ fn list_human(_ctx: &AppContext, skills: &[crate::storage::sqlite::SkillRecord],
     println!("{}", "─".repeat(84).dimmed());
 
     for skill in skills {
-        let layer = skill.source_layer.as_str();
-        let layer_colored = match layer {
-            "system" => layer.blue(),
-            "global" => layer.green(),
+        let layer = normalize_layer(&skill.source_layer);
+        let layer_colored = match layer.as_str() {
+            "base" => layer.blue(),
+            "org" => layer.green(),
             "project" => layer.yellow(),
-            "local" => layer.magenta(),
+            "user" => layer.magenta(),
             _ => layer.normal(),
         };
 
@@ -187,4 +188,14 @@ fn list_robot(_ctx: &AppContext, skills: &[crate::storage::sqlite::SkillRecord])
     );
 
     Ok(())
+}
+
+fn normalize_layer(input: &str) -> String {
+    match input.to_lowercase().as_str() {
+        "system" => "base",
+        "global" => "org",
+        "local" => "user",
+        other => other,
+    }
+    .to_string()
 }

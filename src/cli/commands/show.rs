@@ -66,12 +66,12 @@ fn show_human(
     }
 
     // Layer
-    let layer = &skill.source_layer;
+    let layer = normalize_layer(&skill.source_layer);
     let layer_colored = match layer.as_str() {
-        "system" => layer.blue(),
-        "global" => layer.green(),
+        "base" => layer.blue(),
+        "org" => layer.green(),
         "project" => layer.yellow(),
-        "local" => layer.magenta(),
+        "user" => layer.magenta(),
         _ => layer.normal(),
     };
     println!("{}: {}", "Layer".dimmed(), layer_colored);
@@ -146,15 +146,15 @@ fn show_human(
         println!();
         println!("{}", "Dependencies".bold());
         println!("{}", "─".repeat(40).dimmed());
-        // Parse metadata for dependencies
+        // Parse metadata for requires list
         if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&skill.metadata_json) {
-            if let Some(deps) = meta.get("dependencies").and_then(|d| d.as_array()) {
-                if deps.is_empty() {
+            if let Some(requires) = meta.get("requires").and_then(|d| d.as_array()) {
+                if requires.is_empty() {
                     println!("{}", "No dependencies".dimmed());
                 } else {
-                    for dep in deps {
-                        if let Some(dep_str) = dep.as_str() {
-                            println!("  → {}", dep_str);
+                    for req in requires {
+                        if let Some(req_str) = req.as_str() {
+                            println!("  → {}", req_str);
                         }
                     }
                 }
@@ -205,10 +205,10 @@ fn show_robot(
     }
 
     if args.deps {
-        // Parse dependencies from metadata
+        // Parse requires from metadata
         if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&skill.metadata_json) {
             output["skill"]["dependencies"] = meta
-                .get("dependencies")
+                .get("requires")
                 .cloned()
                 .unwrap_or(serde_json::Value::Array(vec![]));
         }
@@ -226,4 +226,14 @@ fn format_date(datetime: &str) -> String {
         .next()
         .unwrap_or(datetime)
         .to_string()
+}
+
+fn normalize_layer(input: &str) -> String {
+    match input.to_lowercase().as_str() {
+        "system" => "base",
+        "global" => "org",
+        "local" => "user",
+        other => other,
+    }
+    .to_string()
 }

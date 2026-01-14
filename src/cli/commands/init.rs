@@ -171,12 +171,17 @@ global = []
 community = []
 
 [search]
-# Maximum results to return
-max_results = 20
+# Embedding backend configuration
+use_embeddings = true
+embedding_backend = "hash"
+embedding_dims = 384
+bm25_weight = 0.5
+semantic_weight = 0.5
 
 [robot]
 # Default robot mode format
 format = "json"
+include_metadata = true
 "#
     } else {
         r#"# ms configuration (project-local)
@@ -189,8 +194,12 @@ project = ["./skills"]
 local = []
 
 [search]
-# Maximum results to return
-max_results = 20
+# Embedding backend configuration
+use_embeddings = true
+embedding_backend = "hash"
+embedding_dims = 384
+bm25_weight = 0.5
+semantic_weight = 0.5
 "#
     };
 

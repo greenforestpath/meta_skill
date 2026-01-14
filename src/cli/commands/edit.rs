@@ -7,6 +7,7 @@ use std::process::Command;
 
 use crate::app::AppContext;
 use crate::cli::commands::resolve_skill_markdown;
+use crate::core::{SkillMetadata};
 use crate::core::spec_lens::{compile_markdown, parse_markdown};
 use crate::error::Result;
 
@@ -38,8 +39,13 @@ pub fn run(_ctx: &AppContext, _args: &EditArgs) -> Result<()> {
         crate::error::MsError::Config(format!("read {}: {err}", skill_md.display()))
     })?;
     let spec = parse_markdown(&raw)?;
-    let yaml = serde_yaml::to_string(&spec)
-        .map_err(|err| crate::error::MsError::Config(format!("serialize spec: {err}")))?;
+    let yaml = if args.meta {
+        serde_yaml::to_string(&spec.metadata)
+            .map_err(|err| crate::error::MsError::Config(format!("serialize metadata: {err}")))?
+    } else {
+        serde_yaml::to_string(&spec)
+            .map_err(|err| crate::error::MsError::Config(format!("serialize spec: {err}")))?
+    };
 
     if let Some(parent) = edit_path.parent() {
         std::fs::create_dir_all(parent).map_err(|err| {
@@ -60,8 +66,17 @@ pub fn run(_ctx: &AppContext, _args: &EditArgs) -> Result<()> {
     let updated_yaml = std::fs::read_to_string(&edit_path).map_err(|err| {
         crate::error::MsError::Config(format!("read {}: {err}", edit_path.display()))
     })?;
-    let updated_spec: crate::core::SkillSpec = serde_yaml::from_str(&updated_yaml)
-        .map_err(|err| crate::error::MsError::ValidationFailed(format!("spec parse: {err}")))?;
+    let updated_spec = if args.meta {
+        let updated_meta: SkillMetadata = serde_yaml::from_str(&updated_yaml).map_err(|err| {
+            crate::error::MsError::ValidationFailed(format!("metadata parse: {err}"))
+        })?;
+        let mut updated = spec.clone();
+        updated.metadata = updated_meta;
+        updated
+    } else {
+        serde_yaml::from_str(&updated_yaml)
+            .map_err(|err| crate::error::MsError::ValidationFailed(format!("spec parse: {err}")))?
+    };
     let formatted = compile_markdown(&updated_spec);
     std::fs::write(&skill_md, formatted).map_err(|err| {
         crate::error::MsError::Config(format!("write {}: {err}", skill_md.display()))
