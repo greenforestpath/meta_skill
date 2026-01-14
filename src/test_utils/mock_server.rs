@@ -202,8 +202,6 @@ impl MockRegistryServer {
         let base_url = server.base_url();
 
         // Set up default GitHub API mock handlers
-        let state_clone = Arc::clone(&state);
-
         // Mock GET /repos/{owner}/{repo}/releases/tags/{tag}
         server.mock(|when, then| {
             when.method(GET)
