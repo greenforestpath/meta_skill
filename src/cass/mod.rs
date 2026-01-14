@@ -4,8 +4,9 @@
 
 pub mod client;
 pub mod mining;
-pub mod synthesis;
+pub mod quality;
 pub mod refinement;
+pub mod synthesis;
 
 // Re-export main types
 pub use client::{
@@ -13,4 +14,5 @@ pub use client::{
     SessionMatch, SessionMessage, SessionMetadata, ToolCall, ToolResult,
 };
 pub use mining::{Pattern, PatternType};
+pub use quality::{MissingSignal, QualityConfig, QualityScorer, SessionQuality};
 pub use synthesis::SkillDraft;
