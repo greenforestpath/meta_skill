@@ -8,6 +8,7 @@ pub mod quality;
 pub mod refinement;
 pub mod synthesis;
 pub mod transformation;
+pub mod uncertainty;
 
 // Re-export main types
 pub use client::{
@@ -23,4 +24,10 @@ pub use transformation::{
     GeneralPattern, GeneralizationRefiner, GeneralizationValidation, InstanceCluster,
     RefinementCritique, SpecificInstance, SpecificToGeneralTransformer, TransformerConfig,
     UncertaintyQueueSink,
+};
+pub use uncertainty::{
+    DefaultQueryGenerator, DefaultResolver, QueryGenerator, QueryResults, QueryType,
+    Resolution, ResolutionAttempt, ResolutionResult, SuggestedQuery, UncertaintyCounts,
+    UncertaintyConfig, UncertaintyId, UncertaintyItem, UncertaintyQueue, UncertaintyReason,
+    UncertaintyResolver, UncertaintyStatus,
 };
