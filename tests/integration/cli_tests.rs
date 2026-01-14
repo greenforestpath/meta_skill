@@ -320,7 +320,7 @@ fn test_build_auto_no_cass_available() {
 
 #[test]
 fn test_build_safety_warning_flags() {
-    let mut fixture = TestFixture::new("test_build_safety_warning_flags");
+    let fixture = TestFixture::new("test_build_safety_warning_flags");
     let init = fixture.init();
     assert!(init.success, "init failed");
 
