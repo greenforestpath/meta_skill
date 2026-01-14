@@ -1,9 +1,38 @@
 //! Round-trip spec <-> markdown mapping
 
-use crate::error::Result;
+use serde_json::Value as JsonValue;
+
+use crate::error::{MsError, Result};
 use super::skill::{BlockType, SkillBlock, SkillMetadata, SkillSection, SkillSpec};
 
-/// Parse a SKILL.md file into a SkillSpec
+/// Bidirectional mapping between SkillSpec and SKILL.md.
+pub struct SpecLens;
+
+impl SpecLens {
+    /// Compile a SkillSpec to deterministic markdown.
+    pub fn compile(&self, spec: &SkillSpec) -> String {
+        compile_markdown(spec)
+    }
+
+    /// Parse markdown into a SkillSpec.
+    pub fn parse(&self, md: &str) -> Result<SkillSpec> {
+        parse_markdown(md)
+    }
+
+    /// Verify round-trip stability for a spec.
+    pub fn verify_roundtrip(&self, spec: &SkillSpec) -> Result<()> {
+        let md = self.compile(spec);
+        let parsed = self.parse(&md)?;
+        if !spec_equivalent(spec, &parsed)? {
+            return Err(MsError::ValidationFailed(
+                "round-trip spec mismatch".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Parse a SKILL.md file into a SkillSpec.
 pub fn parse_markdown(content: &str) -> Result<SkillSpec> {
     let mut name = String::new();
     let mut description_lines = Vec::new();
@@ -11,6 +40,25 @@ pub fn parse_markdown(content: &str) -> Result<SkillSpec> {
 
     let mut current_section: Option<SkillSection> = None;
     let mut in_description = false;
+    let mut in_code_block = false;
+    let mut code_lines: Vec<String> = Vec::new();
+    let mut paragraph_lines: Vec<String> = Vec::new();
+
+    let mut flush_paragraph = |section: &mut SkillSection, lines: &mut Vec<String>| {
+        if lines.is_empty() {
+            return;
+        }
+        let content = lines.join("\n").trim_end().to_string();
+        lines.clear();
+        if content.is_empty() {
+            return;
+        }
+        section.blocks.push(SkillBlock {
+            id: format!("{}-block-{}", section.id, section.blocks.len() + 1),
+            block_type: BlockType::Text,
+            content,
+        });
+    };
 
     for line in content.lines() {
         if let Some(title) = line.strip_prefix("# ") {
@@ -20,6 +68,9 @@ pub fn parse_markdown(content: &str) -> Result<SkillSpec> {
         }
 
         if let Some(title) = line.strip_prefix("## ") {
+            if let Some(section) = current_section.as_mut() {
+                flush_paragraph(section, &mut paragraph_lines);
+            }
             if let Some(section) = current_section.take() {
                 sections.push(section);
             }
@@ -38,19 +89,57 @@ pub fn parse_markdown(content: &str) -> Result<SkillSpec> {
                     in_description = false;
                 }
             } else {
-                description_lines.push(line.trim().to_string());
+                description_lines.push(line.trim_end().to_string());
             }
             continue;
         }
 
-        if let Some(section) = current_section.as_mut() {
-            if !line.trim().is_empty() {
+        let Some(section) = current_section.as_mut() else {
+            continue;
+        };
+
+        if line.trim_start().starts_with("```") {
+            if in_code_block {
+                code_lines.push(line.to_string());
+                let content = code_lines.join("\n");
+                code_lines.clear();
+                in_code_block = false;
+                flush_paragraph(section, &mut paragraph_lines);
                 section.blocks.push(SkillBlock {
                     id: format!("{}-block-{}", section.id, section.blocks.len() + 1),
-                    block_type: BlockType::Text,
-                    content: line.to_string(),
+                    block_type: BlockType::Code,
+                    content,
                 });
+            } else {
+                flush_paragraph(section, &mut paragraph_lines);
+                in_code_block = true;
+                code_lines.push(line.to_string());
             }
+            continue;
+        }
+
+        if in_code_block {
+            code_lines.push(line.to_string());
+            continue;
+        }
+
+        if line.trim().is_empty() {
+            flush_paragraph(section, &mut paragraph_lines);
+        } else {
+            paragraph_lines.push(line.trim_end().to_string());
+        }
+    }
+
+    if let Some(section) = current_section.as_mut() {
+        flush_paragraph(section, &mut paragraph_lines);
+    }
+    if in_code_block && !code_lines.is_empty() {
+        if let Some(section) = current_section.as_mut() {
+            section.blocks.push(SkillBlock {
+                id: format!("{}-block-{}", section.id, section.blocks.len() + 1),
+                block_type: BlockType::Code,
+                content: code_lines.join("\n"),
+            });
         }
     }
 
@@ -59,7 +148,7 @@ pub fn parse_markdown(content: &str) -> Result<SkillSpec> {
     }
 
     let id = if name.is_empty() { "".to_string() } else { slugify(&name) };
-    let description = description_lines.join(" ");
+    let description = description_lines.join("\n").trim().to_string();
 
     Ok(SkillSpec {
         metadata: SkillMetadata {
@@ -73,25 +162,41 @@ pub fn parse_markdown(content: &str) -> Result<SkillSpec> {
     })
 }
 
-/// Compile a SkillSpec back to markdown
+/// Compile a SkillSpec back to markdown.
 pub fn compile_markdown(spec: &SkillSpec) -> String {
     let mut output = String::new();
 
     output.push_str(&format!("# {}\n\n", spec.metadata.name));
 
     if !spec.metadata.description.is_empty() {
-        output.push_str(&format!("{}\n\n", spec.metadata.description));
+        output.push_str(spec.metadata.description.trim_end());
+        output.push_str("\n\n");
     }
 
     for section in &spec.sections {
         output.push_str(&format!("## {}\n\n", section.title));
         for block in &section.blocks {
-            output.push_str(&block.content);
-            output.push_str("\n\n");
+            match block.block_type {
+                BlockType::Code => {
+                    let content = block.content.trim_end();
+                    if content.starts_with("```") {
+                        output.push_str(content);
+                        output.push_str("\n\n");
+                    } else {
+                        output.push_str("```\n");
+                        output.push_str(content);
+                        output.push_str("\n```\n\n");
+                    }
+                }
+                _ => {
+                    output.push_str(block.content.trim_end());
+                    output.push_str("\n\n");
+                }
+            }
         }
     }
 
-    output
+    output.trim_end().to_string() + "\n"
 }
 
 fn slugify(input: &str) -> String {
@@ -110,4 +215,33 @@ fn slugify(input: &str) -> String {
     }
 
     out.trim_matches('-').to_string()
+}
+
+fn spec_equivalent(left: &SkillSpec, right: &SkillSpec) -> Result<bool> {
+    let left_json = serde_json::to_value(left)
+        .map_err(|err| MsError::ValidationFailed(format!("serialize spec: {err}")))?;
+    let right_json = serde_json::to_value(right)
+        .map_err(|err| MsError::ValidationFailed(format!("serialize spec: {err}")))?;
+    Ok(json_equivalent(&left_json, &right_json))
+}
+
+fn json_equivalent(left: &JsonValue, right: &JsonValue) -> bool {
+    match (left, right) {
+        (JsonValue::Array(a), JsonValue::Array(b)) => a == b,
+        (JsonValue::Object(a), JsonValue::Object(b)) => a == b,
+        _ => left == right,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{compile_markdown, parse_markdown};
+
+    #[test]
+    fn roundtrip_simple_markdown() {
+        let md = "# Sample Skill\n\nA short description.\n\n## Usage\n\nDo the thing.\n\n```bash\nls -la\n```\n";
+        let parsed = parse_markdown(md).expect("parse");
+        let compiled = compile_markdown(&parsed);
+        assert_eq!(compiled, md);
+    }
 }
