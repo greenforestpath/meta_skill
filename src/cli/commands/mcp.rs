@@ -600,27 +600,49 @@ fn handle_tool_evidence(ctx: &AppContext, args: &Value) -> Result<ToolResult> {
     let rule_id = args.get("rule_id").and_then(|v| v.as_str());
 
     // Query evidence from database
-    let evidence = if let Some(rid) = rule_id {
-        ctx.db.get_evidence(skill_id, rid)?
-            .map(|e| vec![e])
-            .unwrap_or_default()
+    let output = if let Some(rid) = rule_id {
+        // Get evidence for specific rule
+        let evidence = ctx.db.get_rule_evidence(skill_id, rid)?;
+        serde_json::json!({
+            "skill_id": skill_id,
+            "rule_id": rid,
+            "evidence_count": evidence.len(),
+            "evidence": evidence.iter().map(|e| {
+                serde_json::json!({
+                    "session_id": e.session_id,
+                    "message_range": [e.message_range.0, e.message_range.1],
+                    "confidence": e.confidence,
+                    "excerpt": e.excerpt,
+                    "snippet_hash": e.snippet_hash,
+                })
+            }).collect::<Vec<_>>()
+        })
     } else {
-        ctx.db.list_evidence(skill_id)?
+        // Get all evidence for skill
+        let index = ctx.db.get_evidence(skill_id)?;
+        serde_json::json!({
+            "skill_id": skill_id,
+            "coverage": {
+                "total_rules": index.coverage.total_rules,
+                "rules_with_evidence": index.coverage.rules_with_evidence,
+                "avg_confidence": index.coverage.avg_confidence,
+            },
+            "rules": index.rules.iter().map(|(rule_id, refs)| {
+                serde_json::json!({
+                    "rule_id": rule_id,
+                    "evidence_count": refs.len(),
+                    "evidence": refs.iter().map(|e| {
+                        serde_json::json!({
+                            "session_id": e.session_id,
+                            "message_range": [e.message_range.0, e.message_range.1],
+                            "confidence": e.confidence,
+                            "excerpt": e.excerpt,
+                        })
+                    }).collect::<Vec<_>>()
+                })
+            }).collect::<Vec<_>>()
+        })
     };
-
-    let output = serde_json::json!({
-        "skill_id": skill_id,
-        "evidence_count": evidence.len(),
-        "evidence": evidence.iter().map(|e| {
-            serde_json::json!({
-                "rule_id": e.rule_id,
-                "session_id": e.session_id,
-                "message_range": [e.message_start, e.message_end],
-                "confidence": e.confidence,
-                "excerpt": e.excerpt,
-            })
-        }).collect::<Vec<_>>()
-    });
 
     Ok(ToolResult::text(serde_json::to_string_pretty(&output)?))
 }

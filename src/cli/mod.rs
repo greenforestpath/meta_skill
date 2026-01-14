@@ -118,4 +118,7 @@ pub enum Commands {
 
     /// View and manage skill provenance evidence
     Evidence(commands::evidence::EvidenceArgs),
+
+    /// Run as MCP (Model Context Protocol) server
+    Mcp(commands::mcp::McpArgs),
 }

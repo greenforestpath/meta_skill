@@ -28,6 +28,7 @@ pub mod index;
 pub mod init;
 pub mod list;
 pub mod load;
+pub mod mcp;
 pub mod pre_commit;
 pub mod prune;
 pub mod quality;
@@ -71,6 +72,7 @@ pub fn run(ctx: &AppContext, command: &Commands) -> Result<()> {
         Commands::Test(args) => test::run(ctx, args),
         Commands::Quality(args) => quality::run(ctx, args),
         Commands::Evidence(args) => evidence::run(ctx, args),
+        Commands::Mcp(args) => mcp::run(ctx, args),
     }
 }
 

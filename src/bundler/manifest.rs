@@ -391,9 +391,7 @@ checksum = "sha256:abc123"
         let bundle_sig = BundleSignature {
             signer: "Test Signer".to_string(),
             key_id: "test-key-1".to_string(),
-            algorithm: "ed25519".to_string(),
             signature: hex::encode(&signature_bytes),
-            timestamp: None,
         };
 
         // Should succeed
@@ -413,9 +411,7 @@ checksum = "sha256:abc123"
         let bundle_sig = BundleSignature {
             signer: "Test Signer".to_string(),
             key_id: "unknown-key".to_string(), // Not in verifier's trusted keys
-            algorithm: "ed25519".to_string(),
             signature: hex::encode(&signature_bytes),
-            timestamp: None,
         };
 
         let result = verifier.verify(payload, &bundle_sig);
@@ -441,9 +437,7 @@ checksum = "sha256:abc123"
         let bundle_sig = BundleSignature {
             signer: "Test Signer".to_string(),
             key_id: "test-key".to_string(),
-            algorithm: "ed25519".to_string(),
             signature: hex::encode(&corrupted_sig),
-            timestamp: None,
         };
 
         let result = verifier.verify(payload, &bundle_sig);
@@ -463,9 +457,7 @@ checksum = "sha256:abc123"
         let bundle_sig = BundleSignature {
             signer: "Test Signer".to_string(),
             key_id: "test-key".to_string(),
-            algorithm: "ed25519".to_string(),
             signature: hex::encode(&signature_bytes),
-            timestamp: None,
         };
 
         // Verify against different payload
@@ -486,9 +478,7 @@ checksum = "sha256:abc123"
         let bundle_sig = BundleSignature {
             signer: "Test Signer".to_string(),
             key_id: "test-key".to_string(),
-            algorithm: "ed25519".to_string(),
             signature: "not-valid-hex!@#$".to_string(),
-            timestamp: None,
         };
 
         let result = verifier.verify(payload, &bundle_sig);
@@ -512,9 +502,7 @@ checksum = "sha256:abc123"
         let bundle_sig = BundleSignature {
             signer: "Signer 2".to_string(),
             key_id: "key2".to_string(),
-            algorithm: "ed25519".to_string(),
             signature: hex::encode(&sig),
-            timestamp: None,
         };
 
         assert!(verifier.verify(payload, &bundle_sig).is_ok());
