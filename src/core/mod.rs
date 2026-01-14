@@ -3,7 +3,6 @@
 pub mod dependencies;
 pub mod disclosure;
 pub mod layering;
-pub mod overlay;
 pub mod packing;
 pub mod registry;
 pub mod requirements;

@@ -837,4 +837,100 @@ And more text.
         assert!(json.contains("code"));
         assert!(json.contains("rust"));
     }
+
+    #[test]
+    fn test_classify_bash_command_validation() {
+        assert_eq!(classify_bash_command("cargo test"), SessionPhase::Validation);
+        assert_eq!(classify_bash_command("npm run test"), SessionPhase::Validation);
+        assert_eq!(classify_bash_command("pytest"), SessionPhase::Validation);
+        assert_eq!(classify_bash_command("cargo check"), SessionPhase::Validation);
+        assert_eq!(classify_bash_command("git status"), SessionPhase::Validation);
+    }
+
+    #[test]
+    fn test_classify_bash_command_wrapup() {
+        assert_eq!(classify_bash_command("git commit -m 'fix'"), SessionPhase::WrapUp);
+        assert_eq!(classify_bash_command("git push origin main"), SessionPhase::WrapUp);
+    }
+
+    #[test]
+    fn test_classify_bash_command_recon() {
+        assert_eq!(classify_bash_command("ls -la"), SessionPhase::Reconnaissance);
+        assert_eq!(classify_bash_command("cat file.txt"), SessionPhase::Reconnaissance);
+        assert_eq!(classify_bash_command("git log --oneline"), SessionPhase::Reconnaissance);
+        assert_eq!(classify_bash_command("rg pattern"), SessionPhase::Reconnaissance);
+    }
+
+    #[test]
+    fn test_classify_bash_command_change() {
+        assert_eq!(classify_bash_command("mkdir new_dir"), SessionPhase::Change);
+        assert_eq!(classify_bash_command("rm old_file"), SessionPhase::Change);
+        assert_eq!(classify_bash_command("cargo build --release"), SessionPhase::Validation); // build is validation
+    }
+
+    #[test]
+    fn test_session_phase_serialization() {
+        let phase = SessionPhase::Reconnaissance;
+        let json = serde_json::to_string(&phase).unwrap();
+        assert_eq!(json, "\"reconnaissance\"");
+
+        let phase = SessionPhase::WrapUp;
+        let json = serde_json::to_string(&phase).unwrap();
+        assert_eq!(json, "\"wrap_up\"");
+    }
+
+    #[test]
+    fn test_merge_adjacent_segments() {
+        let segments = vec![
+            SessionSegment {
+                phase: SessionPhase::Reconnaissance,
+                start_idx: 0,
+                end_idx: 2,
+                confidence: 0.8,
+            },
+            SessionSegment {
+                phase: SessionPhase::Reconnaissance,
+                start_idx: 2,
+                end_idx: 4,
+                confidence: 0.9,
+            },
+            SessionSegment {
+                phase: SessionPhase::Change,
+                start_idx: 4,
+                end_idx: 6,
+                confidence: 0.7,
+            },
+        ];
+
+        let merged = merge_adjacent_segments(segments);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].phase, SessionPhase::Reconnaissance);
+        assert_eq!(merged[0].start_idx, 0);
+        assert_eq!(merged[0].end_idx, 4);
+        assert_eq!(merged[1].phase, SessionPhase::Change);
+    }
+
+    #[test]
+    fn test_segmented_session_dominant_phase() {
+        let session = SegmentedSession {
+            session_id: "test".to_string(),
+            segments: vec![
+                SessionSegment {
+                    phase: SessionPhase::Reconnaissance,
+                    start_idx: 0,
+                    end_idx: 2,
+                    confidence: 0.8,
+                },
+                SessionSegment {
+                    phase: SessionPhase::Change,
+                    start_idx: 2,
+                    end_idx: 10,
+                    confidence: 0.9,
+                },
+            ],
+            total_messages: 10,
+        };
+
+        assert_eq!(session.dominant_phase(), Some(SessionPhase::Change));
+    }
 }
