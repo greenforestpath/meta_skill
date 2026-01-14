@@ -60,6 +60,15 @@ pub enum MsError {
 
     #[error("ACIP error: {0}")]
     AcipError(String),
+
+    #[error("Lock timeout: {0}")]
+    LockTimeout(String),
+
+    #[error("Lock failed: {0}")]
+    LockFailed(String),
+
+    #[error("Serialization error: {0}")]
+    Serialization(String),
 }
 
 pub type Result<T> = std::result::Result<T, MsError>;

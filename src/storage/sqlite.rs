@@ -165,6 +165,22 @@ impl Database {
         Ok(())
     }
 
+    /// Delete a skill only if it has pending status
+    pub fn delete_pending_skill(&self, id: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM skills WHERE id = ? AND source_path = 'pending'",
+            [id],
+        )?;
+        Ok(())
+    }
+
+    /// Delete a transaction record from tx_log
+    pub fn delete_tx_record(&self, id: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM tx_log WHERE id = ?", [id])?;
+        Ok(())
+    }
+
     pub fn resolve_alias(&self, alias: &str) -> Result<Option<AliasResolution>> {
         let mut stmt = self
             .conn
@@ -325,6 +341,118 @@ impl Database {
             });
         }
         Ok(out)
+    }
+
+    // =========================================================================
+    // TRANSACTION LOG METHODS (for 2PC)
+    // =========================================================================
+
+    /// Insert a transaction record into tx_log
+    pub fn insert_tx_record(&self, tx: &super::tx::TxRecord) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO tx_log (id, entity_type, entity_id, phase, payload_json, created_at)
+             VALUES (?, ?, ?, ?, ?, ?)",
+            params![
+                tx.id,
+                tx.entity_type,
+                tx.entity_id,
+                tx.phase.to_string(),
+                tx.payload_json,
+                tx.created_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Update transaction phase
+    pub fn update_tx_phase(&self, tx_id: &str, phase: super::tx::TxPhase) -> Result<()> {
+        self.conn.execute(
+            "UPDATE tx_log SET phase = ? WHERE id = ?",
+            params![phase.to_string(), tx_id],
+        )?;
+        Ok(())
+    }
+
+    /// Check if a transaction exists in tx_log
+    pub fn tx_exists(&self, tx_id: &str) -> Result<bool> {
+        let exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM tx_log WHERE id = ?)",
+            [tx_id],
+            |row| row.get(0),
+        )?;
+        Ok(exists)
+    }
+
+    /// List incomplete transactions (not in Complete phase)
+    pub fn list_incomplete_transactions(&self) -> Result<Vec<super::tx::TxRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, entity_type, entity_id, phase, payload_json, created_at
+             FROM tx_log WHERE phase != 'complete'",
+        )?;
+
+        let txs = stmt
+            .query_map([], |row| {
+                let phase_str: String = row.get(3)?;
+                let phase = match phase_str.as_str() {
+                    "prepare" => super::tx::TxPhase::Prepare,
+                    "pending" => super::tx::TxPhase::Pending,
+                    "committed" => super::tx::TxPhase::Committed,
+                    _ => super::tx::TxPhase::Complete,
+                };
+
+                let created_str: String = row.get(5)?;
+                let created_at = chrono::DateTime::parse_from_rfc3339(&created_str)
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+                    .unwrap_or_else(|_| chrono::Utc::now());
+
+                Ok(super::tx::TxRecord {
+                    id: row.get(0)?,
+                    entity_type: row.get(1)?,
+                    entity_id: row.get(2)?,
+                    phase,
+                    payload_json: row.get(4)?,
+                    created_at,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        Ok(txs)
+    }
+
+    /// Upsert a skill with pending source_path marker
+    pub fn upsert_skill_pending(&self, skill: &crate::core::SkillSpec) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO skills
+             (id, name, description, version, author, source_path, source_layer,
+              content_hash, body, metadata_json, assets_json, token_count, quality_score,
+              indexed_at, modified_at)
+             VALUES (?, ?, ?, ?, ?, 'pending', 'user', 'pending', '', ?, '{}', 0, 0.0,
+                     datetime('now'), datetime('now'))",
+            params![
+                skill.metadata.id,
+                skill.metadata.name,
+                skill.metadata.description,
+                skill.metadata.version,
+                skill.metadata.author,
+                serde_json::to_string(&skill.metadata).unwrap_or_default(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Finalize a skill commit by updating source_path and content_hash
+    pub fn finalize_skill_commit(
+        &self,
+        skill_id: &str,
+        source_path: &str,
+        content_hash: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE skills SET source_path = ?, content_hash = ?, modified_at = datetime('now')
+             WHERE id = ?",
+            params![source_path, content_hash, skill_id],
+        )?;
+        Ok(())
     }
 
     fn configure_pragmas(conn: &Connection) -> Result<()> {
