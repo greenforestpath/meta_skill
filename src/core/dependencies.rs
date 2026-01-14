@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::Result;
+use crate::error::{MsError, Result};
 
 /// Mode for loading dependencies
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -260,7 +260,8 @@ impl<'a> DependencyResolver<'a> {
         };
 
         // Step 4: Assign disclosure levels
-        let ordered = self.assign_disclosure_levels(&topo_order, root_skill_id, root_disclosure, mode);
+        let ordered =
+            self.assign_disclosure_levels(&topo_order, root_skill_id, root_disclosure, mode)?;
 
         Ok(ResolvedDependencyPlan {
             ordered,
@@ -420,15 +421,19 @@ impl<'a> DependencyResolver<'a> {
         root_skill_id: &str,
         root_disclosure: DisclosureLevel,
         mode: DependencyLoadMode,
-    ) -> Vec<SkillLoadPlan> {
+    ) -> Result<Vec<SkillLoadPlan>> {
         let dep_disclosure = match mode {
-            DependencyLoadMode::Off => unreachable!(),
+            DependencyLoadMode::Off => {
+                return Err(MsError::ValidationFailed(
+                    "dependency resolution requested with load mode off".to_string(),
+                ));
+            }
             DependencyLoadMode::Auto => DisclosureLevel::Overview,
             DependencyLoadMode::Full => DisclosureLevel::Full,
             DependencyLoadMode::Overview => DisclosureLevel::Overview,
         };
 
-        topo_order
+        Ok(topo_order
             .iter()
             .map(|skill_id| {
                 let (disclosure, reason) = if skill_id == root_skill_id {
@@ -443,7 +448,7 @@ impl<'a> DependencyResolver<'a> {
                     reason,
                 }
             })
-            .collect()
+            .collect())
     }
 }
 
