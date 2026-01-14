@@ -3,12 +3,15 @@ pub mod bundler;
 pub mod cass;
 pub mod cli;
 pub mod config;
+pub mod context;
 pub mod core;
 pub mod error;
 pub mod quality;
 pub mod search;
 pub mod security;
 pub mod storage;
+pub mod suggestions;
+pub mod testing;
 pub mod updater;
 pub mod utils;
 

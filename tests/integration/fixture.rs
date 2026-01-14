@@ -86,10 +86,10 @@ impl TestFixture {
         std::fs::create_dir_all(&cass_dir).expect("Failed to create mock CASS dir");
 
         let extraction = r#"{
-  \"skill_name\": \"test-skill\",
-  \"description\": \"A test skill for integration testing\",
-  \"patterns\": [\"pattern1\", \"pattern2\"],
-  \"confidence\": 0.85
+  "skill_name": "test-skill",
+  "description": "A test skill for integration testing",
+  "patterns": ["pattern1", "pattern2"],
+  "confidence": 0.85
 }"#;
         std::fs::write(cass_dir.join("extraction.json"), extraction)
             .expect("Failed to write mock extraction");

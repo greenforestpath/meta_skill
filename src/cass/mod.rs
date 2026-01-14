@@ -13,6 +13,8 @@ pub use client::{
     CassCapabilities, CassClient, CassHealth, FingerprintCache, Session, SessionExpanded,
     SessionMatch, SessionMessage, SessionMetadata, ToolCall, ToolResult,
 };
-pub use mining::{Pattern, PatternType};
+pub use mining::{
+    segment_session, Pattern, PatternType, SegmentedSession, SessionPhase, SessionSegment,
+};
 pub use quality::{MissingSignal, QualityConfig, QualityScorer, SessionQuality};
 pub use synthesis::SkillDraft;

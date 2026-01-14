@@ -944,6 +944,7 @@ mod tests {
             "config",
             "tx_log",
             "cass_fingerprints",
+            "session_quality",
         ];
 
         for table in tables {
