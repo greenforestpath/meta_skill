@@ -319,16 +319,13 @@ impl Bm25Index {
 }
 
 fn normalize_layer(input: &str) -> &'static str {
-    let lower = input.to_lowercase();
-    match lower.as_str() {
-        "system" => "base",
-        "global" => "org",
-        "local" => "user",
-        // For other values, return as-is (with valid static mappings)
-        "base" => "base",
-        "org" => "org",
+    // Normalize layer names to match SearchLayer enum values
+    // stored in the database: system, global, project, local
+    match input.to_lowercase().as_str() {
+        "system" | "base" => "system",
+        "global" | "org" => "global",
         "project" => "project",
-        "user" => "user",
+        "local" | "user" => "local",
         _ => "project", // Default fallback
     }
 }

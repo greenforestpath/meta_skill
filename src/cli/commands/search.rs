@@ -345,28 +345,41 @@ fn find_snippet(body: &str, query: &str) -> Option<String> {
 
     // Find first occurrence of any query word
     for word in query_lower.split_whitespace() {
-        if let Some(pos) = body_lower.find(word) {
-            // Extract context around the match
-            let start = pos.saturating_sub(30);
-            let end = (pos + word.len() + 50).min(body.len());
+        if let Some(byte_pos) = body_lower.find(word) {
+            // Convert byte position to char position for safe UTF-8 slicing
+            let char_pos = body_lower[..byte_pos].chars().count();
+            let body_chars: Vec<char> = body.chars().collect();
+            let total_chars = body_chars.len();
 
-            // Find word boundaries
-            let start = body[..start]
-                .rfind(|c: char| c.is_whitespace())
+            // Extract context around the match (in characters, not bytes)
+            let start_char = char_pos.saturating_sub(30);
+            let end_char = (char_pos + word.chars().count() + 50).min(total_chars);
+
+            // Find word boundaries (scan for whitespace)
+            let start_char = body_chars[..start_char]
+                .iter()
+                .rposition(|c| c.is_whitespace())
                 .map(|p| p + 1)
-                .unwrap_or(start);
-            let end = body[end..]
-                .find(|c: char| c.is_whitespace())
-                .map(|p| end + p)
-                .unwrap_or(end);
+                .unwrap_or(start_char);
+            let end_char = body_chars[end_char..]
+                .iter()
+                .position(|c| c.is_whitespace())
+                .map(|p| end_char + p)
+                .unwrap_or(end_char);
 
-            let snippet = body[start..end].trim();
+            let snippet: String = body_chars[start_char..end_char].iter().collect();
+            let snippet = snippet.trim();
             if !snippet.is_empty() {
-                let prefix = if start > 0 { "..." } else { "" };
-                let suffix = if end < body.len() { "..." } else { "" };
+                let prefix = if start_char > 0 { "..." } else { "" };
+                let suffix = if end_char < total_chars { "..." } else { "" };
                 return Some(format!("{}{}{}", prefix, snippet, suffix));
             }
         }
     }
     None
+}
+
+/// Truncate a string to a maximum number of characters (not bytes), safe for UTF-8
+fn truncate_str(s: &str, max_chars: usize) -> String {
+    s.chars().take(max_chars).collect()
 }
