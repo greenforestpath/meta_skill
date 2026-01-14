@@ -159,8 +159,9 @@ app.use(cors());
     fixture.assert_success(&output, "show react-basics");
     fixture.assert_output_contains(&output, "react-basics");
 
-    let output = fixture.run_ms(&["--robot", "show", "nodejs-api"]);
-    fixture.assert_success(&output, "show nodejs-api");
+    // Note: skill ID is derived from name "Node.js API Development" -> "node-js-api-development"
+    let output = fixture.run_ms(&["--robot", "show", "node-js-api-development"]);
+    fixture.assert_success(&output, "show node-js-api-development");
     fixture.checkpoint("post_show");
 
     // Step 7: Verify database state
