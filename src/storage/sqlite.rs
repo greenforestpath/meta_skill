@@ -4,6 +4,7 @@ use std::path::Path;
 
 use rusqlite::{params, Connection, Row};
 use serde_json::Value as JsonValue;
+use uuid::Uuid;
 
 use crate::error::Result;
 use crate::security::QuarantineRecord;
@@ -267,6 +268,23 @@ impl Database {
         Ok(None)
     }
 
+    pub fn insert_quarantine_review(
+        &self,
+        quarantine_id: &str,
+        action: &str,
+        reason: Option<&str>,
+    ) -> Result<String> {
+        let review_id = format!("qr_{}", Uuid::new_v4());
+        let created_at = chrono::Utc::now().to_rfc3339();
+        self.conn.execute(
+            "INSERT INTO injection_quarantine_reviews (
+                id, quarantine_id, action, reason, created_at
+             ) VALUES (?, ?, ?, ?, ?)",
+            params![review_id, quarantine_id, action, reason, created_at],
+        )?;
+        Ok(review_id)
+    }
+
     fn configure_pragmas(conn: &Connection) -> Result<()> {
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
@@ -366,6 +384,7 @@ mod tests {
             "redaction_reports",
             "injection_reports",
             "injection_quarantine",
+            "injection_quarantine_reviews",
             "command_safety_events",
             "skill_usage",
             "skill_usage_events",
