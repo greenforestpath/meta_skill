@@ -219,7 +219,7 @@ fn load_prompt(path: &Path) -> Result<String> {
 }
 
 fn detect_version(prompt: &str) -> Option<String> {
-    static VERSION_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"ACIP\\s+v?([0-9]+(?:\\.[0-9]+)*)").unwrap());
+    static VERSION_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"ACIP\s+v?([0-9]+(?:\.[0-9]+)*)").unwrap());
     VERSION_RE
         .captures(prompt)
         .and_then(|caps| caps.get(1).map(|m| m.as_str().to_string()))
