@@ -245,12 +245,26 @@ impl Database {
              ORDER BY created_at DESC
              LIMIT ?",
         )?;
-        let rows = stmt.query_map(params![limit as i64], |row| quarantine_from_row(row))?;
+        let mut rows = stmt.query(params![limit as i64])?;
         let mut out = Vec::new();
-        for row in rows {
-            out.push(row?);
+        while let Some(row) = rows.next()? {
+            out.push(quarantine_from_row(row)?);
         }
         Ok(out)
+    }
+
+    pub fn get_quarantine_record(&self, quarantine_id: &str) -> Result<Option<QuarantineRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT quarantine_id, session_id, message_index, content_hash, safe_excerpt,
+                    classification_json, audit_tag, created_at, replay_command
+             FROM injection_quarantine
+             WHERE quarantine_id = ?",
+        )?;
+        let mut rows = stmt.query([quarantine_id])?;
+        if let Some(row) = rows.next()? {
+            return Ok(Some(quarantine_from_row(row)?));
+        }
+        Ok(None)
     }
 
     fn configure_pragmas(conn: &Connection) -> Result<()> {
@@ -293,9 +307,9 @@ fn skill_from_row(row: &Row<'_>) -> rusqlite::Result<SkillRecord> {
 fn quarantine_from_row(row: &Row<'_>) -> std::result::Result<QuarantineRecord, rusqlite::Error> {
     let classification_json: String = row.get(5)?;
     let classification: JsonValue = serde_json::from_str(&classification_json)
-        .map_err(|err| crate::error::MsError::Config(format!("invalid classification json: {err}")))?;
+        .map_err(|err| rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(err)))?;
     let acip_classification = serde_json::from_value(classification)
-        .map_err(|err| crate::error::MsError::Config(format!("decode classification: {err}")))?;
+        .map_err(|err| rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(err)))?;
 
     Ok(QuarantineRecord {
         quarantine_id: row.get(0)?,

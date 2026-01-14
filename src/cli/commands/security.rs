@@ -33,8 +33,29 @@ pub enum SecurityCommand {
     },
     /// Scan sessions for injection attempts (stub)
     Scan,
-    /// Quarantine management (stub)
-    Quarantine,
+    /// Quarantine management
+    Quarantine(QuarantineArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct QuarantineArgs {
+    #[command(subcommand)]
+    pub command: QuarantineCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum QuarantineCommand {
+    /// List recent quarantine records
+    List {
+        /// Max records to return
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+    /// Show a specific quarantine record
+    Show {
+        /// Quarantine record id
+        id: String,
+    },
 }
 
 #[derive(Serialize)]
@@ -61,9 +82,7 @@ pub fn run(ctx: &AppContext, args: &SecurityArgs) -> Result<()> {
         SecurityCommand::Version => version(ctx),
         SecurityCommand::Test { input, source } => test(ctx, input, source),
         SecurityCommand::Scan => not_implemented(ctx, "ms security scan not implemented yet"),
-        SecurityCommand::Quarantine => {
-            not_implemented(ctx, "ms security quarantine not implemented yet")
-        }
+        SecurityCommand::Quarantine(cmd) => quarantine(ctx, cmd),
     }
 }
 
@@ -112,6 +131,26 @@ fn test(ctx: &AppContext, input: &str, source: &str) -> Result<()> {
     let source = parse_source(source)?;
     let analysis = engine.analyze(input, source)?;
     emit_output(ctx, &analysis)
+}
+
+fn quarantine(ctx: &AppContext, args: &QuarantineArgs) -> Result<()> {
+    match &args.command {
+        QuarantineCommand::List { limit } => {
+            let records = ctx.db.list_quarantine_records(*limit)?;
+            emit_output(ctx, &records)
+        }
+        QuarantineCommand::Show { id } => {
+            let record = ctx.db.get_quarantine_record(id)?;
+            if ctx.robot_mode {
+                emit_output(ctx, &record)
+            } else {
+                match record {
+                    Some(rec) => emit_output(ctx, &rec),
+                    None => Err(MsError::Config(format!("quarantine record not found: {id}"))),
+                }
+            }
+        }
+    }
 }
 
 fn parse_source(raw: &str) -> Result<ContentSource> {

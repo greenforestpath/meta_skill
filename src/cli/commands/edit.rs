@@ -66,6 +66,7 @@ pub fn run(_ctx: &AppContext, _args: &EditArgs) -> Result<()> {
     std::fs::write(&skill_md, formatted).map_err(|err| {
         crate::error::MsError::Config(format!("write {}: {err}", skill_md.display()))
     })?;
+    record_field_history(skill_dir, &spec, &updated_spec)?;
     Ok(())
 }
 
@@ -91,4 +92,188 @@ fn run_editor(editor: &str, path: &PathBuf) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+#[derive(serde::Serialize)]
+struct FieldHistory {
+    field_path: String,
+    old_value: Option<serde_json::Value>,
+    new_value: serde_json::Value,
+    changed_at: String,
+    changed_by: String,
+}
+
+fn record_field_history(
+    skill_dir: &std::path::Path,
+    before: &crate::core::SkillSpec,
+    after: &crate::core::SkillSpec,
+) -> Result<()> {
+    let mut entries = Vec::new();
+    let who = std::env::var("USER").unwrap_or_else(|_| "unknown".to_string());
+    let now = chrono::Utc::now().to_rfc3339();
+
+    diff_field(
+        &mut entries,
+        "metadata.name",
+        &before.metadata.name,
+        &after.metadata.name,
+        &now,
+        &who,
+    );
+    diff_field(
+        &mut entries,
+        "metadata.description",
+        &before.metadata.description,
+        &after.metadata.description,
+        &now,
+        &who,
+    );
+    diff_field(
+        &mut entries,
+        "metadata.version",
+        &before.metadata.version,
+        &after.metadata.version,
+        &now,
+        &who,
+    );
+    if before.metadata.tags != after.metadata.tags {
+        entries.push(FieldHistory {
+            field_path: "metadata.tags".to_string(),
+            old_value: Some(serde_json::Value::from(before.metadata.tags.clone())),
+            new_value: serde_json::Value::from(after.metadata.tags.clone()),
+            changed_at: now.clone(),
+            changed_by: who.clone(),
+        });
+    }
+
+    let max_sections = before.sections.len().max(after.sections.len());
+    for idx in 0..max_sections {
+        let path_prefix = format!("sections[{idx}]");
+        let before_section = before.sections.get(idx);
+        let after_section = after.sections.get(idx);
+        match (before_section, after_section) {
+            (Some(left), Some(right)) => {
+                diff_field(
+                    &mut entries,
+                    &format!("{path_prefix}.title"),
+                    &left.title,
+                    &right.title,
+                    &now,
+                    &who,
+                );
+                let max_blocks = left.blocks.len().max(right.blocks.len());
+                for bidx in 0..max_blocks {
+                    let block_path = format!("{path_prefix}.blocks[{bidx}]");
+                    let left_block = left.blocks.get(bidx);
+                    let right_block = right.blocks.get(bidx);
+                    match (left_block, right_block) {
+                        (Some(lb), Some(rb)) => {
+                            if lb.block_type != rb.block_type {
+                                entries.push(FieldHistory {
+                                    field_path: format!("{block_path}.type"),
+                                    old_value: Some(serde_json::Value::String(format!(
+                                        "{:?}",
+                                        lb.block_type
+                                    ))),
+                                    new_value: serde_json::Value::String(format!(
+                                        "{:?}",
+                                        rb.block_type
+                                    )),
+                                    changed_at: now.clone(),
+                                    changed_by: who.clone(),
+                                });
+                            }
+                            if lb.content != rb.content {
+                                entries.push(FieldHistory {
+                                    field_path: format!("{block_path}.content"),
+                                    old_value: Some(serde_json::Value::String(lb.content.clone())),
+                                    new_value: serde_json::Value::String(rb.content.clone()),
+                                    changed_at: now.clone(),
+                                    changed_by: who.clone(),
+                                });
+                            }
+                        }
+                        (Some(lb), None) => entries.push(FieldHistory {
+                            field_path: block_path,
+                            old_value: Some(serde_json::Value::String(lb.content.clone())),
+                            new_value: serde_json::Value::Null,
+                            changed_at: now.clone(),
+                            changed_by: who.clone(),
+                        }),
+                        (None, Some(rb)) => entries.push(FieldHistory {
+                            field_path: block_path,
+                            old_value: None,
+                            new_value: serde_json::Value::String(rb.content.clone()),
+                            changed_at: now.clone(),
+                            changed_by: who.clone(),
+                        }),
+                        (None, None) => {}
+                    }
+                }
+            }
+            (Some(left), None) => entries.push(FieldHistory {
+                field_path: path_prefix,
+                old_value: Some(serde_json::Value::String(left.title.clone())),
+                new_value: serde_json::Value::Null,
+                changed_at: now.clone(),
+                changed_by: who.clone(),
+            }),
+            (None, Some(right)) => entries.push(FieldHistory {
+                field_path: path_prefix,
+                old_value: None,
+                new_value: serde_json::Value::String(right.title.clone()),
+                changed_at: now.clone(),
+                changed_by: who.clone(),
+            }),
+            (None, None) => {}
+        }
+    }
+
+    if entries.is_empty() {
+        return Ok(());
+    }
+
+    let history_path = skill_dir.join(".ms").join("field_history.jsonl");
+    if let Some(parent) = history_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|err| {
+            crate::error::MsError::Config(format!("create history dir: {err}"))
+        })?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&history_path)
+        .map_err(|err| {
+            crate::error::MsError::Config(format!("open history log: {err}"))
+        })?;
+    for entry in entries {
+        let line = serde_json::to_string(&entry).map_err(|err| {
+            crate::error::MsError::Config(format!("serialize history: {err}"))
+        })?;
+        use std::io::Write;
+        writeln!(file, "{line}").map_err(|err| {
+            crate::error::MsError::Config(format!("write history: {err}"))
+        })?;
+    }
+    Ok(())
+}
+
+fn diff_field(
+    entries: &mut Vec<FieldHistory>,
+    field_path: &str,
+    before: &str,
+    after: &str,
+    changed_at: &str,
+    changed_by: &str,
+) {
+    if before == after {
+        return;
+    }
+    entries.push(FieldHistory {
+        field_path: field_path.to_string(),
+        old_value: Some(serde_json::Value::String(before.to_string())),
+        new_value: serde_json::Value::String(after.to_string()),
+        changed_at: changed_at.to_string(),
+        changed_by: changed_by.to_string(),
+    });
 }
