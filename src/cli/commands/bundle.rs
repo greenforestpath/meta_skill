@@ -429,13 +429,45 @@ fn run_install(ctx: &AppContext, args: &BundleInstallArgs) -> Result<()> {
 
     let only = normalize_skill_list(&args.skills);
 
-    // Install with verification (unless --no-verify is specified)
-    let options = if args.no_verify {
-        crate::bundler::InstallOptions::<crate::bundler::manifest::NoopSignatureVerifier>::allow_unsigned()
+    // Install with verification
+    //
+    // Current behavior:
+    // - --no-verify: Skip all verification, allow unsigned bundles
+    // - Default (no flag): Allow unsigned bundles (with warning), but require valid
+    //   signatures for signed bundles when a verifier is configured
+    //
+    // Note: Trusted key configuration is not yet implemented. For now, signed bundles
+    // will fail verification unless --no-verify is used. This is intentional - we want
+    // to establish the signature verification pattern early, even if the full key
+    // management workflow isn't complete yet.
+    let report = if args.no_verify {
+        let options = crate::bundler::InstallOptions::<
+            crate::bundler::manifest::NoopSignatureVerifier,
+        >::allow_unsigned();
+        crate::bundler::install_with_options(&package, ctx.git.root(), &only, &options)?
+    } else if package.manifest.signatures.is_empty() {
+        // Unsigned bundle: allow but warn (development/testing scenario)
+        if !ctx.robot_mode {
+            eprintln!(
+                "Warning: Installing unsigned bundle '{}'. \
+                 Use signed bundles for production deployments.",
+                package.manifest.bundle.id
+            );
+        }
+        let options = crate::bundler::InstallOptions::<
+            crate::bundler::manifest::NoopSignatureVerifier,
+        >::allow_unsigned();
+        crate::bundler::install_with_options(&package, ctx.git.root(), &only, &options)?
     } else {
-        crate::bundler::InstallOptions::default()
+        // Signed bundle: require verification
+        // TODO: Load trusted keys from config when implemented
+        return Err(MsError::ValidationFailed(format!(
+            "Bundle '{}' is signed but trusted key configuration is not yet implemented. \
+             Use --no-verify to install (not recommended for production), \
+             or wait for trusted key support in a future release.",
+            package.manifest.bundle.id
+        )));
     };
-    let report = crate::bundler::install_with_options(&package, ctx.git.root(), &only, &options)?;
 
     // Register the installation
     let installed = InstalledBundle {
