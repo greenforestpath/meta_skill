@@ -620,6 +620,11 @@ fn is_generic_binary(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
+
+    // =========================================================================
+    // UpdateChannel tests
+    // =========================================================================
 
     #[test]
     fn parse_update_channel() {
@@ -639,6 +644,32 @@ mod tests {
     }
 
     #[test]
+    fn update_channel_default() {
+        assert_eq!(UpdateChannel::default(), UpdateChannel::Stable);
+    }
+
+    #[test]
+    fn update_channel_display() {
+        assert_eq!(UpdateChannel::Stable.to_string(), "stable");
+        assert_eq!(UpdateChannel::Beta.to_string(), "beta");
+        assert_eq!(UpdateChannel::Nightly.to_string(), "nightly");
+    }
+
+    #[test]
+    fn update_channel_serialization() {
+        let channel = UpdateChannel::Beta;
+        let json = serde_json::to_string(&channel).unwrap();
+        assert_eq!(json, "\"beta\"");
+
+        let deserialized: UpdateChannel = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized, UpdateChannel::Beta);
+    }
+
+    // =========================================================================
+    // parse_repo tests
+    // =========================================================================
+
+    #[test]
     fn parse_repo_basic() {
         let (owner, repo) = parse_repo("owner/repo").unwrap();
         assert_eq!(owner, "owner");
@@ -653,12 +684,148 @@ mod tests {
     }
 
     #[test]
+    fn parse_repo_http_url() {
+        let (owner, repo) = parse_repo("http://github.com/foo/bar").unwrap();
+        assert_eq!(owner, "foo");
+        assert_eq!(repo, "bar");
+    }
+
+    #[test]
+    fn parse_repo_github_com_prefix() {
+        let (owner, repo) = parse_repo("github.com/test/project").unwrap();
+        assert_eq!(owner, "test");
+        assert_eq!(repo, "project");
+    }
+
+    #[test]
+    fn parse_repo_invalid_empty() {
+        assert!(parse_repo("").is_err());
+    }
+
+    #[test]
+    fn parse_repo_invalid_no_slash() {
+        assert!(parse_repo("justrepo").is_err());
+    }
+
+    #[test]
+    fn parse_repo_invalid_empty_owner() {
+        assert!(parse_repo("/repo").is_err());
+    }
+
+    #[test]
+    fn parse_repo_invalid_empty_repo() {
+        assert!(parse_repo("owner/").is_err());
+    }
+
+    // =========================================================================
+    // current_target tests
+    // =========================================================================
+
+    #[test]
     fn current_target_format() {
         let target = current_target();
         assert!(target.contains('-'));
         let parts: Vec<&str> = target.split('-').collect();
         assert_eq!(parts.len(), 2);
     }
+
+    #[test]
+    fn current_target_known_os() {
+        let target = current_target();
+        let os_known = target.contains("linux")
+            || target.contains("macos")
+            || target.contains("windows")
+            || target.contains("unknown");
+        assert!(os_known);
+    }
+
+    #[test]
+    fn current_target_known_arch() {
+        let target = current_target();
+        let arch_known = target.contains("x86_64")
+            || target.contains("aarch64")
+            || target.contains("unknown");
+        assert!(arch_known);
+    }
+
+    // =========================================================================
+    // is_generic_binary tests
+    // =========================================================================
+
+    #[test]
+    fn is_generic_binary_windows_exe() {
+        assert!(is_generic_binary("ms.exe"));
+    }
+
+    #[test]
+    fn is_generic_binary_no_extension() {
+        assert!(is_generic_binary("ms"));
+    }
+
+    #[test]
+    fn is_generic_binary_with_linux_target() {
+        assert!(!is_generic_binary("ms-linux-x86_64"));
+    }
+
+    #[test]
+    fn is_generic_binary_with_macos_target() {
+        assert!(!is_generic_binary("ms-macos-aarch64"));
+    }
+
+    #[test]
+    fn is_generic_binary_with_darwin_target() {
+        assert!(!is_generic_binary("ms-darwin-x86_64"));
+    }
+
+    #[test]
+    fn is_generic_binary_with_windows_target() {
+        assert!(!is_generic_binary("ms-windows-x86_64.exe"));
+    }
+
+    // =========================================================================
+    // compute_sha256 tests
+    // =========================================================================
+
+    #[test]
+    fn compute_sha256_known_content() {
+        let temp = TempDir::new().unwrap();
+        let file = temp.path().join("test.txt");
+        std::fs::write(&file, "hello world").unwrap();
+
+        let hash = compute_sha256(&file).unwrap();
+        // SHA256 of "hello world" is b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9
+        assert_eq!(
+            hash,
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+        );
+    }
+
+    #[test]
+    fn compute_sha256_empty_file() {
+        let temp = TempDir::new().unwrap();
+        let file = temp.path().join("empty.txt");
+        std::fs::write(&file, "").unwrap();
+
+        let hash = compute_sha256(&file).unwrap();
+        // SHA256 of empty string
+        assert_eq!(
+            hash,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    #[test]
+    fn compute_sha256_nonexistent_file() {
+        let temp = TempDir::new().unwrap();
+        let file = temp.path().join("nonexistent.txt");
+
+        let result = compute_sha256(&file);
+        assert!(result.is_err());
+    }
+
+    // =========================================================================
+    // channel_matches tests
+    // =========================================================================
 
     #[test]
     fn channel_matches() {
@@ -690,5 +857,195 @@ mod tests {
 
         assert!(checker.matches_channel(&stable_release));
         assert!(!checker.matches_channel(&beta_release));
+    }
+
+    #[test]
+    fn channel_matches_beta_accepts_stable() {
+        let checker = UpdateChecker::new(
+            Version::new(0, 1, 0),
+            UpdateChannel::Beta,
+            "owner/repo".to_string(),
+        );
+
+        let stable_release = ReleaseInfo {
+            version: Version::new(1, 0, 0),
+            tag: "v1.0.0".to_string(),
+            prerelease: false,
+            assets: vec![],
+            changelog: String::new(),
+            published_at: Utc::now(),
+            html_url: String::new(),
+        };
+
+        // Beta channel accepts stable releases
+        assert!(checker.matches_channel(&stable_release));
+    }
+
+    #[test]
+    fn channel_matches_nightly_accepts_all() {
+        let checker = UpdateChecker::new(
+            Version::new(0, 1, 0),
+            UpdateChannel::Nightly,
+            "owner/repo".to_string(),
+        );
+
+        let stable_release = ReleaseInfo {
+            version: Version::new(1, 0, 0),
+            tag: "v1.0.0".to_string(),
+            prerelease: false,
+            assets: vec![],
+            changelog: String::new(),
+            published_at: Utc::now(),
+            html_url: String::new(),
+        };
+
+        let prerelease = ReleaseInfo {
+            version: Version::new(1, 1, 0),
+            tag: "v1.1.0-alpha.1".to_string(),
+            prerelease: true,
+            assets: vec![],
+            changelog: String::new(),
+            published_at: Utc::now(),
+            html_url: String::new(),
+        };
+
+        // Nightly channel accepts everything
+        assert!(checker.matches_channel(&stable_release));
+        assert!(checker.matches_channel(&prerelease));
+    }
+
+    // =========================================================================
+    // UpdateChecker tests
+    // =========================================================================
+
+    #[test]
+    fn update_checker_current_version() {
+        let checker = UpdateChecker::new(
+            Version::new(1, 2, 3),
+            UpdateChannel::Stable,
+            "owner/repo".to_string(),
+        );
+
+        assert_eq!(*checker.current_version(), Version::new(1, 2, 3));
+    }
+
+    #[test]
+    fn update_checker_channel() {
+        let checker = UpdateChecker::new(
+            Version::new(1, 0, 0),
+            UpdateChannel::Beta,
+            "owner/repo".to_string(),
+        );
+
+        assert_eq!(checker.channel(), UpdateChannel::Beta);
+    }
+
+    #[test]
+    fn update_checker_with_token() {
+        let checker = UpdateChecker::new(
+            Version::new(1, 0, 0),
+            UpdateChannel::Stable,
+            "owner/repo".to_string(),
+        )
+        .with_token(Some("test_token".to_string()));
+
+        // Can't directly access token, but ensure it doesn't panic
+        assert_eq!(checker.channel(), UpdateChannel::Stable);
+    }
+
+    // =========================================================================
+    // ReleaseAsset tests
+    // =========================================================================
+
+    #[test]
+    fn release_asset_serialization() {
+        let asset = ReleaseAsset {
+            id: 12345,
+            name: "ms-linux-x86_64".to_string(),
+            download_url: "https://example.com/download".to_string(),
+            size: 1024 * 1024,
+        };
+
+        let json = serde_json::to_string(&asset).unwrap();
+        assert!(json.contains("12345"));
+        assert!(json.contains("ms-linux-x86_64"));
+
+        let deserialized: ReleaseAsset = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.id, 12345);
+        assert_eq!(deserialized.name, "ms-linux-x86_64");
+    }
+
+    // =========================================================================
+    // InstallResult tests
+    // =========================================================================
+
+    #[test]
+    fn install_result_serialization() {
+        let result = InstallResult {
+            backup_path: Some(PathBuf::from("/tmp/backup")),
+            restart_required: true,
+        };
+
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("restart_required"));
+        assert!(json.contains("true"));
+    }
+
+    // =========================================================================
+    // UpdateDownloader tests
+    // =========================================================================
+
+    #[test]
+    fn update_downloader_with_temp_dir() {
+        let temp = TempDir::new().unwrap();
+        let downloader = UpdateDownloader::with_temp_dir(temp.path().to_path_buf()).unwrap();
+
+        // Cleanup should not fail
+        downloader.cleanup().unwrap();
+    }
+
+    #[test]
+    fn update_downloader_cleanup_nonexistent() {
+        let temp = TempDir::new().unwrap();
+        let temp_path = temp.path().join("nonexistent");
+        // Create then drop
+        {
+            let _ = UpdateDownloader::with_temp_dir(temp_path.clone());
+        }
+        // Manual cleanup after temp_dir is gone should not fail
+        if temp_path.exists() {
+            std::fs::remove_dir_all(&temp_path).unwrap();
+        }
+    }
+
+    // =========================================================================
+    // UpdateInstaller tests
+    // =========================================================================
+
+    #[test]
+    fn update_installer_with_paths() {
+        let temp = TempDir::new().unwrap();
+        let binary = temp.path().join("ms");
+        let backup = temp.path().join("backup");
+
+        let installer = UpdateInstaller::with_paths(binary.clone(), backup.clone());
+
+        // Create a fake binary
+        std::fs::write(&binary, "fake binary").unwrap();
+
+        // Cleanup should work
+        let _ = installer.cleanup_backup();
+    }
+
+    #[test]
+    fn update_installer_rollback_no_backup() {
+        let temp = TempDir::new().unwrap();
+        let binary = temp.path().join("ms");
+        let backup = temp.path().join("backup");
+
+        let installer = UpdateInstaller::with_paths(binary, backup);
+
+        // Rollback with no backup should succeed (no-op)
+        installer.rollback().unwrap();
     }
 }
