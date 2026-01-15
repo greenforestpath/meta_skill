@@ -15,83 +15,83 @@ use crate::beads::{
     BeadsClient, CreateIssueRequest, IssueStatus, TestLogger, WorkFilter,
 };
 
-    /// Test fixture that creates an isolated beads environment.
-    ///
-    /// SAFETY: Uses tempdir + BEADS_DB override to completely isolate tests.
-    pub struct TestBeadsEnv {
-        /// Temporary directory containing the test database
-        pub temp_dir: TempDir,
-        /// Path to the test database
-        db_path: PathBuf,
-        /// Test logger for this environment
-        pub log: TestLogger,
-        /// Whether bd was successfully initialized
-        pub initialized: bool,
-    }
+/// Test fixture that creates an isolated beads environment.
+///
+/// SAFETY: Uses tempdir + BEADS_DB override to completely isolate tests.
+pub struct TestBeadsEnv {
+    /// Temporary directory containing the test database
+    pub temp_dir: TempDir,
+    /// Path to the test database
+    db_path: PathBuf,
+    /// Test logger for this environment
+    pub log: TestLogger,
+    /// Whether bd was successfully initialized
+    pub initialized: bool,
+}
 
-    impl TestBeadsEnv {
-        /// Create a new isolated test environment.
-        pub fn new(test_name: &str) -> Self {
-            let mut log = TestLogger::new(test_name);
+impl TestBeadsEnv {
+    /// Create a new isolated test environment.
+    pub fn new(test_name: &str) -> Self {
+        let mut log = TestLogger::new(test_name);
 
-            let temp_dir = tempfile::tempdir().expect("Failed to create temp directory");
-            let beads_dir = temp_dir.path().join(".beads");
-            std::fs::create_dir_all(&beads_dir).expect("Failed to create .beads directory");
-            let db_path = beads_dir.join("beads.db");
+        let temp_dir = tempfile::tempdir().expect("Failed to create temp directory");
+        let beads_dir = temp_dir.path().join(".beads");
+        std::fs::create_dir_all(&beads_dir).expect("Failed to create .beads directory");
+        let db_path = beads_dir.join("beads.db");
 
-            log.info(
-                "SETUP",
-                &format!("Test dir: {}", temp_dir.path().display()),
-                None,
-            );
+        log.info(
+            "SETUP",
+            &format!("Test dir: {}", temp_dir.path().display()),
+            None,
+        );
 
-            // Initialize database using env var
-            log.info("INIT", "Initializing test database", None);
-            let status = Command::new("bd")
-                .args(["init"])
-                .env("BEADS_DB", &db_path)
-                .current_dir(temp_dir.path())
-                .output();
+        // Initialize database using env var
+        log.info("INIT", "Initializing test database", None);
+        let status = Command::new("bd")
+            .args(["init"])
+            .env("BEADS_DB", &db_path)
+            .current_dir(temp_dir.path())
+            .output();
 
-            let initialized = match status {
-                Ok(output) if output.status.success() => {
-                    log.success("INIT", "Database initialized", None);
-                    true
-                }
-                Ok(output) => {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    log.warn("INIT", &format!("bd init warning: {}", stderr), None);
-                    false
-                }
-                Err(e) => {
-                    log.warn("INIT", &format!("bd init failed: {}", e), None);
-                    false
-                }
-            };
-
-            log.success("SETUP", "Test environment ready", None);
-
-            TestBeadsEnv {
-                temp_dir,
-                db_path,
-                log,
-                initialized,
+        let initialized = match status {
+            Ok(output) if output.status.success() => {
+                log.success("INIT", "Database initialized", None);
+                true
             }
-        }
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                log.warn("INIT", &format!("bd init warning: {}", stderr), None);
+                false
+            }
+            Err(e) => {
+                log.warn("INIT", &format!("bd init failed: {}", e), None);
+                false
+            }
+        };
 
-        /// Get a BeadsClient configured for this test environment.
-        pub fn client(&self) -> BeadsClient {
-            BeadsClient::new()
-                .with_work_dir(self.temp_dir.path())
-                .with_env("BEADS_DB", self.db_path.to_string_lossy())
+        log.success("SETUP", "Test environment ready", None);
+
+        TestBeadsEnv {
+            temp_dir,
+            db_path,
+            log,
+            initialized,
         }
     }
 
-    impl Drop for TestBeadsEnv {
-        fn drop(&mut self) {
-            self.log.info("CLEANUP", "Test environment dropped", None);
-        }
+    /// Get a BeadsClient configured for this test environment.
+    pub fn client(&self) -> BeadsClient {
+        BeadsClient::new()
+            .with_work_dir(self.temp_dir.path())
+            .with_env("BEADS_DB", self.db_path.to_string_lossy())
     }
+}
+
+impl Drop for TestBeadsEnv {
+    fn drop(&mut self) {
+        self.log.info("CLEANUP", "Test environment dropped", None);
+    }
+}
 
 /// Count running bd processes.
 fn count_bd_processes() -> usize {
@@ -270,7 +270,6 @@ fn test_operation_continuity() {
 
     // The important thing: we should still be able to access the issue
     // Note: We verify via list() since show() may have ID parsing issues in test environments
-    let filter = WorkFilter::default();
     match client.list(&filter) {
         Ok(issues) => {
             let found = issues.iter().any(|i| i.title.contains("Continuity Test"));
