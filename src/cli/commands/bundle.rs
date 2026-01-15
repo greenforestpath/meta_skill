@@ -415,6 +415,9 @@ fn run_create(ctx: &AppContext, args: &BundleCreateArgs) -> Result<()> {
 }
 
 fn run_install(ctx: &AppContext, args: &BundleInstallArgs) -> Result<()> {
+    // Acquire lock to prevent concurrent modifications
+    let _lock = GlobalLock::acquire(&ctx.ms_root)?;
+
     // Parse the source using the new ParsedSource
     let parsed = ParsedSource::parse(&args.source)?;
 
@@ -545,6 +548,9 @@ fn run_install(ctx: &AppContext, args: &BundleInstallArgs) -> Result<()> {
 
 fn run_remove(ctx: &AppContext, args: &BundleRemoveArgs) -> Result<()> {
     use std::io::Write;
+
+    // Acquire lock to prevent concurrent modifications
+    let _lock = GlobalLock::acquire(&ctx.ms_root)?;
 
     let mut registry = BundleRegistry::open(ctx.git.root())?;
 

@@ -326,4 +326,16 @@ mod tests {
             _ => panic!("expected File source"),
         }
     }
+
+    #[test]
+    fn test_ambiguous_local_path_parses_as_github() {
+        // "skills/bundle.msb" looks like "owner/repo"
+        let parsed = ParsedSource::parse("skills/bundle.msb").unwrap();
+        match parsed.source {
+            InstallSource::GitHub { repo, .. } => {
+                assert_eq!(repo, "skills/bundle.msb");
+            }
+            _ => panic!("expected GitHub source for ambiguous path"),
+        }
+    }
 }
