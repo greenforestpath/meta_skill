@@ -892,3 +892,489 @@ fn env_list(key: &str) -> Result<Option<Vec<String>>> {
         Err(_) => Ok(None),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    // =========================================================================
+    // Config default tests
+    // =========================================================================
+
+    #[test]
+    fn config_default_has_all_fields() {
+        let config = Config::default();
+        // Verify all sections have sensible defaults
+        assert!(!config.skill_paths.global.is_empty());
+        assert!(!config.layers.priority.is_empty());
+        assert!(!config.disclosure.default_level.is_empty());
+        assert!(config.search.embedding_dims > 0);
+        assert!(config.cache.max_size_mb > 0);
+        assert!(config.update.check_interval_hours > 0);
+    }
+
+    #[test]
+    fn config_serialization_roundtrip() {
+        let config = Config::default();
+        let json = serde_json::to_string(&config).unwrap();
+        let deserialized: Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(config.disclosure.default_level, deserialized.disclosure.default_level);
+        assert_eq!(config.cache.enabled, deserialized.cache.enabled);
+    }
+
+    // =========================================================================
+    // SkillPathsConfig tests
+    // =========================================================================
+
+    #[test]
+    fn skill_paths_config_defaults() {
+        let config = SkillPathsConfig::default();
+        assert_eq!(config.global.len(), 1);
+        assert!(config.global[0].contains("ms/skills"));
+        assert_eq!(config.project.len(), 1);
+        assert!(config.project[0].contains(".ms/skills"));
+        assert_eq!(config.community.len(), 1);
+        assert!(config.local.is_empty());
+    }
+
+    #[test]
+    fn skill_paths_config_serialization() {
+        let config = SkillPathsConfig::default();
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains("global"));
+        assert!(json.contains("project"));
+    }
+
+    // =========================================================================
+    // LayersConfig tests
+    // =========================================================================
+
+    #[test]
+    fn layers_config_defaults() {
+        let config = LayersConfig::default();
+        assert_eq!(config.priority.len(), 3);
+        assert_eq!(config.priority[0], "project");
+        assert_eq!(config.priority[1], "global");
+        assert_eq!(config.priority[2], "community");
+        assert!(config.auto_detect);
+        assert!(config.project_overrides);
+    }
+
+    #[test]
+    fn layers_config_serialization() {
+        let config = LayersConfig::default();
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains("\"auto_detect\":true"));
+    }
+
+    // =========================================================================
+    // DisclosureConfig tests
+    // =========================================================================
+
+    #[test]
+    fn disclosure_config_defaults() {
+        let config = DisclosureConfig::default();
+        assert_eq!(config.default_level, "moderate");
+        assert_eq!(config.token_budget, 800);
+        assert!(config.auto_suggest);
+        assert_eq!(config.cooldown_seconds, 300);
+    }
+
+    #[test]
+    fn disclosure_config_serialization() {
+        let config = DisclosureConfig::default();
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains("\"token_budget\":800"));
+    }
+
+    // =========================================================================
+    // SearchConfig tests
+    // =========================================================================
+
+    #[test]
+    fn search_config_defaults() {
+        let config = SearchConfig::default();
+        assert!(config.use_embeddings);
+        assert_eq!(config.embedding_backend, "hash");
+        assert_eq!(config.embedding_dims, 384);
+        assert!((config.bm25_weight - 0.5).abs() < f32::EPSILON);
+        assert!((config.semantic_weight - 0.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn search_config_serialization() {
+        let config = SearchConfig::default();
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains("\"embedding_dims\":384"));
+    }
+
+    // =========================================================================
+    // CassConfig tests
+    // =========================================================================
+
+    #[test]
+    fn cass_config_defaults() {
+        let config = CassConfig::default();
+        assert!(config.auto_detect);
+        assert!(config.cass_path.is_none());
+        assert_eq!(config.session_pattern, "*.jsonl");
+    }
+
+    #[test]
+    fn cass_config_serialization() {
+        let config = CassConfig::default();
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains("\"session_pattern\":\"*.jsonl\""));
+    }
+
+    // =========================================================================
+    // CmConfig tests
+    // =========================================================================
+
+    #[test]
+    fn cm_config_defaults() {
+        let config = CmConfig::default();
+        assert!(config.enabled);
+        assert!(config.cm_path.is_none());
+        assert!(config.default_flags.is_empty());
+    }
+
+    #[test]
+    fn cm_config_serialization() {
+        let config = CmConfig::default();
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains("\"enabled\":true"));
+    }
+
+    // =========================================================================
+    // CacheConfig tests
+    // =========================================================================
+
+    #[test]
+    fn cache_config_defaults() {
+        let config = CacheConfig::default();
+        assert!(config.enabled);
+        assert_eq!(config.max_size_mb, 100);
+        assert_eq!(config.ttl_seconds, 3600);
+    }
+
+    #[test]
+    fn cache_config_serialization() {
+        let config = CacheConfig::default();
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains("\"max_size_mb\":100"));
+    }
+
+    // =========================================================================
+    // UpdateConfig tests
+    // =========================================================================
+
+    #[test]
+    fn update_config_defaults() {
+        let config = UpdateConfig::default();
+        assert!(config.auto_check);
+        assert_eq!(config.check_interval_hours, 24);
+        assert_eq!(config.channel, "stable");
+    }
+
+    #[test]
+    fn update_config_serialization() {
+        let config = UpdateConfig::default();
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains("\"channel\":\"stable\""));
+    }
+
+    // =========================================================================
+    // RobotConfig tests
+    // =========================================================================
+
+    #[test]
+    fn robot_config_defaults() {
+        let config = RobotConfig::default();
+        assert_eq!(config.format, "json");
+        assert!(config.include_metadata);
+    }
+
+    #[test]
+    fn robot_config_serialization() {
+        let config = RobotConfig::default();
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains("\"format\":\"json\""));
+    }
+
+    // =========================================================================
+    // SafetyConfig tests
+    // =========================================================================
+
+    #[test]
+    fn safety_config_defaults() {
+        let config = SafetyConfig::default();
+        assert_eq!(config.dcg_bin, PathBuf::from("dcg"));
+        assert!(config.dcg_packs.is_empty());
+        assert_eq!(config.dcg_explain_format, "json");
+        assert!(config.require_verbatim_approval);
+    }
+
+    #[test]
+    fn safety_config_serialization() {
+        let config = SafetyConfig::default();
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains("\"dcg_explain_format\":\"json\""));
+    }
+
+    // =========================================================================
+    // merge_unique tests
+    // =========================================================================
+
+    #[test]
+    fn merge_unique_combines_lists() {
+        let new = vec!["a".to_string(), "b".to_string()];
+        let existing = vec!["c".to_string(), "d".to_string()];
+        let result = merge_unique(new, &existing);
+        assert_eq!(result.len(), 4);
+        assert_eq!(result, vec!["a", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn merge_unique_removes_duplicates() {
+        let new = vec!["a".to_string(), "b".to_string()];
+        let existing = vec!["b".to_string(), "c".to_string()];
+        let result = merge_unique(new, &existing);
+        assert_eq!(result.len(), 3);
+        assert_eq!(result, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn merge_unique_prefers_new_order() {
+        let new = vec!["x".to_string(), "y".to_string()];
+        let existing = vec!["y".to_string(), "z".to_string()];
+        let result = merge_unique(new, &existing);
+        // New values come first
+        assert_eq!(result[0], "x");
+        assert_eq!(result[1], "y");
+        assert_eq!(result[2], "z");
+    }
+
+    #[test]
+    fn merge_unique_empty_new() {
+        let new = vec![];
+        let existing = vec!["a".to_string(), "b".to_string()];
+        let result = merge_unique(new, &existing);
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn merge_unique_empty_existing() {
+        let new = vec!["a".to_string(), "b".to_string()];
+        let existing = vec![];
+        let result = merge_unique(new, &existing);
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn merge_unique_both_empty() {
+        let new: Vec<String> = vec![];
+        let existing: Vec<String> = vec![];
+        let result = merge_unique(new, &existing);
+        assert!(result.is_empty());
+    }
+
+    // =========================================================================
+    // parse_trust_level tests
+    // =========================================================================
+
+    #[test]
+    fn parse_trust_level_trusted() {
+        assert_eq!(parse_trust_level("trusted").unwrap(), TrustLevel::Trusted);
+        assert_eq!(parse_trust_level("TRUSTED").unwrap(), TrustLevel::Trusted);
+        assert_eq!(parse_trust_level("Trusted").unwrap(), TrustLevel::Trusted);
+    }
+
+    #[test]
+    fn parse_trust_level_untrusted() {
+        assert_eq!(parse_trust_level("untrusted").unwrap(), TrustLevel::Untrusted);
+        assert_eq!(parse_trust_level("UNTRUSTED").unwrap(), TrustLevel::Untrusted);
+    }
+
+    #[test]
+    fn parse_trust_level_verify_required_variants() {
+        assert_eq!(parse_trust_level("verify_required").unwrap(), TrustLevel::VerifyRequired);
+        assert_eq!(parse_trust_level("verifyrequired").unwrap(), TrustLevel::VerifyRequired);
+        assert_eq!(parse_trust_level("verify-required").unwrap(), TrustLevel::VerifyRequired);
+        assert_eq!(parse_trust_level("VERIFY_REQUIRED").unwrap(), TrustLevel::VerifyRequired);
+    }
+
+    #[test]
+    fn parse_trust_level_invalid() {
+        let result = parse_trust_level("invalid");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("invalid trust level"));
+    }
+
+    // =========================================================================
+    // Config::load_patch tests (file-based)
+    // =========================================================================
+
+    #[test]
+    fn load_patch_nonexistent_file() {
+        let result = Config::load_patch(Path::new("/nonexistent/path/config.toml")).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn load_patch_valid_toml() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("config.toml");
+        std::fs::write(&path, r#"
+[cache]
+enabled = false
+max_size_mb = 200
+"#).unwrap();
+
+        let patch = Config::load_patch(&path).unwrap().unwrap();
+        assert!(patch.cache.is_some());
+        let cache_patch = patch.cache.unwrap();
+        assert_eq!(cache_patch.enabled, Some(false));
+        assert_eq!(cache_patch.max_size_mb, Some(200));
+    }
+
+    #[test]
+    fn load_patch_partial_config() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("config.toml");
+        std::fs::write(&path, r#"
+[disclosure]
+token_budget = 1000
+"#).unwrap();
+
+        let patch = Config::load_patch(&path).unwrap().unwrap();
+        assert!(patch.disclosure.is_some());
+        assert!(patch.cache.is_none());
+        assert!(patch.search.is_none());
+    }
+
+    #[test]
+    fn load_patch_invalid_toml() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("config.toml");
+        std::fs::write(&path, "this is not valid toml [[[").unwrap();
+
+        let result = Config::load_patch(&path);
+        assert!(result.is_err());
+    }
+
+    // =========================================================================
+    // Config merge tests
+    // =========================================================================
+
+    #[test]
+    fn config_merge_patch_updates_values() {
+        let mut config = Config::default();
+        assert!(config.cache.enabled);
+
+        let patch = ConfigPatch {
+            cache: Some(CachePatch {
+                enabled: Some(false),
+                max_size_mb: None,
+                ttl_seconds: None,
+            }),
+            ..Default::default()
+        };
+
+        config.merge_patch(patch);
+        assert!(!config.cache.enabled);
+        // Other values unchanged
+        assert_eq!(config.cache.max_size_mb, 100);
+    }
+
+    #[test]
+    fn config_merge_patch_empty_noop() {
+        let config_before = Config::default();
+        let mut config = Config::default();
+
+        let patch = ConfigPatch::default();
+        config.merge_patch(patch);
+
+        // Values unchanged
+        assert_eq!(config.cache.enabled, config_before.cache.enabled);
+        assert_eq!(config.disclosure.token_budget, config_before.disclosure.token_budget);
+    }
+
+    #[test]
+    fn config_merge_multiple_sections() {
+        let mut config = Config::default();
+
+        let patch = ConfigPatch {
+            cache: Some(CachePatch {
+                enabled: Some(false),
+                max_size_mb: Some(50),
+                ttl_seconds: Some(7200),
+            }),
+            update: Some(UpdatePatch {
+                auto_check: Some(false),
+                check_interval_hours: Some(48),
+                channel: Some("beta".to_string()),
+            }),
+            ..Default::default()
+        };
+
+        config.merge_patch(patch);
+
+        assert!(!config.cache.enabled);
+        assert_eq!(config.cache.max_size_mb, 50);
+        assert_eq!(config.cache.ttl_seconds, 7200);
+        assert!(!config.update.auto_check);
+        assert_eq!(config.update.check_interval_hours, 48);
+        assert_eq!(config.update.channel, "beta");
+    }
+
+    // =========================================================================
+    // Config::load tests (integration)
+    // =========================================================================
+
+    #[test]
+    fn config_load_from_explicit_path() {
+        let temp = TempDir::new().unwrap();
+        let config_path = temp.path().join("custom_config.toml");
+        let ms_root = temp.path().join(".ms");
+        std::fs::create_dir_all(&ms_root).unwrap();
+
+        std::fs::write(&config_path, r#"
+[cache]
+enabled = false
+"#).unwrap();
+
+        let config = Config::load(Some(&config_path), &ms_root).unwrap();
+        assert!(!config.cache.enabled);
+    }
+
+    #[test]
+    fn config_load_project_config() {
+        let temp = TempDir::new().unwrap();
+        let ms_root = temp.path().join(".ms");
+        std::fs::create_dir_all(&ms_root).unwrap();
+
+        let project_config = ms_root.join("config.toml");
+        std::fs::write(&project_config, r#"
+[disclosure]
+token_budget = 1500
+"#).unwrap();
+
+        let config = Config::load(None, &ms_root).unwrap();
+        assert_eq!(config.disclosure.token_budget, 1500);
+    }
+
+    #[test]
+    fn config_load_with_no_config_files() {
+        let temp = TempDir::new().unwrap();
+        let ms_root = temp.path().join(".ms");
+        std::fs::create_dir_all(&ms_root).unwrap();
+
+        let config = Config::load(None, &ms_root).unwrap();
+        // Should get defaults
+        assert_eq!(config.disclosure.token_budget, 800);
+        assert!(config.cache.enabled);
+    }
+}
