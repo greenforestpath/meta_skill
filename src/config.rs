@@ -137,11 +137,11 @@ impl Config {
     }
 
     fn apply_env_overrides(&mut self) -> Result<()> {
-        if env_bool("MS_ROBOT").unwrap_or(false) {
+        if env_bool("MS_ROBOT")?.unwrap_or(false) {
             self.robot.format = "json".to_string();
             self.robot.include_metadata = true;
         }
-        if env_bool("MS_CACHE_DISABLED").unwrap_or(false) {
+        if env_bool("MS_CACHE_DISABLED")?.unwrap_or(false) {
             self.cache.enabled = false;
         }
 
@@ -161,10 +161,10 @@ impl Config {
         if let Some(values) = env_list("MS_LAYERS_PRIORITY")? {
             self.layers.priority = values;
         }
-        if let Some(value) = env_bool("MS_LAYERS_AUTO_DETECT") {
+        if let Some(value) = env_bool("MS_LAYERS_AUTO_DETECT")? {
             self.layers.auto_detect = value;
         }
-        if let Some(value) = env_bool("MS_LAYERS_PROJECT_OVERRIDES") {
+        if let Some(value) = env_bool("MS_LAYERS_PROJECT_OVERRIDES")? {
             self.layers.project_overrides = value;
         }
 
@@ -174,14 +174,14 @@ impl Config {
         if let Some(value) = env_u32("MS_DISCLOSURE_TOKEN_BUDGET")? {
             self.disclosure.token_budget = value;
         }
-        if let Some(value) = env_bool("MS_DISCLOSURE_AUTO_SUGGEST") {
+        if let Some(value) = env_bool("MS_DISCLOSURE_AUTO_SUGGEST")? {
             self.disclosure.auto_suggest = value;
         }
         if let Some(value) = env_u64("MS_DISCLOSURE_COOLDOWN_SECONDS")? {
             self.disclosure.cooldown_seconds = value;
         }
 
-        if let Some(value) = env_bool("MS_SEARCH_USE_EMBEDDINGS") {
+        if let Some(value) = env_bool("MS_SEARCH_USE_EMBEDDINGS")? {
             self.search.use_embeddings = value;
         }
         if let Some(value) = env_string("MS_SEARCH_EMBEDDING_BACKEND") {
@@ -191,13 +191,15 @@ impl Config {
             self.search.embedding_dims = value;
         }
         if let Some(value) = env_f32("MS_SEARCH_BM25_WEIGHT")? {
+            validate_weight("MS_SEARCH_BM25_WEIGHT", value)?;
             self.search.bm25_weight = value;
         }
         if let Some(value) = env_f32("MS_SEARCH_SEMANTIC_WEIGHT")? {
+            validate_weight("MS_SEARCH_SEMANTIC_WEIGHT", value)?;
             self.search.semantic_weight = value;
         }
 
-        if let Some(value) = env_bool("MS_CASS_AUTO_DETECT") {
+        if let Some(value) = env_bool("MS_CASS_AUTO_DETECT")? {
             self.cass.auto_detect = value;
         }
         if let Some(value) = env_string("MS_CASS_PATH") {
@@ -206,7 +208,7 @@ impl Config {
         if let Some(value) = env_string("MS_CASS_SESSION_PATTERN") {
             self.cass.session_pattern = value;
         }
-        if let Some(value) = env_bool("MS_CM_ENABLED") {
+        if let Some(value) = env_bool("MS_CM_ENABLED")? {
             self.cm.enabled = value;
         }
         if let Some(value) = env_string("MS_CM_PATH") {
@@ -216,7 +218,7 @@ impl Config {
             self.cm.default_flags = values;
         }
 
-        if let Some(value) = env_bool("MS_CACHE_ENABLED") {
+        if let Some(value) = env_bool("MS_CACHE_ENABLED")? {
             self.cache.enabled = value;
         }
         if let Some(value) = env_u32("MS_CACHE_MAX_SIZE_MB")? {
@@ -226,7 +228,7 @@ impl Config {
             self.cache.ttl_seconds = value;
         }
 
-        if let Some(value) = env_bool("MS_UPDATE_AUTO_CHECK") {
+        if let Some(value) = env_bool("MS_UPDATE_AUTO_CHECK")? {
             self.update.auto_check = value;
         }
         if let Some(value) = env_u32("MS_UPDATE_CHECK_INTERVAL_HOURS")? {
@@ -239,11 +241,11 @@ impl Config {
         if let Some(value) = env_string("MS_ROBOT_FORMAT") {
             self.robot.format = value;
         }
-        if let Some(value) = env_bool("MS_ROBOT_INCLUDE_METADATA") {
+        if let Some(value) = env_bool("MS_ROBOT_INCLUDE_METADATA")? {
             self.robot.include_metadata = value;
         }
 
-        if let Some(value) = env_bool("MS_SECURITY_ACIP_ENABLED") {
+        if let Some(value) = env_bool("MS_SECURITY_ACIP_ENABLED")? {
             self.security.acip.enabled = value;
         }
         if let Some(value) = env_string("MS_SECURITY_ACIP_VERSION") {
@@ -252,7 +254,7 @@ impl Config {
         if let Some(value) = env_string("MS_SECURITY_ACIP_PROMPT_PATH") {
             self.security.acip.prompt_path = PathBuf::from(value);
         }
-        if let Some(value) = env_bool("MS_SECURITY_ACIP_AUDIT_MODE") {
+        if let Some(value) = env_bool("MS_SECURITY_ACIP_AUDIT_MODE")? {
             self.security.acip.audit_mode = value;
         }
         if let Some(value) = env_string("MS_SECURITY_ACIP_TRUST_USER_MESSAGES") {
@@ -276,7 +278,7 @@ impl Config {
         if let Some(value) = env_string("MS_SAFETY_DCG_EXPLAIN_FORMAT") {
             self.safety.dcg_explain_format = value;
         }
-        if let Some(value) = env_bool("MS_SAFETY_REQUIRE_VERBATIM_APPROVAL") {
+        if let Some(value) = env_bool("MS_SAFETY_REQUIRE_VERBATIM_APPROVAL")? {
             self.safety.require_verbatim_approval = value;
         }
 
@@ -842,13 +844,17 @@ fn env_string(key: &str) -> Option<String> {
     std::env::var(key).ok()
 }
 
-fn env_bool(key: &str) -> Option<bool> {
-    std::env::var(key).ok().map(|value| {
-        matches!(
-            value.to_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    })
+fn env_bool(key: &str) -> Result<Option<bool>> {
+    match std::env::var(key) {
+        Ok(value) => match value.to_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Ok(Some(true)),
+            "0" | "false" | "no" | "off" | "" => Ok(Some(false)),
+            _ => Err(MsError::Config(format!(
+                "invalid boolean value for {key}: {value} (expected true|false|1|0|yes|no|on|off)"
+            ))),
+        },
+        Err(_) => Ok(None),
+    }
 }
 
 fn env_u32(key: &str) -> Result<Option<u32>> {
@@ -876,6 +882,18 @@ fn env_f32(key: &str) -> Result<Option<f32>> {
         }),
         Err(_) => Ok(None),
     }
+}
+
+fn validate_weight(name: &str, value: f32) -> Result<()> {
+    if value.is_nan() {
+        return Err(MsError::Config(format!("{name} cannot be NaN")));
+    }
+    if !(0.0..=1.0).contains(&value) {
+        return Err(MsError::Config(format!(
+            "{name} must be between 0.0 and 1.0, got {value}"
+        )));
+    }
+    Ok(())
 }
 
 fn env_list(key: &str) -> Result<Option<Vec<String>>> {

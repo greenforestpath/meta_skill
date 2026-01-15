@@ -798,12 +798,12 @@ impl UncertaintyQueue {
 
     /// Get the current queue length
     pub fn len(&self) -> usize {
-        self.items.read().unwrap().len()
+        self.items.read().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     /// Check if queue is empty
     pub fn is_empty(&self) -> bool {
-        self.items.read().unwrap().is_empty()
+        self.items.read().unwrap_or_else(|e| e.into_inner()).is_empty()
     }
 
     /// Add new uncertainty to queue
@@ -816,11 +816,11 @@ impl UncertaintyQueue {
             item.suggested_queries = self.query_generator.generate_queries(&item, max_queries);
         }
 
-        let mut items = self.items.write().unwrap();
+        let mut items = self.items.write().unwrap_or_else(|e| e.into_inner());
         items.push_back(item);
 
         // Update stats
-        let mut stats = self.stats.write().unwrap();
+        let mut stats = self.stats.write().unwrap_or_else(|e| e.into_inner());
         stats.total_queued += 1;
 
         // Check if we need to force resolution
@@ -841,7 +841,7 @@ impl UncertaintyQueue {
 
     /// Get next item to process (FIFO)
     pub fn next(&self) -> Option<UncertaintyItem> {
-        let items = self.items.read().unwrap();
+        let items = self.items.read().unwrap_or_else(|e| e.into_inner());
         items
             .iter()
             .find(|item| matches!(item.status, UncertaintyStatus::Pending))
@@ -850,13 +850,13 @@ impl UncertaintyQueue {
 
     /// Get item by ID
     pub fn get(&self, id: &str) -> Option<UncertaintyItem> {
-        let items = self.items.read().unwrap();
+        let items = self.items.read().unwrap_or_else(|e| e.into_inner());
         items.iter().find(|item| item.id == id).cloned()
     }
 
     /// Update an item in the queue
     pub fn update(&self, updated: UncertaintyItem) -> bool {
-        let mut items = self.items.write().unwrap();
+        let mut items = self.items.write().unwrap_or_else(|e| e.into_inner());
         if let Some(item) = items.iter_mut().find(|item| item.id == updated.id) {
             *item = updated;
             return true;
@@ -866,7 +866,7 @@ impl UncertaintyQueue {
 
     /// Mark item as resolved
     pub fn mark_resolved(&self, id: &str, resolution: Resolution, new_confidence: f32) {
-        let mut items = self.items.write().unwrap();
+        let mut items = self.items.write().unwrap_or_else(|e| e.into_inner());
         if let Some(item) = items.iter_mut().find(|item| item.id == id) {
             item.status = UncertaintyStatus::Resolved {
                 new_confidence,
@@ -877,7 +877,7 @@ impl UncertaintyQueue {
             item.confidence = new_confidence;
 
             // Update stats
-            let mut stats = self.stats.write().unwrap();
+            let mut stats = self.stats.write().unwrap_or_else(|e| e.into_inner());
             stats.total_resolved += 1;
             let resolution_time = (item.updated_at - item.created_at).num_seconds() as f64;
             let total_resolved = stats.total_resolved as f64;
@@ -889,7 +889,7 @@ impl UncertaintyQueue {
 
     /// Mark item as rejected
     pub fn mark_rejected(&self, id: &str, reason: &str) {
-        let mut items = self.items.write().unwrap();
+        let mut items = self.items.write().unwrap_or_else(|e| e.into_inner());
         if let Some(item) = items.iter_mut().find(|item| item.id == id) {
             item.status = UncertaintyStatus::Rejected {
                 reason: reason.to_string(),
@@ -898,7 +898,7 @@ impl UncertaintyQueue {
             item.updated_at = Utc::now();
 
             // Update stats
-            let mut stats = self.stats.write().unwrap();
+            let mut stats = self.stats.write().unwrap_or_else(|e| e.into_inner());
             stats.total_rejected += 1;
         }
     }
@@ -909,7 +909,7 @@ impl UncertaintyQueue {
         let now = Utc::now();
         let mut expired = Vec::new();
 
-        let mut items = self.items.write().unwrap();
+        let mut items = self.items.write().unwrap_or_else(|e| e.into_inner());
 
         // Find and mark expired items
         for item in items.iter_mut() {
@@ -930,7 +930,7 @@ impl UncertaintyQueue {
 
         // Update stats
         if !expired.is_empty() {
-            let mut stats = self.stats.write().unwrap();
+            let mut stats = self.stats.write().unwrap_or_else(|e| e.into_inner());
             stats.total_expired += expired.len() as u64;
         }
 
@@ -939,12 +939,12 @@ impl UncertaintyQueue {
 
     /// Get queue statistics
     pub fn stats(&self) -> QueueStats {
-        self.stats.read().unwrap().clone()
+        self.stats.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// List all items with optional status filter
     pub fn list(&self, status_filter: Option<&str>) -> Vec<UncertaintyItem> {
-        let items = self.items.read().unwrap();
+        let items = self.items.read().unwrap_or_else(|e| e.into_inner());
 
         items
             .iter()
@@ -969,7 +969,7 @@ impl UncertaintyQueue {
 
     /// Get counts by status
     pub fn counts(&self) -> UncertaintyCounts {
-        let items = self.items.read().unwrap();
+        let items = self.items.read().unwrap_or_else(|e| e.into_inner());
 
         let mut counts = UncertaintyCounts::default();
 

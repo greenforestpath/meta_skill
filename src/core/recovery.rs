@@ -72,12 +72,14 @@ impl RetryConfig {
             * self.backoff_multiplier.powi(attempt as i32);
         let capped_delay = base_delay.min(self.max_delay.as_secs_f64());
 
-        // Add jitter
+        // Add random jitter to prevent thundering herd
         let jitter = if self.jitter_factor > 0.0 {
+            use rand::Rng;
             let jitter_range = capped_delay * self.jitter_factor;
-            // Simple deterministic jitter based on attempt number
-            let jitter_offset = (attempt as f64 * 0.618033988749895) % 1.0;
-            jitter_range * (jitter_offset - 0.5) * 2.0
+            // Use true randomness to decorrelate retry attempts across processes
+            let mut rng = rand::rng();
+            let jitter_offset: f64 = rng.random_range(-1.0..1.0);
+            jitter_range * jitter_offset
         } else {
             0.0
         };
@@ -395,34 +397,16 @@ impl RecoveryManager {
         use crate::storage::tx::GlobalLock;
 
         if let Some(holder) = GlobalLock::status(&self.ms_root)? {
-            // Check if process is still alive
-            #[cfg(target_os = "linux")]
-            {
-                let proc_path = format!("/proc/{}", holder.pid);
-                if !Path::new(&proc_path).exists() {
-                    report.issues.push(RecoveryIssue::new(
-                        FailureMode::Lock,
-                        2,
-                        format!(
-                            "Stale lock held by dead process {} (acquired {})",
-                            holder.pid, holder.acquired_at
-                        ),
-                    ));
-                }
-            }
-
-            #[cfg(not(target_os = "linux"))]
-            {
-                // On non-Linux, we can't easily check if process is alive
-                // Report as informational
-                report.issues.push(
-                    RecoveryIssue::new(
-                        FailureMode::Lock,
-                        3,
-                        format!("Lock held by PID {} on {}", holder.pid, holder.hostname),
-                    )
-                    .not_auto_recoverable(),
-                );
+            // Check if process is still alive using cross-platform method
+            if !is_process_alive(holder.pid) {
+                report.issues.push(RecoveryIssue::new(
+                    FailureMode::Lock,
+                    2,
+                    format!(
+                        "Stale lock held by dead process {} (acquired {})",
+                        holder.pid, holder.acquired_at
+                    ),
+                ));
             }
         }
 
@@ -447,20 +431,37 @@ impl RecoveryManager {
     }
 
     fn check_search_index(&self, report: &mut RecoveryReport) -> Result<()> {
-        let index_path = self.ms_root.join("search_index");
+        // The search index is created at "index" by init.rs, not "search_index"
+        let index_path = self.ms_root.join("index");
         if !index_path.exists() {
             // Not an error - index might not be created yet
             return Ok(());
         }
 
         // Check for obvious corruption indicators
-        let meta_file = index_path.join("meta.json");
-        if index_path.is_dir() && !meta_file.exists() {
-            report.issues.push(RecoveryIssue::new(
-                FailureMode::SearchIndex,
-                2,
-                "Search index appears corrupted (missing meta.json)",
-            ));
+        // Tantivy stores segment metadata in .managed.json and segment files
+        let managed_file = index_path.join(".managed.json");
+        if index_path.is_dir() && !managed_file.exists() {
+            // Check if there are any segment files at all
+            let has_segments = std::fs::read_dir(&index_path)
+                .map(|entries| {
+                    entries
+                        .filter_map(|e| e.ok())
+                        .any(|e| {
+                            e.file_name()
+                                .to_str()
+                                .is_some_and(|n| n.ends_with(".managed.json") || n.starts_with("seg_"))
+                        })
+                })
+                .unwrap_or(false);
+
+            if !has_segments {
+                report.issues.push(RecoveryIssue::new(
+                    FailureMode::SearchIndex,
+                    2,
+                    "Search index appears corrupted or empty (no Tantivy metadata found)",
+                ));
+            }
         }
 
         Ok(())
@@ -526,14 +527,10 @@ impl RecoveryManager {
         use crate::storage::tx::GlobalLock;
 
         if let Some(holder) = GlobalLock::status(&self.ms_root)? {
-            // Only break lock if process is confirmed dead
-            #[cfg(target_os = "linux")]
-            {
-                let proc_path = format!("/proc/{}", holder.pid);
-                if !Path::new(&proc_path).exists() {
-                    if GlobalLock::break_lock(&self.ms_root)? {
-                        report.fixed += 1;
-                    }
+            // Only break lock if process is confirmed dead (cross-platform check)
+            if !is_process_alive(holder.pid) {
+                if GlobalLock::break_lock(&self.ms_root)? {
+                    report.fixed += 1;
                 }
             }
         }
@@ -541,14 +538,15 @@ impl RecoveryManager {
     }
 
     fn recover_search_index(&self, report: &mut RecoveryReport) -> Result<()> {
-        let index_path = self.ms_root.join("search_index");
+        // The search index is created at "index" by init.rs, not "search_index"
+        let index_path = self.ms_root.join("index");
         if !index_path.exists() {
             return Ok(());
         }
 
-        // Check if index is corrupted
-        let meta_file = index_path.join("meta.json");
-        if index_path.is_dir() && !meta_file.exists() {
+        // Check if index is corrupted using Tantivy's marker files
+        let managed_file = index_path.join(".managed.json");
+        if index_path.is_dir() && !managed_file.exists() {
             // Index needs rebuild - mark as needing attention
             // Actual rebuild would need the SearchIndex component
             report.unfixed += 1;
@@ -584,6 +582,57 @@ impl RecoveryManager {
 
         Ok(())
     }
+}
+
+/// Check if a process with the given PID is still running.
+/// Works on Linux, macOS, and falls back to kill(0) on other Unix systems.
+#[cfg(unix)]
+fn is_process_alive(pid: u32) -> bool {
+    // On Linux, check /proc/{pid} for efficiency and safety
+    #[cfg(target_os = "linux")]
+    {
+        let proc_path = format!("/proc/{}", pid);
+        if std::path::Path::new("/proc").is_dir() {
+            return std::path::Path::new(&proc_path).exists();
+        }
+    }
+
+    // On other Unix systems (or if /proc is missing), use `kill -0` command
+    // This avoids unsafe blocks required for libc::kill, satisfying -F unsafe-code
+    use std::process::Command;
+    match Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .output()
+    {
+        Ok(output) => {
+            if output.status.success() {
+                true
+            } else {
+                // If exit code is non-zero, it might be "No such process" (dead)
+                // or "Permission denied" (alive but owned by another user).
+                // kill -0 typically returns 1 for both.
+                // We check stderr for clues, though this is heuristic.
+                let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
+                if stderr.contains("denied") || stderr.contains("permitted") {
+                    true
+                } else {
+                    false
+                }
+            }
+        },
+        Err(_) => {
+            // If we can't run kill, assume alive to avoid breaking valid locks
+            true
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn is_process_alive(_pid: u32) -> bool {
+    // On non-Unix systems (Windows), we can't easily check process liveness
+    // Assume the process is alive to avoid accidentally breaking active locks
+    true
 }
 
 /// Execute a fallible operation with retry logic.
@@ -692,14 +741,40 @@ impl Checkpoint {
         self.state.get(key).map(|s| s.as_str())
     }
 
+    /// Sanitize an operation ID for safe use in filenames.
+    /// Rejects IDs containing path traversal or invalid characters.
+    fn sanitize_operation_id(operation_id: &str) -> Result<&str> {
+        if operation_id.is_empty() {
+            return Err(MsError::ValidationFailed(
+                "operation_id cannot be empty".to_string(),
+            ));
+        }
+
+        // Reject path traversal attempts and problematic characters
+        if operation_id.contains("..")
+            || operation_id.contains('/')
+            || operation_id.contains('\\')
+            || operation_id.contains('\0')
+        {
+            return Err(MsError::ValidationFailed(format!(
+                "operation_id contains invalid characters: {}",
+                operation_id.chars().take(50).collect::<String>()
+            )));
+        }
+
+        Ok(operation_id)
+    }
+
     /// Save checkpoint to disk.
     pub fn save(&self, ms_root: &Path) -> Result<()> {
+        let safe_id = Self::sanitize_operation_id(&self.operation_id)?;
+
         let checkpoints_dir = ms_root.join("checkpoints");
         std::fs::create_dir_all(&checkpoints_dir).map_err(|e| {
             MsError::Config(format!("Failed to create checkpoints dir: {}", e))
         })?;
 
-        let path = checkpoints_dir.join(format!("{}.json", self.operation_id));
+        let path = checkpoints_dir.join(format!("{}.json", safe_id));
         let json = serde_json::to_string_pretty(self).map_err(|e| {
             MsError::Config(format!("Failed to serialize checkpoint: {}", e))
         })?;
@@ -713,7 +788,9 @@ impl Checkpoint {
 
     /// Load checkpoint from disk.
     pub fn load(ms_root: &Path, operation_id: &str) -> Result<Option<Self>> {
-        let path = ms_root.join("checkpoints").join(format!("{}.json", operation_id));
+        let safe_id = Self::sanitize_operation_id(operation_id)?;
+
+        let path = ms_root.join("checkpoints").join(format!("{}.json", safe_id));
         if !path.exists() {
             return Ok(None);
         }
@@ -731,7 +808,9 @@ impl Checkpoint {
 
     /// Remove checkpoint from disk.
     pub fn remove(ms_root: &Path, operation_id: &str) -> Result<bool> {
-        let path = ms_root.join("checkpoints").join(format!("{}.json", operation_id));
+        let safe_id = Self::sanitize_operation_id(operation_id)?;
+
+        let path = ms_root.join("checkpoints").join(format!("{}.json", safe_id));
         if !path.exists() {
             return Ok(false);
         }

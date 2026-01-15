@@ -77,8 +77,9 @@ pub fn parse_markdown(content: &str) -> Result<SkillSpec> {
             if line.trim() == "---" {
                 in_frontmatter = false;
                 let yaml = frontmatter_lines.join("\n");
-                if let Ok(meta) = serde_yaml::from_str::<SkillMetadata>(&yaml) {
-                    metadata = meta;
+                match serde_yaml::from_str::<SkillMetadata>(&yaml) {
+                    Ok(meta) => metadata = meta,
+                    Err(e) => eprintln!("Failed to parse frontmatter: {}\nYAML:\n{}", e, yaml),
                 }
                 continue;
             }
@@ -297,7 +298,7 @@ mod tests {
     }
     #[test]
     fn parse_frontmatter_tags() {
-        let md = "---\nname: Tagged Skill\ntags: [rust, backend]\n---\n\n# Tagged Skill\n\nDescription.\n";
+        let md = "---\nid: tagged-skill\nname: Tagged Skill\nversion: 0.1.0\ndescription: A test skill\ntags: [rust, backend]\nrequires: []\nprovides: []\nplatforms: []\n---\n\n# Tagged Skill\n\nDescription.\n";
         let parsed = parse_markdown(md).expect("parse");
         assert_eq!(parsed.metadata.name, "Tagged Skill");
         assert_eq!(parsed.metadata.tags, vec!["rust", "backend"]);
