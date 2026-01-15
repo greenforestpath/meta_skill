@@ -118,45 +118,45 @@ impl BundlePackage {
         }
         cursor += header.len();
 
-        let manifest_len = read_u64(bytes, &mut cursor)? as usize;
-        if manifest_len > MAX_MANIFEST_SIZE {
+        let manifest_len = read_u64(bytes, &mut cursor)?;
+        if manifest_len > MAX_MANIFEST_SIZE as u64 {
             return Err(MsError::ValidationFailed(format!(
-                "manifest size {} exceeds maximum {}",
-                manifest_len, MAX_MANIFEST_SIZE
+                "manifest size {manifest_len} exceeds maximum {MAX_MANIFEST_SIZE}",
             )));
         }
+        let manifest_len = manifest_len as usize;
         let manifest_bytes = read_slice(bytes, &mut cursor, manifest_len)?;
         let manifest_str = std::str::from_utf8(manifest_bytes)
             .map_err(|_| MsError::ValidationFailed("manifest is not valid UTF-8".to_string()))?;
         let manifest = BundleManifest::from_toml_str(manifest_str)?;
 
-        let blob_count = read_u64(bytes, &mut cursor)? as usize;
-        if blob_count > MAX_BLOB_COUNT {
+        let blob_count = read_u64(bytes, &mut cursor)?;
+        if blob_count > MAX_BLOB_COUNT as u64 {
             return Err(MsError::ValidationFailed(format!(
-                "blob count {} exceeds maximum {}",
-                blob_count, MAX_BLOB_COUNT
+                "blob count {blob_count} exceeds maximum {MAX_BLOB_COUNT}",
             )));
         }
+        let blob_count = blob_count as usize;
         let mut blobs = Vec::with_capacity(blob_count);
         for _ in 0..blob_count {
-            let hash_len = read_u64(bytes, &mut cursor)? as usize;
-            if hash_len > MAX_HASH_SIZE {
+            let hash_len = read_u64(bytes, &mut cursor)?;
+            if hash_len > MAX_HASH_SIZE as u64 {
                 return Err(MsError::ValidationFailed(format!(
-                    "hash size {} exceeds maximum {}",
-                    hash_len, MAX_HASH_SIZE
+                    "hash size {hash_len} exceeds maximum {MAX_HASH_SIZE}",
                 )));
             }
+            let hash_len = hash_len as usize;
             let hash_bytes = read_slice(bytes, &mut cursor, hash_len)?;
             let hash = std::str::from_utf8(hash_bytes)
                 .map_err(|_| MsError::ValidationFailed("invalid blob hash".to_string()))?
                 .to_string();
-            let blob_len = read_u64(bytes, &mut cursor)? as usize;
-            if blob_len > MAX_BLOB_SIZE {
+            let blob_len = read_u64(bytes, &mut cursor)?;
+            if blob_len > MAX_BLOB_SIZE as u64 {
                 return Err(MsError::ValidationFailed(format!(
-                    "blob size {} exceeds maximum {}",
-                    blob_len, MAX_BLOB_SIZE
+                    "blob size {blob_len} exceeds maximum {MAX_BLOB_SIZE}",
                 )));
             }
+            let blob_len = blob_len as usize;
             let blob_bytes = read_slice(bytes, &mut cursor, blob_len)?.to_vec();
             blobs.push(BundleBlob {
                 hash,

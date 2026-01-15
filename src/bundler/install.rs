@@ -243,7 +243,13 @@ fn ensure_relative(path: &Path) -> Result<()> {
 fn unpack_blob(target: &Path, bytes: &[u8]) -> Result<()> {
     let mut cursor = 0usize;
     while cursor < bytes.len() {
-        let name_len = read_u64(bytes, &mut cursor)? as usize;
+        let name_len = read_u64(bytes, &mut cursor)?;
+        if name_len > bytes.len() as u64 {
+            return Err(MsError::ValidationFailed(format!(
+                "bundle entry path length {name_len} exceeds blob size",
+            )));
+        }
+        let name_len = name_len as usize;
         if name_len == 0 {
             return Err(MsError::ValidationFailed(
                 "bundle entry has empty path".to_string(),
@@ -253,7 +259,13 @@ fn unpack_blob(target: &Path, bytes: &[u8]) -> Result<()> {
         let name = std::str::from_utf8(name_bytes).map_err(|_| {
             MsError::ValidationFailed("bundle entry path is invalid UTF-8".to_string())
         })?;
-        let file_len = read_u64(bytes, &mut cursor)? as usize;
+        let file_len = read_u64(bytes, &mut cursor)?;
+        if file_len > bytes.len() as u64 {
+            return Err(MsError::ValidationFailed(format!(
+                "bundle entry file length {file_len} exceeds blob size",
+            )));
+        }
+        let file_len = file_len as usize;
         let file_bytes = read_slice(bytes, &mut cursor, file_len)?;
 
         let rel = Path::new(name);
