@@ -21,6 +21,8 @@ pub struct Config {
     #[serde(default)]
     pub cm: CmConfig,
     #[serde(default)]
+    pub ru: RuConfig,
+    #[serde(default)]
     pub cache: CacheConfig,
     #[serde(default)]
     pub update: UpdateConfig,
@@ -43,6 +45,7 @@ impl Default for Config {
             search: SearchConfig::default(),
             cass: CassConfig::default(),
             cm: CmConfig::default(),
+            ru: RuConfig::default(),
             cache: CacheConfig::default(),
             update: UpdateConfig::default(),
             robot: RobotConfig::default(),
@@ -438,6 +441,15 @@ pub struct SearchConfig {
     pub bm25_weight: f32,
     #[serde(default)]
     pub semantic_weight: f32,
+    /// API endpoint for embedding service (e.g., OpenAI, Voyage)
+    #[serde(default)]
+    pub api_endpoint: String,
+    /// Model name for API embeddings
+    #[serde(default)]
+    pub api_model: String,
+    /// Environment variable containing API key
+    #[serde(default)]
+    pub api_key_env: String,
 }
 
 impl Default for SearchConfig {
@@ -448,6 +460,9 @@ impl Default for SearchConfig {
             embedding_dims: 384,
             bm25_weight: 0.5,
             semantic_weight: 0.5,
+            api_endpoint: "https://api.openai.com/v1/embeddings".to_string(),
+            api_model: "text-embedding-3-small".to_string(),
+            api_key_env: "OPENAI_API_KEY".to_string(),
         }
     }
 }
@@ -468,6 +483,15 @@ impl SearchConfig {
         }
         if let Some(value) = patch.semantic_weight {
             self.semantic_weight = value;
+        }
+        if let Some(value) = patch.api_endpoint {
+            self.api_endpoint = value;
+        }
+        if let Some(value) = patch.api_model {
+            self.api_model = value;
+        }
+        if let Some(value) = patch.api_key_env {
+            self.api_key_env = value;
         }
     }
 }
@@ -536,6 +560,65 @@ impl CmConfig {
         }
         if let Some(values) = patch.default_flags {
             self.default_flags = values;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuConfig {
+    /// Enable ru integration for skill repo sync
+    #[serde(default)]
+    pub enabled: bool,
+    /// Path to ru binary (auto-detect if not set)
+    #[serde(default)]
+    pub ru_path: Option<String>,
+    /// List of repository paths to treat as skill sources
+    #[serde(default)]
+    pub skill_repos: Vec<String>,
+    /// Auto-index after ru sync completes
+    #[serde(default = "default_ru_auto_index")]
+    pub auto_index: bool,
+    /// Parallel sync workers (default: 4)
+    #[serde(default = "default_ru_parallel")]
+    pub parallel: u32,
+}
+
+fn default_ru_auto_index() -> bool {
+    true
+}
+
+fn default_ru_parallel() -> u32 {
+    4
+}
+
+impl Default for RuConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            ru_path: None,
+            skill_repos: Vec::new(),
+            auto_index: true,
+            parallel: 4,
+        }
+    }
+}
+
+impl RuConfig {
+    fn merge(&mut self, patch: RuPatch) {
+        if let Some(value) = patch.enabled {
+            self.enabled = value;
+        }
+        if let Some(value) = patch.ru_path {
+            self.ru_path = Some(value);
+        }
+        if let Some(values) = patch.skill_repos {
+            self.skill_repos = values;
+        }
+        if let Some(value) = patch.auto_index {
+            self.auto_index = value;
+        }
+        if let Some(value) = patch.parallel {
+            self.parallel = value;
         }
     }
 }
@@ -792,6 +875,9 @@ struct SearchPatch {
     pub embedding_dims: Option<u32>,
     pub bm25_weight: Option<f32>,
     pub semantic_weight: Option<f32>,
+    pub api_endpoint: Option<String>,
+    pub api_model: Option<String>,
+    pub api_key_env: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -806,6 +892,15 @@ struct CmPatch {
     pub enabled: Option<bool>,
     pub cm_path: Option<String>,
     pub default_flags: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct RuPatch {
+    pub enabled: Option<bool>,
+    pub ru_path: Option<String>,
+    pub skill_repos: Option<Vec<String>>,
+    pub auto_index: Option<bool>,
+    pub parallel: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

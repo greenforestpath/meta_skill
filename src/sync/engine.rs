@@ -139,6 +139,11 @@ impl SyncEngine {
                 let remote_git = open_git_remote(&remote, &self.ms_root)?;
                 self.sync_with_archive(&remote, options, &mut report, &remote_git)?;
             }
+            RemoteType::Ru => {
+                return Err(MsError::NotImplemented(
+                    "RU (Repo Updater) sync is not yet implemented".to_string(),
+                ));
+            }
         }
 
         if !options.dry_run {

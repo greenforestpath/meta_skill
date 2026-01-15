@@ -157,6 +157,9 @@ fn arb_search() -> impl Strategy<Value = SearchConfig> {
                     embedding_dims,
                     bm25_weight,
                     semantic_weight,
+                    api_endpoint: "https://api.openai.com/v1/embeddings".to_string(),
+                    api_model: "text-embedding-3-small".to_string(),
+                    api_key_env: "OPENAI_API_KEY".to_string(),
                 }
             },
         )
@@ -307,6 +310,7 @@ pub fn arb_config() -> impl Strategy<Value = Config> {
                     search,
                     cass,
                     cm: crate::config::CmConfig::default(),
+                    ru: crate::config::RuConfig::default(),
                     cache,
                     update,
                     robot,

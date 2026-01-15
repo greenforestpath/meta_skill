@@ -107,6 +107,9 @@ pub enum Commands {
     /// Show or update machine identity
     Machine(commands::machine::MachineArgs),
 
+    /// Manage meta-skills (composed slice bundles)
+    Meta(commands::meta::MetaArgs),
+
     /// Skill graph analysis (bv integration)
     Graph(commands::graph::GraphArgs),
 
@@ -172,4 +175,7 @@ pub enum Commands {
 
     /// Run as MCP (Model Context Protocol) server
     Mcp(commands::mcp::McpArgs),
+
+    /// Test embedding backends
+    Embed(commands::embed::EmbedArgs),
 }

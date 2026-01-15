@@ -1,0 +1,413 @@
+//! MetaSkill manager - resolves slices, evaluates conditions, and packs content.
+
+use std::collections::HashSet;
+use std::path::Path;
+
+use crate::app::AppContext;
+use crate::core::skill::SkillSlice;
+use crate::core::slicing::SkillSlicer;
+use crate::core::spec_lens::parse_markdown;
+use crate::error::{MsError, Result};
+use crate::storage::sqlite::SkillRecord;
+
+use super::types::{MetaDisclosureLevel, MetaSkill, MetaSkillSliceRef, SliceCondition};
+
+/// Result of loading a meta-skill.
+#[derive(Debug)]
+pub struct MetaSkillLoadResult {
+    /// The meta-skill that was loaded.
+    pub meta_skill_id: String,
+    /// All resolved slices with their content.
+    pub slices: Vec<ResolvedSlice>,
+    /// Total tokens used.
+    pub tokens_used: usize,
+    /// Slices that were skipped (conditions not met or budget exceeded).
+    pub skipped: Vec<SkippedSlice>,
+    /// Packed content ready for use.
+    pub packed_content: String,
+}
+
+/// A resolved slice from a meta-skill.
+#[derive(Debug, Clone)]
+pub struct ResolvedSlice {
+    pub skill_id: String,
+    pub slice_id: String,
+    pub content: String,
+    pub token_estimate: usize,
+    pub priority: u8,
+    pub required: bool,
+}
+
+/// A slice that was skipped during loading.
+#[derive(Debug)]
+pub struct SkippedSlice {
+    pub skill_id: String,
+    pub slice_id: Option<String>,
+    pub reason: SkipReason,
+}
+
+/// Reason a slice was skipped.
+#[derive(Debug)]
+pub enum SkipReason {
+    ConditionNotMet(String),
+    BudgetExceeded,
+    SkillNotFound,
+    SliceNotFound,
+    ResolutionError(String),
+}
+
+/// Context for condition evaluation.
+pub struct ConditionContext<'a> {
+    pub working_dir: &'a Path,
+    pub tech_stacks: &'a [String],
+    pub loaded_slices: &'a HashSet<(String, String)>,
+}
+
+impl<'a> ConditionContext<'a> {
+    pub fn evaluate(&self, condition: &SliceCondition) -> bool {
+        match condition {
+            SliceCondition::TechStack { value } => {
+                self.tech_stacks.iter().any(|s| s.eq_ignore_ascii_case(value))
+            }
+            SliceCondition::FileExists { value } => self.working_dir.join(value).exists(),
+            SliceCondition::EnvVar { value } => std::env::var(value).is_ok(),
+            SliceCondition::DependsOn { skill_id, slice_id } => {
+                self.loaded_slices.contains(&(skill_id.clone(), slice_id.clone()))
+            }
+        }
+    }
+
+    pub fn evaluate_all(&self, conditions: &[SliceCondition]) -> bool {
+        conditions.iter().all(|c| self.evaluate(c))
+    }
+}
+
+/// Manager for loading and resolving meta-skills.
+pub struct MetaSkillManager<'a> {
+    ctx: &'a AppContext,
+}
+
+impl<'a> MetaSkillManager<'a> {
+    pub fn new(ctx: &'a AppContext) -> Self {
+        Self { ctx }
+    }
+
+    /// Load a meta-skill and resolve all slices.
+    pub fn load(
+        &self,
+        meta_skill: &MetaSkill,
+        token_budget: usize,
+        condition_ctx: &ConditionContext,
+    ) -> Result<MetaSkillLoadResult> {
+        let mut resolved_slices = Vec::new();
+        let mut skipped = Vec::new();
+        let mut loaded_slice_keys: HashSet<(String, String)> = HashSet::new();
+
+        // First pass: resolve all slice references
+        for slice_ref in &meta_skill.slices {
+            let resolution = self.resolve_slice_ref(slice_ref, condition_ctx, &loaded_slice_keys);
+
+            match resolution {
+                SliceResolution::Resolved(slices) => {
+                    for slice in slices {
+                        loaded_slice_keys.insert((slice.skill_id.clone(), slice.slice_id.clone()));
+                        resolved_slices.push(slice);
+                    }
+                }
+                SliceResolution::Skipped(skip) => {
+                    skipped.push(skip);
+                }
+            }
+        }
+
+        // Sort by priority (higher first) then by required status
+        resolved_slices.sort_by(|a, b| {
+            b.required.cmp(&a.required)
+                .then_with(|| b.priority.cmp(&a.priority))
+        });
+
+        // Check that required slices fit in budget
+        let required_tokens: usize = resolved_slices
+            .iter()
+            .filter(|s| s.required)
+            .map(|s| s.token_estimate)
+            .sum();
+
+        if required_tokens > token_budget {
+            return Err(MsError::ValidationFailed(format!(
+                "required slices need {} tokens but budget is {}",
+                required_tokens, token_budget
+            )));
+        }
+
+        // Pack slices within budget
+        let (packed_slices, tokens_used) = self.pack_within_budget(
+            resolved_slices,
+            token_budget,
+            &mut skipped,
+        );
+
+        // Generate packed content
+        let packed_content = self.render_packed_content(&packed_slices, meta_skill);
+
+        Ok(MetaSkillLoadResult {
+            meta_skill_id: meta_skill.id.clone(),
+            slices: packed_slices,
+            tokens_used,
+            skipped,
+            packed_content,
+        })
+    }
+
+    fn resolve_slice_ref(
+        &self,
+        slice_ref: &MetaSkillSliceRef,
+        condition_ctx: &ConditionContext,
+        loaded_slices: &HashSet<(String, String)>,
+    ) -> SliceResolution {
+        // Check conditions first
+        if !slice_ref.conditions.is_empty() {
+            // Create updated context with currently loaded slices
+            let updated_ctx = ConditionContext {
+                working_dir: condition_ctx.working_dir,
+                tech_stacks: condition_ctx.tech_stacks,
+                loaded_slices,
+            };
+
+            if !updated_ctx.evaluate_all(&slice_ref.conditions) {
+                return SliceResolution::Skipped(SkippedSlice {
+                    skill_id: slice_ref.skill_id.clone(),
+                    slice_id: None,
+                    reason: SkipReason::ConditionNotMet("conditions not satisfied".to_string()),
+                });
+            }
+        }
+
+        // Look up the skill
+        let skill_record = match self.lookup_skill(&slice_ref.skill_id) {
+            Some(record) => record,
+            None => {
+                return SliceResolution::Skipped(SkippedSlice {
+                    skill_id: slice_ref.skill_id.clone(),
+                    slice_id: None,
+                    reason: SkipReason::SkillNotFound,
+                });
+            }
+        };
+
+        // Parse and slice the skill
+        let spec = match parse_markdown(&skill_record.body) {
+            Ok(s) => s,
+            Err(e) => {
+                return SliceResolution::Skipped(SkippedSlice {
+                    skill_id: slice_ref.skill_id.clone(),
+                    slice_id: None,
+                    reason: SkipReason::ResolutionError(e.to_string()),
+                });
+            }
+        };
+
+        let slice_index = SkillSlicer::slice(&spec);
+        let all_slices = slice_index.slices;
+
+        // Filter to requested slices or use level-based selection
+        let selected_slices = if slice_ref.slice_ids.is_empty() {
+            // Use level-based selection
+            self.select_by_level(&all_slices, slice_ref.level)
+        } else {
+            // Use explicit slice IDs
+            all_slices
+                .into_iter()
+                .filter(|s| slice_ref.slice_ids.contains(&s.id))
+                .collect()
+        };
+
+        if selected_slices.is_empty() && !slice_ref.slice_ids.is_empty() {
+            return SliceResolution::Skipped(SkippedSlice {
+                skill_id: slice_ref.skill_id.clone(),
+                slice_id: slice_ref.slice_ids.first().cloned(),
+                reason: SkipReason::SliceNotFound,
+            });
+        }
+
+        let resolved: Vec<ResolvedSlice> = selected_slices
+            .into_iter()
+            .map(|s| ResolvedSlice {
+                skill_id: slice_ref.skill_id.clone(),
+                slice_id: s.id.clone(),
+                content: s.content.clone(),
+                token_estimate: s.token_estimate,
+                priority: slice_ref.priority,
+                required: slice_ref.required,
+            })
+            .collect();
+
+        SliceResolution::Resolved(resolved)
+    }
+
+    fn select_by_level(&self, slices: &[SkillSlice], level: Option<MetaDisclosureLevel>) -> Vec<SkillSlice> {
+        use crate::core::skill::SliceType;
+
+        let level = level.unwrap_or(MetaDisclosureLevel::Core);
+
+        slices
+            .iter()
+            .filter(|s| {
+                match level {
+                    MetaDisclosureLevel::Core => {
+                        matches!(s.slice_type, SliceType::Overview | SliceType::Policy)
+                    }
+                    MetaDisclosureLevel::Extended => {
+                        matches!(s.slice_type, SliceType::Overview | SliceType::Policy | SliceType::Example | SliceType::Command)
+                    }
+                    MetaDisclosureLevel::Deep => {
+                        // Include all slice types
+                        true
+                    }
+                }
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn lookup_skill(&self, skill_id: &str) -> Option<SkillRecord> {
+        // Try exact match first
+        if let Ok(Some(record)) = self.ctx.db.get_skill(skill_id) {
+            return Some(record);
+        }
+
+        // Try name-based lookup
+        if let Ok(records) = self.ctx.db.search_fts(skill_id, 1) {
+            if let Ok(Some(record)) = self.ctx.db.get_skill(records.first()?) {
+                return Some(record);
+            }
+        }
+
+        None
+    }
+
+    fn pack_within_budget(
+        &self,
+        slices: Vec<ResolvedSlice>,
+        budget: usize,
+        skipped: &mut Vec<SkippedSlice>,
+    ) -> (Vec<ResolvedSlice>, usize) {
+        let mut packed = Vec::new();
+        let mut used = 0usize;
+
+        for slice in slices {
+            if slice.required {
+                // Required slices always included (we already verified they fit)
+                used += slice.token_estimate;
+                packed.push(slice);
+            } else if used + slice.token_estimate <= budget {
+                used += slice.token_estimate;
+                packed.push(slice);
+            } else {
+                skipped.push(SkippedSlice {
+                    skill_id: slice.skill_id,
+                    slice_id: Some(slice.slice_id),
+                    reason: SkipReason::BudgetExceeded,
+                });
+            }
+        }
+
+        (packed, used)
+    }
+
+    fn render_packed_content(&self, slices: &[ResolvedSlice], meta_skill: &MetaSkill) -> String {
+        let mut output = String::new();
+
+        // Header
+        output.push_str(&format!("# Meta-Skill: {}\n\n", meta_skill.name));
+        output.push_str(&format!("{}\n\n", meta_skill.description));
+        output.push_str("---\n\n");
+
+        // Group slices by skill for better readability
+        let mut by_skill: std::collections::HashMap<&str, Vec<&ResolvedSlice>> = std::collections::HashMap::new();
+        for slice in slices {
+            by_skill.entry(&slice.skill_id).or_default().push(slice);
+        }
+
+        for (skill_id, skill_slices) in by_skill {
+            output.push_str(&format!("## From: {}\n\n", skill_id));
+            for slice in skill_slices {
+                output.push_str(&slice.content);
+                output.push_str("\n\n");
+            }
+        }
+
+        output
+    }
+}
+
+enum SliceResolution {
+    Resolved(Vec<ResolvedSlice>),
+    Skipped(SkippedSlice),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn condition_evaluates_tech_stack() {
+        let ctx = ConditionContext {
+            working_dir: Path::new("/tmp"),
+            tech_stacks: &["rust".to_string(), "typescript".to_string()],
+            loaded_slices: &HashSet::new(),
+        };
+
+        assert!(ctx.evaluate(&SliceCondition::TechStack {
+            value: "rust".to_string()
+        }));
+        assert!(ctx.evaluate(&SliceCondition::TechStack {
+            value: "RUST".to_string()
+        }));
+        assert!(!ctx.evaluate(&SliceCondition::TechStack {
+            value: "python".to_string()
+        }));
+    }
+
+    #[test]
+    fn condition_evaluates_env_var() {
+        // Test that existing env vars are detected correctly.
+        // We check a variable that is typically set in all environments.
+        let ctx = ConditionContext {
+            working_dir: Path::new("/tmp"),
+            tech_stacks: &[],
+            loaded_slices: &HashSet::new(),
+        };
+
+        // PATH is almost always set
+        assert!(ctx.evaluate(&SliceCondition::EnvVar {
+            value: "PATH".to_string()
+        }));
+        // This variable should not exist
+        assert!(!ctx.evaluate(&SliceCondition::EnvVar {
+            value: "MS_TEST_NONEXISTENT_VAR_12345".to_string()
+        }));
+    }
+
+    #[test]
+    fn condition_evaluates_depends_on() {
+        let mut loaded = HashSet::new();
+        loaded.insert(("skill-a".to_string(), "slice-1".to_string()));
+
+        let ctx = ConditionContext {
+            working_dir: Path::new("/tmp"),
+            tech_stacks: &[],
+            loaded_slices: &loaded,
+        };
+
+        assert!(ctx.evaluate(&SliceCondition::DependsOn {
+            skill_id: "skill-a".to_string(),
+            slice_id: "slice-1".to_string(),
+        }));
+        assert!(!ctx.evaluate(&SliceCondition::DependsOn {
+            skill_id: "skill-b".to_string(),
+            slice_id: "slice-2".to_string(),
+        }));
+    }
+}

@@ -26,6 +26,7 @@ pub mod contract;
 pub mod diff;
 pub mod doctor;
 pub mod edit;
+pub mod embed;
 pub mod evidence;
 pub mod experiment;
 pub mod feedback;
@@ -39,6 +40,7 @@ pub mod list;
 pub mod load;
 pub mod machine;
 pub mod mcp;
+pub mod meta;
 pub mod migrate;
 pub mod outcome;
 pub mod pre_commit;
@@ -85,6 +87,7 @@ pub fn run(ctx: &AppContext, command: &Commands) -> Result<()> {
         Commands::Sync(args) => sync::run(ctx, args),
         Commands::Remote(args) => remote::run(ctx, args),
         Commands::Machine(args) => machine::run(ctx, args),
+        Commands::Meta(args) => meta::run(ctx, args),
         Commands::Graph(args) => graph::run(ctx, args),
         Commands::Conflicts(args) => conflicts::run(ctx, args),
         Commands::Contract(args) => contract::run(ctx, args),
@@ -107,6 +110,7 @@ pub fn run(ctx: &AppContext, command: &Commands) -> Result<()> {
         Commands::Evidence(args) => evidence::run(ctx, args),
         Commands::Mcp(args) => mcp::run(ctx, args),
         Commands::Template(args) => template::run(ctx, args),
+        Commands::Embed(args) => embed::run(ctx, args),
     }
 }
 

@@ -1,18 +1,23 @@
-//! Hash embeddings (xf-style)
+//! Pluggable embedding backends
 //!
-//! Implements FNV-1a based hash embeddings for semantic similarity.
-//! No ML model dependencies - fully deterministic.
+//! Supports multiple embedding strategies:
+//! - Hash: FNV-1a based, zero dependencies, fully deterministic
+//! - API: External embedding services (OpenAI, Voyage, etc.)
+//! - Local: ONNX runtime (not yet implemented)
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use crate::config::SearchConfig;
 use crate::error::{MsError, Result};
 
 /// Pluggable embedding backend interface
-pub trait Embedder {
+pub trait Embedder: Send + Sync {
     fn embed(&self, text: &str) -> Vec<f32>;
     fn dims(&self) -> usize;
+    fn name(&self) -> &str;
 }
 
 /// Build an embedder from search config.
@@ -28,11 +33,22 @@ pub fn build_embedder(config: &SearchConfig) -> Result<Box<dyn Embedder>> {
     match backend.as_str() {
         "" | "hash" => Ok(Box::new(HashEmbedder::new(dims))),
         "local" => Err(MsError::Config(
-            "search.embedding_backend=local is not implemented yet".to_string(),
+            "search.embedding_backend=local requires ONNX runtime (not yet implemented)".to_string(),
         )),
-        "api" => Err(MsError::Config(
-            "search.embedding_backend=api is not implemented yet".to_string(),
-        )),
+        "api" => {
+            let api_key = std::env::var(&config.api_key_env).map_err(|_| {
+                MsError::Config(format!(
+                    "API embedding requires {} environment variable",
+                    config.api_key_env
+                ))
+            })?;
+            Ok(Box::new(ApiEmbedder::new(
+                config.api_endpoint.clone(),
+                config.api_model.clone(),
+                api_key,
+                dims,
+            )))
+        }
         other => Err(MsError::Config(format!(
             "unknown embedding backend: {other}"
         ))),
@@ -113,6 +129,123 @@ impl Embedder for HashEmbedder {
 
     fn dims(&self) -> usize {
         self.dim
+    }
+
+    fn name(&self) -> &str {
+        "hash"
+    }
+}
+
+/// API-based embedder for external embedding services (OpenAI, Voyage, etc.)
+pub struct ApiEmbedder {
+    client: reqwest::blocking::Client,
+    endpoint: String,
+    model: String,
+    api_key: String,
+    dims: usize,
+    /// Rate limiting: track last request time
+    last_request: Mutex<Option<Instant>>,
+    /// Minimum delay between requests (100ms default)
+    min_delay: Duration,
+}
+
+impl ApiEmbedder {
+    pub fn new(endpoint: String, model: String, api_key: String, dims: usize) -> Self {
+        Self {
+            client: reqwest::blocking::Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .expect("failed to create HTTP client"),
+            endpoint,
+            model,
+            api_key,
+            dims,
+            last_request: Mutex::new(None),
+            min_delay: Duration::from_millis(100),
+        }
+    }
+
+    fn rate_limit(&self) {
+        let mut last = self.last_request.lock().expect("lock poisoned");
+        if let Some(last_time) = *last {
+            let elapsed = last_time.elapsed();
+            if elapsed < self.min_delay {
+                std::thread::sleep(self.min_delay - elapsed);
+            }
+        }
+        *last = Some(Instant::now());
+    }
+
+    fn call_api(&self, text: &str) -> std::result::Result<Vec<f32>, String> {
+        self.rate_limit();
+
+        let body = serde_json::json!({
+            "model": self.model,
+            "input": text,
+            "dimensions": self.dims
+        });
+
+        let response = self
+            .client
+            .post(&self.endpoint)
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .map_err(|e| format!("API request failed: {e}"))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().unwrap_or_default();
+            // Handle rate limiting with exponential backoff hint
+            if status.as_u16() == 429 {
+                return Err(format!("Rate limited by API (429). Try again later. Response: {text}"));
+            }
+            return Err(format!("API returned {status}: {text}"));
+        }
+
+        let json: serde_json::Value = response
+            .json()
+            .map_err(|e| format!("Failed to parse API response: {e}"))?;
+
+        // Parse OpenAI-style response: { "data": [{ "embedding": [...] }] }
+        let embedding = json["data"][0]["embedding"]
+            .as_array()
+            .ok_or_else(|| "Invalid response format: missing data[0].embedding".to_string())?
+            .iter()
+            .filter_map(|v| v.as_f64().map(|f| f as f32))
+            .collect::<Vec<f32>>();
+
+        if embedding.len() != self.dims {
+            return Err(format!(
+                "Embedding dimension mismatch: expected {}, got {}",
+                self.dims,
+                embedding.len()
+            ));
+        }
+
+        Ok(embedding)
+    }
+}
+
+impl Embedder for ApiEmbedder {
+    fn embed(&self, text: &str) -> Vec<f32> {
+        match self.call_api(text) {
+            Ok(embedding) => embedding,
+            Err(e) => {
+                eprintln!("API embedding error: {e}");
+                // Return zero vector on error (graceful degradation)
+                vec![0.0; self.dims]
+            }
+        }
+    }
+
+    fn dims(&self) -> usize {
+        self.dims
+    }
+
+    fn name(&self) -> &str {
+        "api"
     }
 }
 
