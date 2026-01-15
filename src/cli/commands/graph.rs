@@ -274,25 +274,7 @@ fn run_top(
         return crate::cli::output::emit_json(&output);
     }
 
-    let mut resolved = resolve_metric_items(&items, names);
-    resolved.truncate(args.limit.min(resolved.len()));
-
-    println!("{} (showing {}):", key, resolved.len());
-    println!("{:>4} {:>10} {:36} {}", "Rank", "Score", "Skill ID", "Name");
-    println!("{:>4} {:>10} {:36} {}", "----", "-----", "--------", "----");
-    for (idx, entry) in resolved.iter().enumerate() {
-        let score_str = entry
-            .score
-            .map(|s| format!("{:.4}", s))
-            .unwrap_or_else(|| "-".to_string());
-        println!(
-            "{:>4} {:>10} {:36} {}",
-            idx + 1,
-            score_str,
-            entry.id,
-            entry.name.clone().unwrap_or_default()
-        );
-    }
+    print_metric_table(key, &items, names, args.limit);
     Ok(())
 }
 
@@ -333,28 +315,9 @@ fn print_metric_table(
     names: &std::collections::HashMap<String, String>,
     limit: usize,
 ) {
-    if items.is_empty() {
-        return;
-    }
-    let mut resolved = resolve_metric_items(items, names);
-    resolved.truncate(limit.min(resolved.len()));
-
-    println!();
-    println!("{} (showing {}):", title, resolved.len());
-    println!("{:>4} {:>10} {:36} {}", "Rank", "Score", "Skill ID", "Name");
-    println!("{:>4} {:>10} {:36} {}", "----", "-----", "--------", "----");
-    for (idx, entry) in resolved.iter().enumerate() {
-        let score_str = entry
-            .score
-            .map(|s| format!("{:.4}", s))
-            .unwrap_or_else(|| "-".to_string());
-        println!(
-            "{:>4} {:>10} {:36} {}",
-            idx + 1,
-            score_str,
-            entry.id,
-            entry.name.clone().unwrap_or_default()
-        );
+    if let Some(table) = format_metric_table(title, items, names, limit) {
+        println!();
+        println!("{}", table);
     }
 }
 
@@ -363,12 +326,64 @@ fn print_cycles_table(
     names: &std::collections::HashMap<String, String>,
     limit: usize,
 ) {
+    if let Some(table) = format_cycles_table(cycles, names, limit) {
+        println!();
+        println!("{}", table);
+    }
+}
+
+fn format_metric_table(
+    title: &str,
+    items: &[serde_json::Value],
+    names: &std::collections::HashMap<String, String>,
+    limit: usize,
+) -> Option<String> {
+    if items.is_empty() {
+        return None;
+    }
+    let mut resolved = resolve_metric_items(items, names);
+    resolved.truncate(limit.min(resolved.len()));
+    if resolved.is_empty() {
+        return None;
+    }
+
+    let mut lines = Vec::new();
+    lines.push(format!("{} (showing {}):", title, resolved.len()));
+    lines.push(format!(
+        "{:>4} {:>10} {:36} {}",
+        "Rank", "Score", "Skill ID", "Name"
+    ));
+    lines.push(format!(
+        "{:>4} {:>10} {:36} {}",
+        "----", "-----", "--------", "----"
+    ));
+    for (idx, entry) in resolved.iter().enumerate() {
+        let score_str = entry
+            .score
+            .map(|s| format!("{:.4}", s))
+            .unwrap_or_else(|| "-".to_string());
+        lines.push(format!(
+            "{:>4} {:>10} {:36} {}",
+            idx + 1,
+            score_str,
+            entry.id,
+            entry.name.clone().unwrap_or_default()
+        ));
+    }
+    Some(lines.join("\n"))
+}
+
+fn format_cycles_table(
+    cycles: &[serde_json::Value],
+    names: &std::collections::HashMap<String, String>,
+    limit: usize,
+) -> Option<String> {
     if cycles.is_empty() {
-        return;
+        return None;
     }
     let limit = limit.min(cycles.len());
-    println!();
-    println!("Cycles (showing {}):", limit);
+    let mut lines = Vec::new();
+    lines.push(format!("Cycles (showing {}):", limit));
     for (idx, cycle) in cycles.iter().take(limit).enumerate() {
         let chain = cycle
             .as_array()
@@ -383,8 +398,9 @@ fn print_cycles_table(
                     .join(" -> ")
             })
             .unwrap_or_else(|| cycle.to_string());
-        println!("  {:>2}. {}", idx + 1, chain);
+        lines.push(format!("  {:>2}. {}", idx + 1, chain));
     }
+    Some(lines.join("\n"))
 }
 
 fn run_health(ctx: &AppContext, client: &BvClient, issues: &[crate::beads::Issue]) -> Result<()> {
@@ -394,4 +410,47 @@ fn run_health(ctx: &AppContext, client: &BvClient, issues: &[crate::beads::Issue
     }
     println!("{}", serde_json::to_string_pretty(&value)?);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_metric_table_renders() {
+        let items = vec![
+            serde_json::json!({"id": "skill-a", "value": 0.12345}),
+            serde_json::json!(["skill-b", 0.9]),
+        ];
+        let names = std::collections::HashMap::from([
+            ("skill-a".to_string(), "Skill A".to_string()),
+            ("skill-b".to_string(), "Skill B".to_string()),
+        ]);
+
+        let table = format_metric_table("Keystones", &items, &names, 1).unwrap();
+        assert!(table.contains("Keystones (showing 1):"));
+        assert!(table.contains("skill-a"));
+        assert!(table.contains("Skill A"));
+        assert!(table.contains("0.1235"));
+    }
+
+    #[test]
+    fn format_cycles_table_renders() {
+        let cycles = vec![serde_json::json!(["skill-a", "skill-b"])];
+        let names = std::collections::HashMap::from([
+            ("skill-a".to_string(), "Skill A".to_string()),
+            ("skill-b".to_string(), "Skill B".to_string()),
+        ]);
+
+        let table = format_cycles_table(&cycles, &names, 5).unwrap();
+        assert!(table.contains("Cycles (showing 1):"));
+        assert!(table.contains("skill-a (Skill A) -> skill-b (Skill B)"));
+    }
+
+    #[test]
+    fn format_tables_empty() {
+        let names = std::collections::HashMap::<String, String>::new();
+        assert!(format_metric_table("Keystones", &[], &names, 5).is_none());
+        assert!(format_cycles_table(&[], &names, 5).is_none());
+    }
 }
