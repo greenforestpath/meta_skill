@@ -244,6 +244,10 @@ impl<'a> SkillTestRunner<'a> {
                         skills.push(name.to_string());
                     }
                 }
+                // Recurse into nested directories (skip tests/ itself)
+                if path.file_name().and_then(|n| n.to_str()) != Some("tests") {
+                    self.scan_for_tests(&path, skills)?;
+                }
             }
         }
 
