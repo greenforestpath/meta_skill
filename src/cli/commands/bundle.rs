@@ -1,18 +1,23 @@
 //! ms bundle - Manage skill bundles
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::{Args, Subcommand};
+use semver::Version;
+use serde::Serialize;
 
 use crate::app::AppContext;
 use crate::bundler::github::{download_bundle, download_url, publish_bundle, GitHubConfig};
 use crate::bundler::install::InstallReport;
-use crate::bundler::local_safety::{detect_modifications, ModificationStatus, SkillModificationReport};
+use crate::bundler::local_safety::{
+    backup_file, detect_modifications, hash_bytes, ModificationStatus, SkillModificationReport,
+};
 use crate::bundler::registry::{BundleRegistry, InstallSource, InstalledBundle, ParsedSource};
-use crate::bundler::{Bundle, BundleInfo, BundleManifest, BundledSkill};
+use crate::bundler::{Bundle, BundleInfo, BundleManifest, BundlePackage, BundledSkill};
 use crate::cli::output::emit_json;
 use crate::error::{MsError, Result};
+use crate::storage::GlobalLock;
 
 #[derive(Args, Debug)]
 pub struct BundleArgs {
@@ -30,6 +35,8 @@ pub enum BundleCommand {
     Install(BundleInstallArgs),
     /// Remove an installed bundle
     Remove(BundleRemoveArgs),
+    /// Update installed bundles
+    Update(BundleUpdateArgs),
     /// List installed bundles
     List,
     /// Show details of a bundle
@@ -165,6 +172,36 @@ pub struct BundleRemoveArgs {
 }
 
 #[derive(Args, Debug)]
+pub struct BundleUpdateArgs {
+    /// Bundle ID to update (default: all installed bundles)
+    pub bundle_id: Option<String>,
+
+    /// Check for updates without applying
+    #[arg(long)]
+    pub check: bool,
+
+    /// Update all bundles (ignores bundle_id)
+    #[arg(long)]
+    pub all: bool,
+
+    /// Show what would change without applying
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Force update (overwrite local changes)
+    #[arg(long, short = 'f')]
+    pub force: bool,
+
+    /// GitHub token (overrides env)
+    #[arg(long)]
+    pub token: Option<String>,
+
+    /// Skip signature verification (checksum still enforced)
+    #[arg(long)]
+    pub no_verify: bool,
+}
+
+#[derive(Args, Debug)]
 pub struct BundleConflictsArgs {
     /// Skill to check (default: all installed skills)
     #[arg(long)]
@@ -192,6 +229,7 @@ pub fn run(_ctx: &AppContext, _args: &BundleArgs) -> Result<()> {
         BundleCommand::Install(install) => run_install(ctx, install),
         BundleCommand::Remove(remove) => run_remove(ctx, remove),
         BundleCommand::Publish(publish) => run_publish(ctx, publish),
+        BundleCommand::Update(update) => run_update(ctx, update),
         BundleCommand::List => run_list(ctx),
         BundleCommand::Show(show) => run_show(ctx, show),
         BundleCommand::Conflicts(conflicts) => run_conflicts(ctx, conflicts),
@@ -210,11 +248,6 @@ fn run_create(ctx: &AppContext, args: &BundleCreateArgs) -> Result<()> {
         return Err(MsError::ValidationFailed(
             "bundle create requires --skills or --from-dir".to_string(),
         ));
-    }
-
-    // Warn about unimplemented signing feature
-    if args.sign {
-        eprintln!("Warning: --sign is not yet implemented; bundle will be created unsigned");
     }
 
     let bundle_id = args.id.clone().unwrap_or_else(|| slugify(&args.name));
@@ -297,8 +330,37 @@ fn run_create(ctx: &AppContext, args: &BundleCreateArgs) -> Result<()> {
     manifest.validate()?;
 
     let bundle = Bundle::new(manifest, &root);
-    let package = bundle.package()?;
+    let mut package = bundle.package()?;
     package.verify()?;
+
+    // Sign the bundle if requested
+    if args.sign {
+        let key_path = args.sign_key.clone().unwrap_or_else(|| {
+            dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".ssh")
+                .join("id_ed25519")
+        });
+
+        let signer = crate::bundler::Ed25519Signer::from_openssh_file(&key_path)?;
+
+        // Sign the checksum (the payload that represents bundle integrity)
+        let checksum = package.manifest.checksum.as_ref().ok_or_else(|| {
+            MsError::ValidationFailed("bundle has no checksum to sign".to_string())
+        })?;
+
+        // Get signer identity from git config or username
+        let signer_name = std::env::var("USER")
+            .or_else(|_| std::env::var("USERNAME"))
+            .unwrap_or_else(|_| "unknown".to_string());
+
+        let signature = signer.sign(checksum.as_bytes(), &signer_name);
+        package.manifest.signatures.push(signature);
+
+        if !ctx.robot_mode {
+            eprintln!("Signed bundle with key: {}", key_path.display());
+        }
+    }
 
     let output = args
         .output
@@ -564,6 +626,518 @@ fn run_remove(ctx: &AppContext, args: &BundleRemoveArgs) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[derive(Serialize)]
+struct BundleUpdateItem {
+    bundle_id: String,
+    current_version: String,
+    available_version: Option<String>,
+    update_available: bool,
+    applied: bool,
+    source: String,
+    conflicts: Vec<BundleConflictSummary>,
+    skipped_reason: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Serialize)]
+struct BundleUpdateSummary {
+    status: String,
+    updates: Vec<BundleUpdateItem>,
+}
+
+#[derive(Serialize)]
+struct BundleConflictSummary {
+    skill_id: String,
+    modified: usize,
+    deleted: usize,
+    conflict: usize,
+}
+
+fn run_update(ctx: &AppContext, args: &BundleUpdateArgs) -> Result<()> {
+    // Acquire lock to prevent concurrent modifications
+    let _lock = GlobalLock::acquire(&ctx.ms_root)?;
+
+    if args.all && args.bundle_id.is_some() {
+        return Err(MsError::ValidationFailed(
+            "--all cannot be used with bundle_id".to_string(),
+        ));
+    }
+
+    let registry = BundleRegistry::open(ctx.git.root())?;
+    let mut targets: Vec<InstalledBundle> = if let Some(ref id) = args.bundle_id {
+        vec![registry
+            .get(id)
+            .cloned()
+            .ok_or_else(|| MsError::NotFound(format!("bundle '{}' is not installed", id)))?]
+    } else {
+        registry.list().cloned().collect()
+    };
+
+    if targets.is_empty() {
+        if ctx.robot_mode {
+            return emit_json(&BundleUpdateSummary {
+                status: "ok".to_string(),
+                updates: Vec::new(),
+            });
+        }
+        println!("No bundles installed.");
+        return Ok(());
+    }
+
+    targets.sort_by(|a, b| a.id.cmp(&b.id));
+
+    let mut updates = Vec::new();
+    let default_check = !args.check
+        && !args.dry_run
+        && !args.all
+        && args.bundle_id.is_none();
+
+    for installed in targets {
+        let item = match fetch_update_candidate(ctx, args, &installed) {
+            Ok(candidate) => build_update_item(ctx, args, &installed, candidate, default_check)?,
+            Err(err) => BundleUpdateItem {
+                bundle_id: installed.id.clone(),
+                current_version: installed.version.clone(),
+                available_version: None,
+                update_available: false,
+                applied: false,
+                source: installed.source.to_string(),
+                conflicts: Vec::new(),
+                skipped_reason: None,
+                error: Some(err.to_string()),
+            },
+        };
+
+        updates.push(item);
+    }
+
+    if ctx.robot_mode {
+        return emit_json(&BundleUpdateSummary {
+            status: "ok".to_string(),
+            updates,
+        });
+    }
+
+    print_update_summary(&updates);
+    Ok(())
+}
+
+struct UpdateCandidate {
+    package: BundlePackage,
+    source: InstallSource,
+}
+
+fn fetch_update_candidate(
+    ctx: &AppContext,
+    args: &BundleUpdateArgs,
+    installed: &InstalledBundle,
+) -> Result<UpdateCandidate> {
+    let (bytes, source_override) = match &installed.source {
+        InstallSource::GitHub { repo, tag, asset } => {
+            let result = download_bundle(
+                repo,
+                tag.as_deref(),
+                asset.as_deref(),
+                args.token.clone(),
+            )?;
+            (
+                result.bytes,
+                Some(InstallSource::GitHub {
+                    repo: repo.clone(),
+                    tag: Some(result.tag),
+                    asset: Some(result.asset_name),
+                }),
+            )
+        }
+        InstallSource::Url { url } => (download_url(url, args.token.clone())?, None),
+        InstallSource::File { path } => (
+            std::fs::read(path)
+                .map_err(|err| MsError::Config(format!("read bundle {}: {err}", path)))?,
+            None,
+        ),
+    };
+
+    let package = BundlePackage::from_bytes(&bytes)?;
+    let source = source_override.unwrap_or_else(|| installed.source.clone());
+    if package.manifest.bundle.id != installed.id {
+        return Err(MsError::ValidationFailed(format!(
+            "bundle id mismatch: expected {}, got {}",
+            installed.id, package.manifest.bundle.id
+        )));
+    }
+    verify_bundle(ctx, args, &package)?;
+    Ok(UpdateCandidate { package, source })
+}
+
+fn verify_bundle(ctx: &AppContext, args: &BundleUpdateArgs, package: &BundlePackage) -> Result<()> {
+    package.verify()?;
+
+    if args.no_verify {
+        return Ok(());
+    }
+
+    if package.manifest.signatures.is_empty() {
+        if !ctx.robot_mode {
+            eprintln!(
+                "Warning: Updating with unsigned bundle '{}'. Use signed bundles for production.",
+                package.manifest.bundle.id
+            );
+        }
+        return Ok(());
+    }
+
+    Err(MsError::ValidationFailed(format!(
+        "Bundle '{}' is signed but trusted key configuration is not yet implemented. \
+         Use --no-verify to update (not recommended for production).",
+        package.manifest.bundle.id
+    )))
+}
+
+fn build_update_item(
+    ctx: &AppContext,
+    args: &BundleUpdateArgs,
+    installed: &InstalledBundle,
+    candidate: UpdateCandidate,
+    default_check: bool,
+) -> Result<BundleUpdateItem> {
+    let new_version = candidate.package.manifest.bundle.version.clone();
+    let update_available = is_newer_version(&installed.version, &new_version)?;
+
+    let mut item = BundleUpdateItem {
+        bundle_id: installed.id.clone(),
+        current_version: installed.version.clone(),
+        available_version: Some(new_version.clone()),
+        update_available,
+        applied: false,
+        source: installed.source.to_string(),
+        conflicts: Vec::new(),
+        skipped_reason: None,
+        error: None,
+    };
+
+    let check_only = args.check || args.dry_run || default_check;
+    if !update_available {
+        item.available_version = None;
+        return Ok(item);
+    }
+
+    if check_only {
+        item.skipped_reason = Some("check_only".to_string());
+        return Ok(item);
+    }
+
+    let apply_result = apply_bundle_update(ctx, args, installed, &candidate)?;
+    item.applied = apply_result.applied;
+    item.conflicts = apply_result.conflicts;
+    item.skipped_reason = apply_result.skipped_reason;
+    Ok(item)
+}
+
+struct ApplyResult {
+    applied: bool,
+    conflicts: Vec<BundleConflictSummary>,
+    skipped_reason: Option<String>,
+}
+
+fn apply_bundle_update(
+    ctx: &AppContext,
+    args: &BundleUpdateArgs,
+    installed: &InstalledBundle,
+    candidate: &UpdateCandidate,
+) -> Result<ApplyResult> {
+    let mut conflicts = Vec::new();
+    let backup_root = backup_root(ctx, &installed.id);
+    let mut pending = Vec::new();
+
+    for skill in &candidate.package.manifest.skills {
+        let (entries, new_hashes) = bundle_skill_entries(&candidate.package, skill)?;
+        let target = resolve_bundle_target(ctx.git.root(), &skill.path, &skill.name)?;
+
+        let report = if target.exists() {
+            match load_bundle_meta(&target)? {
+                Some(existing_hashes) => {
+                    let report = detect_modifications(&target, &skill.name, &existing_hashes)?;
+                    if report.needs_attention() {
+                        conflicts.push(BundleConflictSummary {
+                            skill_id: report.skill_id.clone(),
+                            modified: report.summary.modified,
+                            deleted: report.summary.deleted,
+                            conflict: report.summary.conflict,
+                        });
+                    }
+                    Some(report)
+                }
+                None => {
+                    if !ctx.robot_mode {
+                        eprintln!(
+                            "Warning: bundle metadata missing for '{}'; update will overwrite without modification detection.",
+                            skill.name
+                        );
+                    }
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        pending.push((skill.name.clone(), target, entries, new_hashes, report));
+    }
+
+    if !conflicts.is_empty() && !args.force {
+        return Ok(ApplyResult {
+            applied: false,
+            conflicts,
+            skipped_reason: Some("conflicts_detected".to_string()),
+        });
+    }
+
+    for (_skill_name, target, entries, expected_hashes, report) in pending {
+        if let Some(report) = report {
+            if report.needs_attention() && args.force {
+                for file in report.files.iter() {
+                    if matches!(
+                        file.status,
+                        ModificationStatus::Modified | ModificationStatus::Conflict
+                    ) {
+                        let path = target.join(&file.path);
+                        if path.exists() {
+                            let _ = backup_file(&path, &backup_root);
+                        }
+                    }
+                }
+            }
+        }
+
+        write_bundle_files(&target, &entries)?;
+        write_bundle_meta(&target, &expected_hashes)?;
+    }
+
+    let installed = InstalledBundle {
+        id: candidate.package.manifest.bundle.id.clone(),
+        version: candidate.package.manifest.bundle.version.clone(),
+        source: candidate.source.clone(),
+        installed_at: chrono::Utc::now(),
+        skills: candidate
+            .package
+            .manifest
+            .skills
+            .iter()
+            .map(|s| s.name.clone())
+            .collect(),
+        checksum: candidate.package.manifest.checksum.clone(),
+    };
+    BundleRegistry::open(ctx.git.root())?.register(installed)?;
+
+    Ok(ApplyResult {
+        applied: true,
+        conflicts,
+        skipped_reason: None,
+    })
+}
+
+fn is_newer_version(current: &str, candidate: &str) -> Result<bool> {
+    let current_trim = current.trim_start_matches('v');
+    let candidate_trim = candidate.trim_start_matches('v');
+    match (Version::parse(current_trim), Version::parse(candidate_trim)) {
+        (Ok(c), Ok(n)) => Ok(n > c),
+        _ => Ok(candidate_trim != current_trim),
+    }
+}
+
+fn bundle_skill_entries(
+    package: &BundlePackage,
+    skill: &BundledSkill,
+) -> Result<(Vec<(PathBuf, Vec<u8>)>, HashMap<PathBuf, String>)> {
+    let hash = skill.hash.as_ref().ok_or_else(|| {
+        MsError::ValidationFailed(format!("missing blob hash for {}", skill.name))
+    })?;
+    let blob = package
+        .blobs
+        .iter()
+        .find(|b| &b.hash == hash)
+        .ok_or_else(|| {
+            MsError::ValidationFailed(format!("bundle missing blob {} for {}", hash, skill.name))
+        })?;
+
+    let entries = decode_blob_entries(&blob.bytes)?;
+    let mut expected_hashes = HashMap::new();
+    for (path, bytes) in &entries {
+        expected_hashes.insert(path.clone(), hash_bytes(bytes));
+    }
+    Ok((entries, expected_hashes))
+}
+
+fn decode_blob_entries(input: &[u8]) -> Result<Vec<(PathBuf, Vec<u8>)>> {
+    let mut cursor = 0usize;
+    let mut entries = Vec::new();
+    while cursor < input.len() {
+        let name_len = read_u64(input, &mut cursor)? as usize;
+        if name_len == 0 {
+            return Err(MsError::ValidationFailed(
+                "bundle entry has empty path".to_string(),
+            ));
+        }
+        let name_bytes = read_slice(input, &mut cursor, name_len)?;
+        let name = std::str::from_utf8(name_bytes).map_err(|_| {
+            MsError::ValidationFailed("bundle entry path is invalid UTF-8".to_string())
+        })?;
+        let file_len = read_u64(input, &mut cursor)? as usize;
+        let file_bytes = read_slice(input, &mut cursor, file_len)?.to_vec();
+        entries.push((PathBuf::from(name), file_bytes));
+    }
+    Ok(entries)
+}
+
+fn write_bundle_files(target: &Path, entries: &[(PathBuf, Vec<u8>)]) -> Result<()> {
+    for (rel, bytes) in entries {
+        ensure_relative(rel)?;
+        let path = target.join(rel);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|err| {
+                MsError::Config(format!("create {}: {err}", parent.display()))
+            })?;
+        }
+        std::fs::write(&path, bytes)
+            .map_err(|err| MsError::Config(format!("write {}: {err}", path.display())))?;
+    }
+    Ok(())
+}
+
+fn load_bundle_meta(target: &Path) -> Result<Option<HashMap<PathBuf, String>>> {
+    let meta_path = target.join(".bundle_meta.json");
+    if !meta_path.exists() {
+        return Ok(None);
+    }
+    let content = std::fs::read_to_string(&meta_path)
+        .map_err(|err| MsError::Config(format!("read {}: {err}", meta_path.display())))?;
+    let parsed = serde_json::from_str(&content)
+        .map_err(|err| MsError::Config(format!("parse {}: {err}", meta_path.display())))?;
+    Ok(Some(parsed))
+}
+
+fn write_bundle_meta(target: &Path, expected_hashes: &HashMap<PathBuf, String>) -> Result<()> {
+    let meta_path = target.join(".bundle_meta.json");
+    let content = serde_json::to_string_pretty(expected_hashes)
+        .map_err(|err| MsError::Config(format!("serialize bundle meta: {err}")))?;
+    std::fs::write(&meta_path, content)
+        .map_err(|err| MsError::Config(format!("write {}: {err}", meta_path.display())))
+}
+
+fn resolve_bundle_target(root: &Path, path: &Path, fallback_id: &str) -> Result<PathBuf> {
+    if !path.as_os_str().is_empty() {
+        ensure_relative(path)?;
+        return Ok(root.join(path));
+    }
+    ensure_safe_id(fallback_id)?;
+    Ok(root.join("skills").join("by-id").join(fallback_id))
+}
+
+fn ensure_safe_id(id: &str) -> Result<()> {
+    if id.is_empty() {
+        return Err(MsError::ValidationFailed(
+            "skill id must not be empty".to_string(),
+        ));
+    }
+    if id.contains("..") || id.contains('/') || id.contains('\\') {
+        return Err(MsError::ValidationFailed(format!(
+            "skill id contains invalid characters: {}",
+            id
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_relative(path: &Path) -> Result<()> {
+    if path.is_absolute() {
+        return Err(MsError::ValidationFailed(format!(
+            "bundle path must be relative: {}",
+            path.display()
+        )));
+    }
+    for comp in path.components() {
+        match comp {
+            std::path::Component::ParentDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => {
+                return Err(MsError::ValidationFailed(format!(
+                    "bundle path contains invalid component: {}",
+                    path.display()
+                )));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn read_u64(input: &[u8], cursor: &mut usize) -> Result<u64> {
+    if *cursor + 8 > input.len() {
+        return Err(MsError::ValidationFailed(
+            "bundle data truncated".to_string(),
+        ));
+    }
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(&input[*cursor..*cursor + 8]);
+    *cursor += 8;
+    Ok(u64::from_le_bytes(buf))
+}
+
+fn read_slice<'a>(input: &'a [u8], cursor: &mut usize, len: usize) -> Result<&'a [u8]> {
+    if *cursor + len > input.len() {
+        return Err(MsError::ValidationFailed(
+            "bundle data truncated".to_string(),
+        ));
+    }
+    let slice = &input[*cursor..*cursor + len];
+    *cursor += len;
+    Ok(slice)
+}
+
+fn backup_root(ctx: &AppContext, bundle_id: &str) -> PathBuf {
+    let timestamp = chrono::Utc::now().format("%Y%m%d%H%M%S").to_string();
+    ctx.git
+        .root()
+        .join("bundles")
+        .join("backups")
+        .join(bundle_id)
+        .join(timestamp)
+}
+
+fn print_update_summary(updates: &[BundleUpdateItem]) {
+    if updates.is_empty() {
+        println!("No bundles to update.");
+        return;
+    }
+
+    for update in updates {
+        println!(
+            "{} {} (current: {})",
+            if update.applied { "✓" } else { "-" },
+            update.bundle_id,
+            update.current_version
+        );
+        if let Some(ref available) = update.available_version {
+            println!("  available: {}", available);
+        }
+        if !update.conflicts.is_empty() {
+            println!("  conflicts:");
+            for conflict in &update.conflicts {
+                println!(
+                    "    - {} (modified: {}, deleted: {}, conflict: {})",
+                    conflict.skill_id, conflict.modified, conflict.deleted, conflict.conflict
+                );
+            }
+        }
+        if let Some(ref reason) = update.skipped_reason {
+            println!("  skipped: {}", reason);
+        }
+        if let Some(ref error) = update.error {
+            println!("  error: {}", error);
+        }
+    }
 }
 
 fn run_publish(ctx: &AppContext, args: &BundlePublishArgs) -> Result<()> {
@@ -1506,6 +2080,64 @@ mod tests {
             assert!(conflicts.diff);
         } else {
             panic!("Expected Conflicts command");
+        }
+    }
+
+    #[test]
+    fn test_bundle_update_args_defaults() {
+        use clap::Parser;
+
+        #[derive(Parser)]
+        struct TestCli {
+            #[command(subcommand)]
+            cmd: BundleCommand,
+        }
+
+        let args = TestCli::parse_from(["test", "update"]);
+        if let BundleCommand::Update(update) = args.cmd {
+            assert!(update.bundle_id.is_none());
+            assert!(!update.check);
+            assert!(!update.all);
+            assert!(!update.dry_run);
+            assert!(!update.force);
+            assert!(!update.no_verify);
+        } else {
+            panic!("Expected Update command");
+        }
+    }
+
+    #[test]
+    fn test_bundle_update_args_with_options() {
+        use clap::Parser;
+
+        #[derive(Parser)]
+        struct TestCli {
+            #[command(subcommand)]
+            cmd: BundleCommand,
+        }
+
+        let args = TestCli::parse_from([
+            "test",
+            "update",
+            "bundle-1",
+            "--check",
+            "--all",
+            "--dry-run",
+            "--force",
+            "--token",
+            "ghp_123",
+            "--no-verify",
+        ]);
+        if let BundleCommand::Update(update) = args.cmd {
+            assert_eq!(update.bundle_id.as_deref(), Some("bundle-1"));
+            assert!(update.check);
+            assert!(update.all);
+            assert!(update.dry_run);
+            assert!(update.force);
+            assert_eq!(update.token.as_deref(), Some("ghp_123"));
+            assert!(update.no_verify);
+        } else {
+            panic!("Expected Update command");
         }
     }
 

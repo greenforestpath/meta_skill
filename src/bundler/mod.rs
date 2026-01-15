@@ -17,7 +17,7 @@ pub use local_safety::{
     SkillModificationReport,
 };
 pub use manifest::{
-    BundleDependency, BundleInfo, BundleManifest, BundleSignature, BundledSkill, Ed25519Verifier,
-    SignatureVerifier,
+    BundleDependency, BundleInfo, BundleManifest, BundleSignature, BundledSkill, Ed25519Signer,
+    Ed25519Verifier, SignatureVerifier,
 };
 pub use package::{missing_blobs, Bundle, BundleBlob, BundlePackage};

@@ -1,4 +1,5 @@
 use crate::error::{MsError, Result};
+use ring::signature::KeyPair;
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -207,6 +208,228 @@ impl Default for Ed25519Verifier {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Ed25519 signer for creating bundle signatures.
+///
+/// Loads private keys from OpenSSH format (the standard format used by ssh-keygen).
+pub struct Ed25519Signer {
+    keypair: ring::signature::Ed25519KeyPair,
+    key_id: String,
+}
+
+impl std::fmt::Debug for Ed25519Signer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Ed25519Signer")
+            .field("key_id", &self.key_id)
+            .field("keypair", &"[Ed25519KeyPair]")
+            .finish()
+    }
+}
+
+impl Ed25519Signer {
+    /// Load a signer from an OpenSSH private key file.
+    ///
+    /// Supports unencrypted Ed25519 keys in the standard OpenSSH format
+    /// (e.g., `~/.ssh/id_ed25519`).
+    pub fn from_openssh_file(path: &std::path::Path) -> Result<Self> {
+        let contents = std::fs::read_to_string(path).map_err(|err| {
+            MsError::Config(format!("failed to read key file {}: {}", path.display(), err))
+        })?;
+        Self::from_openssh_str(&contents)
+    }
+
+    /// Load a signer from an OpenSSH private key string.
+    pub fn from_openssh_str(pem: &str) -> Result<Self> {
+        let (seed, public_key) = parse_openssh_ed25519_key(pem)?;
+
+        let keypair =
+            ring::signature::Ed25519KeyPair::from_seed_unchecked(&seed).map_err(|_| {
+                MsError::ValidationFailed("invalid Ed25519 seed in SSH key".to_string())
+            })?;
+
+        // Generate key_id from public key (hex-encoded first 8 bytes)
+        let key_id = format!("ed25519:{}", hex::encode(&public_key[..8]));
+
+        Ok(Self { keypair, key_id })
+    }
+
+    /// Sign data and return a BundleSignature.
+    pub fn sign(&self, payload: &[u8], signer_name: &str) -> BundleSignature {
+        let signature = self.keypair.sign(payload);
+        BundleSignature {
+            signer: signer_name.to_string(),
+            key_id: self.key_id.clone(),
+            signature: hex::encode(signature.as_ref()),
+        }
+    }
+
+    /// Get the public key bytes (32 bytes).
+    pub fn public_key(&self) -> &[u8] {
+        self.keypair.public_key().as_ref()
+    }
+
+    /// Get the key ID.
+    pub fn key_id(&self) -> &str {
+        &self.key_id
+    }
+}
+
+/// Parse an OpenSSH Ed25519 private key and return (seed, public_key).
+///
+/// The OpenSSH format is documented at:
+/// <https://github.com/openssh/openssh-portable/blob/master/PROTOCOL.key>
+fn parse_openssh_ed25519_key(pem: &str) -> Result<([u8; 32], [u8; 32])> {
+    use base64::Engine;
+
+    const BEGIN_MARKER: &str = "-----BEGIN OPENSSH PRIVATE KEY-----";
+    const END_MARKER: &str = "-----END OPENSSH PRIVATE KEY-----";
+    const AUTH_MAGIC: &[u8] = b"openssh-key-v1\0";
+
+    // Extract base64 content
+    let start = pem.find(BEGIN_MARKER).ok_or_else(|| {
+        MsError::ValidationFailed("not an OpenSSH private key (missing BEGIN marker)".to_string())
+    })? + BEGIN_MARKER.len();
+
+    let end = pem.find(END_MARKER).ok_or_else(|| {
+        MsError::ValidationFailed("not an OpenSSH private key (missing END marker)".to_string())
+    })?;
+
+    let b64_content: String = pem[start..end]
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+
+    let data = base64::engine::general_purpose::STANDARD
+        .decode(&b64_content)
+        .map_err(|err| MsError::ValidationFailed(format!("invalid base64 in SSH key: {}", err)))?;
+
+    // Verify magic bytes
+    if !data.starts_with(AUTH_MAGIC) {
+        return Err(MsError::ValidationFailed(
+            "invalid OpenSSH key (bad magic)".to_string(),
+        ));
+    }
+
+    let mut cursor = AUTH_MAGIC.len();
+
+    // Read cipher name
+    let cipher = read_openssh_string(&data, &mut cursor)?;
+    if cipher != "none" {
+        return Err(MsError::ValidationFailed(format!(
+            "encrypted SSH keys not supported (cipher: {})",
+            cipher
+        )));
+    }
+
+    // Read KDF name
+    let kdf = read_openssh_string(&data, &mut cursor)?;
+    if kdf != "none" {
+        return Err(MsError::ValidationFailed(format!(
+            "encrypted SSH keys not supported (kdf: {})",
+            kdf
+        )));
+    }
+
+    // Read KDF options (should be empty for "none")
+    let _kdf_options = read_openssh_bytes(&data, &mut cursor)?;
+
+    // Read number of keys
+    let num_keys = read_openssh_u32(&data, &mut cursor)?;
+    if num_keys != 1 {
+        return Err(MsError::ValidationFailed(format!(
+            "multi-key SSH files not supported (found {} keys)",
+            num_keys
+        )));
+    }
+
+    // Skip public key blob
+    let _public_blob = read_openssh_bytes(&data, &mut cursor)?;
+
+    // Read private section length
+    let private_len = read_openssh_u32(&data, &mut cursor)? as usize;
+    if cursor + private_len > data.len() {
+        return Err(MsError::ValidationFailed(
+            "truncated SSH key (private section)".to_string(),
+        ));
+    }
+
+    // Read check integers (must match for verification)
+    let check1 = read_openssh_u32(&data, &mut cursor)?;
+    let check2 = read_openssh_u32(&data, &mut cursor)?;
+    if check1 != check2 {
+        return Err(MsError::ValidationFailed(
+            "SSH key check integers don't match (corrupted key?)".to_string(),
+        ));
+    }
+
+    // Read key type
+    let key_type = read_openssh_string(&data, &mut cursor)?;
+    if key_type != "ssh-ed25519" {
+        return Err(MsError::ValidationFailed(format!(
+            "expected ssh-ed25519 key, found: {}",
+            key_type
+        )));
+    }
+
+    // Read public key (32 bytes)
+    let public_key_bytes = read_openssh_bytes(&data, &mut cursor)?;
+    if public_key_bytes.len() != 32 {
+        return Err(MsError::ValidationFailed(format!(
+            "invalid Ed25519 public key length: {} (expected 32)",
+            public_key_bytes.len()
+        )));
+    }
+
+    // Read private key (64 bytes: 32-byte seed + 32-byte public key)
+    let private_key_bytes = read_openssh_bytes(&data, &mut cursor)?;
+    if private_key_bytes.len() != 64 {
+        return Err(MsError::ValidationFailed(format!(
+            "invalid Ed25519 private key length: {} (expected 64)",
+            private_key_bytes.len()
+        )));
+    }
+
+    let mut seed = [0u8; 32];
+    let mut public_key = [0u8; 32];
+    seed.copy_from_slice(&private_key_bytes[..32]);
+    public_key.copy_from_slice(&public_key_bytes);
+
+    Ok((seed, public_key))
+}
+
+fn read_openssh_u32(data: &[u8], cursor: &mut usize) -> Result<u32> {
+    if *cursor + 4 > data.len() {
+        return Err(MsError::ValidationFailed(
+            "truncated SSH key data".to_string(),
+        ));
+    }
+    let value = u32::from_be_bytes([
+        data[*cursor],
+        data[*cursor + 1],
+        data[*cursor + 2],
+        data[*cursor + 3],
+    ]);
+    *cursor += 4;
+    Ok(value)
+}
+
+fn read_openssh_bytes<'a>(data: &'a [u8], cursor: &mut usize) -> Result<&'a [u8]> {
+    let len = read_openssh_u32(data, cursor)? as usize;
+    if *cursor + len > data.len() {
+        return Err(MsError::ValidationFailed(
+            "truncated SSH key data".to_string(),
+        ));
+    }
+    let bytes = &data[*cursor..*cursor + len];
+    *cursor += len;
+    Ok(bytes)
+}
+
+fn read_openssh_string(data: &[u8], cursor: &mut usize) -> Result<String> {
+    let bytes = read_openssh_bytes(data, cursor)?;
+    String::from_utf8(bytes.to_vec())
+        .map_err(|_| MsError::ValidationFailed("invalid UTF-8 in SSH key".to_string()))
 }
 
 impl SignatureVerifier for Ed25519Verifier {
@@ -555,5 +778,148 @@ checksum = "sha256:abc123"
         let result = manifest.verify_signatures(payload, &verifier);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("unknown signing key"));
+    }
+
+    // --- Ed25519Signer tests ---
+
+    /// Generate a test OpenSSH Ed25519 private key string.
+    /// This creates a valid unencrypted key for testing.
+    fn generate_test_openssh_key() -> (String, Vec<u8>) {
+        use ring::rand::SystemRandom;
+        use ring::signature::{Ed25519KeyPair, KeyPair};
+
+        let rng = SystemRandom::new();
+        let pkcs8_bytes = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        let keypair = Ed25519KeyPair::from_pkcs8(pkcs8_bytes.as_ref()).unwrap();
+        let public_key = keypair.public_key().as_ref().to_vec();
+
+        // Extract the seed from PKCS8 (the last 32 bytes after the fixed prefix)
+        // PKCS8 for Ed25519 is: version(3) + alg_id(5) + priv_key_wrapper(2+32+2+32)
+        // Simplified: seed is at offset 16, public is at offset 51
+        let seed = &pkcs8_bytes.as_ref()[16..48];
+
+        // Build OpenSSH format key
+        let mut ssh_data = Vec::new();
+
+        // Magic
+        ssh_data.extend_from_slice(b"openssh-key-v1\0");
+
+        // Cipher: "none"
+        ssh_data.extend_from_slice(&4u32.to_be_bytes());
+        ssh_data.extend_from_slice(b"none");
+
+        // KDF: "none"
+        ssh_data.extend_from_slice(&4u32.to_be_bytes());
+        ssh_data.extend_from_slice(b"none");
+
+        // KDF options: empty
+        ssh_data.extend_from_slice(&0u32.to_be_bytes());
+
+        // Number of keys: 1
+        ssh_data.extend_from_slice(&1u32.to_be_bytes());
+
+        // Public key blob
+        let mut pub_blob = Vec::new();
+        pub_blob.extend_from_slice(&11u32.to_be_bytes()); // "ssh-ed25519" length
+        pub_blob.extend_from_slice(b"ssh-ed25519");
+        pub_blob.extend_from_slice(&32u32.to_be_bytes());
+        pub_blob.extend_from_slice(&public_key);
+        ssh_data.extend_from_slice(&(pub_blob.len() as u32).to_be_bytes());
+        ssh_data.extend_from_slice(&pub_blob);
+
+        // Private section
+        let check = 0x12345678u32;
+        let mut priv_section = Vec::new();
+        priv_section.extend_from_slice(&check.to_be_bytes());
+        priv_section.extend_from_slice(&check.to_be_bytes());
+        priv_section.extend_from_slice(&11u32.to_be_bytes()); // "ssh-ed25519"
+        priv_section.extend_from_slice(b"ssh-ed25519");
+        priv_section.extend_from_slice(&32u32.to_be_bytes()); // public key
+        priv_section.extend_from_slice(&public_key);
+        priv_section.extend_from_slice(&64u32.to_be_bytes()); // private key (seed + pub)
+        priv_section.extend_from_slice(seed);
+        priv_section.extend_from_slice(&public_key);
+        priv_section.extend_from_slice(&0u32.to_be_bytes()); // empty comment
+
+        // Padding to multiple of 8
+        let pad_needed = (8 - (priv_section.len() % 8)) % 8;
+        for i in 1..=pad_needed {
+            priv_section.push(i as u8);
+        }
+
+        ssh_data.extend_from_slice(&(priv_section.len() as u32).to_be_bytes());
+        ssh_data.extend_from_slice(&priv_section);
+
+        // Base64 encode and format as PEM
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&ssh_data);
+        let mut pem = String::from("-----BEGIN OPENSSH PRIVATE KEY-----\n");
+        for chunk in b64.as_bytes().chunks(70) {
+            pem.push_str(std::str::from_utf8(chunk).unwrap());
+            pem.push('\n');
+        }
+        pem.push_str("-----END OPENSSH PRIVATE KEY-----\n");
+
+        (pem, public_key)
+    }
+
+    #[test]
+    fn ed25519_signer_parses_openssh_key() {
+        let (pem, _public_key) = generate_test_openssh_key();
+        let signer = Ed25519Signer::from_openssh_str(&pem);
+        assert!(signer.is_ok(), "Failed to parse OpenSSH key: {:?}", signer.err());
+
+        let signer = signer.unwrap();
+        assert!(signer.key_id().starts_with("ed25519:"));
+        assert_eq!(signer.public_key().len(), 32);
+    }
+
+    #[test]
+    fn ed25519_signer_signs_data() {
+        let (pem, _public_key) = generate_test_openssh_key();
+        let signer = Ed25519Signer::from_openssh_str(&pem).unwrap();
+
+        let payload = b"test payload for signing";
+        let signature = signer.sign(payload, "Test Signer");
+
+        assert_eq!(signature.signer, "Test Signer");
+        assert_eq!(signature.key_id, signer.key_id());
+        assert!(!signature.signature.is_empty());
+        // Ed25519 signatures are 64 bytes = 128 hex chars
+        assert_eq!(signature.signature.len(), 128);
+    }
+
+    #[test]
+    fn ed25519_signer_signature_verifies() {
+        let (pem, public_key) = generate_test_openssh_key();
+        let signer = Ed25519Signer::from_openssh_str(&pem).unwrap();
+
+        let payload = b"test payload for verification";
+        let signature = signer.sign(payload, "Test Signer");
+
+        // Verify with Ed25519Verifier
+        let mut verifier = Ed25519Verifier::new();
+        verifier.add_key(signer.key_id(), public_key);
+
+        let result = verifier.verify(payload, &signature);
+        assert!(result.is_ok(), "Signature verification failed: {:?}", result.err());
+    }
+
+    #[test]
+    fn ed25519_signer_rejects_invalid_pem() {
+        let result = Ed25519Signer::from_openssh_str("not a valid key");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("missing BEGIN marker"));
+    }
+
+    #[test]
+    fn ed25519_signer_rejects_encrypted_key() {
+        // A key with cipher != "none" should be rejected
+        let encrypted_marker = "-----BEGIN OPENSSH PRIVATE KEY-----\n\
+            b3BlbnNzaC1rZXktdjEAAAAACmFlczI1Ni1jdHIAAAAGYmNyeXB0AAAAGAAAABDs\n\
+            -----END OPENSSH PRIVATE KEY-----\n";
+        let result = Ed25519Signer::from_openssh_str(encrypted_marker);
+        assert!(result.is_err());
+        // The exact error depends on how far parsing gets, but it should fail
     }
 }
