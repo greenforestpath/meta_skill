@@ -26,6 +26,11 @@ impl BlobStore {
         let hash = hash_bytes(bytes);
         let path = self.blob_path(&hash)?;
         if !path.exists() {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).map_err(|err| {
+                    MsError::Config(format!("create blob dir {}: {err}", parent.display()))
+                })?;
+            }
             fs::write(&path, bytes).map_err(|err| {
                 MsError::Config(format!("write blob {}: {err}", path.display()))
             })?;
@@ -119,7 +124,15 @@ impl BlobStore {
                 "invalid blob hash: malformed hex component"
             )));
         }
-        Ok(self.root.join("blobs").join(hash))
+
+        // Check for legacy flat structure first
+        let legacy_path = self.root.join("blobs").join(hash);
+        if legacy_path.exists() {
+            return Ok(legacy_path);
+        }
+
+        // Use nested structure for new blobs: blobs/sha256/hex
+        Ok(self.root.join("blobs").join("sha256").join(hex_part))
     }
 }
 
@@ -211,12 +224,31 @@ mod tests {
     }
 
     #[test]
-    fn blob_path_accepts_valid_hash() {
+    fn blob_path_uses_nested_structure() {
         let dir = tempdir().unwrap();
         let store = BlobStore::open(dir.path()).unwrap();
 
         // Valid sha256 hash (64 hex chars)
         let valid_hash = "sha256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
-        assert!(store.blob_path(valid_hash).is_ok());
+        let path = store.blob_path(valid_hash).unwrap();
+        let expected = dir
+            .path()
+            .join("blobs")
+            .join("sha256")
+            .join("2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824");
+        assert_eq!(path, expected);
+    }
+
+    #[test]
+    fn blob_path_prefers_legacy_when_present() {
+        let dir = tempdir().unwrap();
+        let store = BlobStore::open(dir.path()).unwrap();
+
+        let valid_hash = "sha256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+        let legacy_path = dir.path().join("blobs").join(valid_hash);
+        fs::write(&legacy_path, b"legacy").unwrap();
+
+        let path = store.blob_path(valid_hash).unwrap();
+        assert_eq!(path, legacy_path);
     }
 }

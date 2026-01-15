@@ -1,5 +1,7 @@
 //! Bundle installation
 
+use std::fs::OpenOptions;
+use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 
 use crate::bundler::blob::BlobStore;
@@ -96,6 +98,13 @@ pub fn install_with_options<V: SignatureVerifier>(
 
     let mut installed = Vec::new();
     let mut skipped = Vec::new();
+    
+    // Optimization: Pre-map blobs for O(1) lookup
+    let blob_map: HashMap<&String, &crate::bundler::package::BundleBlob> = 
+        package.blobs.iter().map(|b| (&b.hash, b)).collect();
+
+    // Rollback tracking
+    let mut installed_paths = Vec::new();
 
     for skill in &package.manifest.skills {
         if !only_skills.is_empty() && !only_skills.contains(&skill.name) {
@@ -105,26 +114,34 @@ pub fn install_with_options<V: SignatureVerifier>(
         let hash = skill.hash.as_ref().ok_or_else(|| {
             MsError::ValidationFailed(format!("missing blob hash for {}", skill.name))
         })?;
-        let blob = package
-            .blobs
-            .iter()
-            .find(|b| &b.hash == hash)
-            .ok_or_else(|| {
-                MsError::ValidationFailed(format!("bundle missing blob {} for {}", hash, skill.name))
-            })?;
+        
+        let blob = blob_map.get(hash).ok_or_else(|| {
+            MsError::ValidationFailed(format!("bundle missing blob {} for {}", hash, skill.name))
+        })?;
 
         let target = resolve_target_path(archive_root, &skill.path, &skill.name)?;
+        
+        // Atomic-ish check: if directory exists, we fail.
         if target.exists() {
+            // Rollback any previously installed skills in this transaction
+            rollback_install(&installed_paths);
             return Err(MsError::ValidationFailed(format!(
                 "skill already exists at {}",
                 target.display()
             )));
         }
 
-        std::fs::create_dir_all(&target).map_err(|err| {
-            MsError::Config(format!("create {}: {err}", target.display()))
-        })?;
-        unpack_blob(&target, &blob.bytes)?;
+        // Try install
+        if let Err(e) = perform_install(&target, &blob.bytes) {
+            // Rollback this skill and previous ones
+            if target.exists() {
+                let _ = std::fs::remove_dir_all(&target);
+            }
+            rollback_install(&installed_paths);
+            return Err(e);
+        }
+        
+        installed_paths.push(target);
         installed.push(skill.name.clone());
     }
 
@@ -135,6 +152,21 @@ pub fn install_with_options<V: SignatureVerifier>(
         blobs_written,
         signature_verified,
     })
+}
+
+fn perform_install(target: &Path, bytes: &[u8]) -> Result<()> {
+    std::fs::create_dir_all(target).map_err(|err| {
+        MsError::Config(format!("create {}: {err}", target.display()))
+    })?;
+    unpack_blob(target, bytes)
+}
+
+fn rollback_install(paths: &[PathBuf]) {
+    for path in paths {
+        if path.exists() {
+            let _ = std::fs::remove_dir_all(path);
+        }
+    }
 }
 
 /// Install a bundle into the git archive root (allows unsigned bundles).
@@ -219,19 +251,30 @@ fn unpack_blob(target: &Path, bytes: &[u8]) -> Result<()> {
         let rel = Path::new(name);
         ensure_relative(rel)?;
         let path = target.join(rel);
-        if path.exists() {
-            return Err(MsError::ValidationFailed(format!(
-                "bundle file already exists: {}",
-                path.display()
-            )));
-        }
+        
+        // Ensure parent directories exist
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|err| {
                 MsError::Config(format!("create {}: {err}", parent.display()))
             })?;
         }
-        std::fs::write(&path, file_bytes).map_err(|err| {
-            MsError::Config(format!("write {}: {err}", path.display()))
+        
+        // Use create_new(true) to prevent overwriting existing files and ensure atomicity
+        use std::io::Write;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|err| {
+                if err.kind() == std::io::ErrorKind::AlreadyExists {
+                    MsError::ValidationFailed(format!("bundle file collision: {}", path.display()))
+                } else {
+                    MsError::Config(format!("write {}: {err}", path.display()))
+                }
+            })?;
+            
+        file.write_all(file_bytes).map_err(|err| {
+            MsError::Config(format!("write content {}: {err}", path.display()))
         })?;
     }
     Ok(())

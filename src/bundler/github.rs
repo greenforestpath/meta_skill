@@ -11,6 +11,9 @@ const GH_API: &str = "https://api.github.com";
 const GH_UPLOADS: &str = "https://uploads.github.com";
 const USER_AGENT: &str = "ms-cli";
 
+/// Maximum download size for bundles (100 MB) to prevent memory exhaustion
+const MAX_DOWNLOAD_SIZE: u64 = 100 * 1024 * 1024;
+
 #[derive(Debug, Clone)]
 pub struct GitHubConfig {
     pub repo: String,
@@ -369,6 +372,8 @@ impl GitHubClient {
     }
 
     fn download_url(&self, url: &str) -> Result<Vec<u8>> {
+        use std::io::Read;
+
         let mut request = self.client.get(url).header("User-Agent", USER_AGENT);
         if let Some(token) = &self.token {
             request = request.bearer_auth(token);
@@ -382,9 +387,33 @@ impl GitHubClient {
                 response.status()
             )));
         }
-        response.bytes().map(|b| b.to_vec()).map_err(|err| {
-            MsError::Config(format!("download read failed: {err}"))
-        })
+
+        // Check Content-Length if available to reject oversized downloads early
+        if let Some(content_length) = response.content_length() {
+            if content_length > MAX_DOWNLOAD_SIZE {
+                return Err(MsError::ValidationFailed(format!(
+                    "download too large: {} bytes (max {} MB)",
+                    content_length,
+                    MAX_DOWNLOAD_SIZE / (1024 * 1024)
+                )));
+            }
+        }
+
+        // Read with size limit to handle streaming responses without Content-Length
+        let mut bytes = Vec::new();
+        response
+            .take(MAX_DOWNLOAD_SIZE + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|err| MsError::Config(format!("download read failed: {err}")))?;
+
+        if bytes.len() as u64 > MAX_DOWNLOAD_SIZE {
+            return Err(MsError::ValidationFailed(format!(
+                "download exceeded size limit ({} MB)",
+                MAX_DOWNLOAD_SIZE / (1024 * 1024)
+            )));
+        }
+
+        Ok(bytes)
     }
 
     fn download_release_asset(
@@ -393,6 +422,8 @@ impl GitHubClient {
         repo: &str,
         asset_id: u64,
     ) -> Result<Vec<u8>> {
+        use std::io::Read;
+
         let url = format!("{GH_API}/repos/{owner}/{repo}/releases/assets/{asset_id}");
         let mut request = self
             .client
@@ -411,9 +442,33 @@ impl GitHubClient {
                 response.status()
             )));
         }
-        response.bytes().map(|b| b.to_vec()).map_err(|err| {
-            MsError::Config(format!("download asset read failed: {err}"))
-        })
+
+        // Check Content-Length if available to reject oversized downloads early
+        if let Some(content_length) = response.content_length() {
+            if content_length > MAX_DOWNLOAD_SIZE {
+                return Err(MsError::ValidationFailed(format!(
+                    "asset too large: {} bytes (max {} MB)",
+                    content_length,
+                    MAX_DOWNLOAD_SIZE / (1024 * 1024)
+                )));
+            }
+        }
+
+        // Read with size limit to handle streaming responses without Content-Length
+        let mut bytes = Vec::new();
+        response
+            .take(MAX_DOWNLOAD_SIZE + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|err| MsError::Config(format!("download asset read failed: {err}")))?;
+
+        if bytes.len() as u64 > MAX_DOWNLOAD_SIZE {
+            return Err(MsError::ValidationFailed(format!(
+                "asset exceeded size limit ({} MB)",
+                MAX_DOWNLOAD_SIZE / (1024 * 1024)
+            )));
+        }
+
+        Ok(bytes)
     }
 
     fn get(&self, url: &str) -> Result<reqwest::blocking::Response> {

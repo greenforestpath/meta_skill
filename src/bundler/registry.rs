@@ -229,10 +229,31 @@ impl BundleRegistry {
     }
 
     fn save(&self) -> Result<()> {
+        use std::io::Write;
+
         let content = serde_json::to_string_pretty(&self.bundles).map_err(|e| {
             MsError::Config(format!("serialize bundle registry: {}", e))
         })?;
-        std::fs::write(&self.path, content)?;
+
+        // Atomic write: write to temp file, sync, then rename
+        let temp_path = self.path.with_extension("json.tmp");
+        let mut file = std::fs::File::create(&temp_path).map_err(|e| {
+            MsError::Config(format!("create temp registry file: {}", e))
+        })?;
+        file.write_all(content.as_bytes()).map_err(|e| {
+            MsError::Config(format!("write temp registry file: {}", e))
+        })?;
+        file.sync_all().map_err(|e| {
+            MsError::Config(format!("sync temp registry file: {}", e))
+        })?;
+        drop(file);
+
+        std::fs::rename(&temp_path, &self.path).map_err(|e| {
+            // Clean up temp file on rename failure
+            let _ = std::fs::remove_file(&temp_path);
+            MsError::Config(format!("rename registry file: {}", e))
+        })?;
+
         Ok(())
     }
 }
