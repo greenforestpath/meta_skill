@@ -1,0 +1,12 @@
+---
+source: tests/snapshots/disclosure_levels.rs
+expression: disclosed
+---
+frontmatter:
+  id: rust-error-handling
+  name: Rust Error Handling
+  version: 0.1.0
+  description: "Use Result<T, E> for recoverable errors and panic! for unrecoverable ones."
+body: "## Overview\n\nRust's error handling is based on the Result type for operations that can fail.\n\n## Rules\n\n- Use `?` operator to propagate errors\n- Define custom error types with thiserror\n- Use anyhow for application errors\n- Reserve panic! for programming errors\n\n## Examples\n\n```rust\nfn read_file(path: &str) -> Result<String, std::io::Error> {\n    std::fs::read_to_string(path)\n}\n```\n\n"
+token_estimate: 145
+level: standard

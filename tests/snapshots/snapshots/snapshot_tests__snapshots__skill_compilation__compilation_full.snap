@@ -1,0 +1,40 @@
+---
+source: tests/snapshots/skill_compilation.rs
+assertion_line: 27
+expression: output
+---
+---
+id: full-skill
+name: Full Skill
+version: 0.1.0
+description: |-
+  A longer description line.
+  Second line of description.
+tags: []
+requires: []
+provides: []
+platforms: []
+author: null
+license: null
+---
+
+# Full Skill
+
+A longer description line.
+Second line of description.
+
+## Setup
+
+Install dependencies.
+
+```bash
+cargo build
+```
+
+## Usage
+
+Run the tool.
+
+```bash
+ms --help
+```

@@ -1,0 +1,25 @@
+---
+source: tests/snapshots/skill_compilation.rs
+assertion_line: 21
+expression: output
+---
+---
+id: minimal-skill
+name: Minimal Skill
+version: 0.1.0
+description: A short description.
+tags: []
+requires: []
+provides: []
+platforms: []
+author: null
+license: null
+---
+
+# Minimal Skill
+
+A short description.
+
+## Usage
+
+Do the thing.

@@ -1,0 +1,11 @@
+---
+source: tests/snapshots/disclosure_levels.rs
+expression: disclosed
+---
+frontmatter:
+  id: rust-error-handling
+  name: Rust Error Handling
+  version: 0.1.0
+  description: "Use Result<T, E> for recoverable errors and panic! for unrecoverable ones"
+token_estimate: 49
+level: minimal

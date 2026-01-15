@@ -1,0 +1,6 @@
+# Insta configuration
+behavior:
+  review: true
+  update_mode: new
+
+snapshot_path_template: "{module}/{function}"

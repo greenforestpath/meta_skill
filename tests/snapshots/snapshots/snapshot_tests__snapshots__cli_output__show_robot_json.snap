@@ -1,0 +1,23 @@
+---
+source: tests/snapshots/cli_output.rs
+assertion_line: 67
+expression: json
+---
+{
+  "skill": {
+    "author": null,
+    "content_hash": "3f3bce240b546ff4bf6bd021b7b81c739cdc311aeddf8c90d06fc3ab7a6d0c80",
+    "deprecation_reason": null,
+    "description": "Use Result<T, E> for recoverable errors and panic! for unrecoverable ones.",
+    "git_commit": null,
+    "git_remote": null,
+    "id": "rust-error-handling",
+    "is_deprecated": false,
+    "layer": "project",
+    "name": "Rust Error Handling",
+    "quality_score": 0.48500001430511475,
+    "token_count": 87,
+    "version": "0.1.0"
+  },
+  "status": "ok"
+}

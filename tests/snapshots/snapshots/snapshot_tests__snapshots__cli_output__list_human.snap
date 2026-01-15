@@ -1,0 +1,12 @@
+---
+source: tests/snapshots/cli_output.rs
+assertion_line: 14
+expression: sanitized
+---
+ID                                       VERSION      LAYER    UPDATED             
+────────────────────────────────────────────────────────────────────────────────────
+git-workflow                             0.1.0        project  [TIMESTAMP] 
+rust-error-handling                      0.1.0        project  [TIMESTAMP] 
+testing-best-practices                   0.1.0        project  [TIMESTAMP] 
+
+Total: 3 skills (limit: 50, offset: 0)

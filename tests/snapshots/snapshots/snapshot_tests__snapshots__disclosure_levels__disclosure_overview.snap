@@ -1,0 +1,12 @@
+---
+source: tests/snapshots/disclosure_levels.rs
+expression: disclosed
+---
+frontmatter:
+  id: rust-error-handling
+  name: Rust Error Handling
+  version: 0.1.0
+  description: "Use Result<T, E> for recoverable errors and panic! for unrecoverable ones."
+body: "## Overview\nRust's error handling is based on the Result type for operations that can fail....\n\n## Rules\n- Use `?` operator to propagate errors...\n\n## Examples\n```rust...\n\n"
+token_estimate: 92
+level: overview

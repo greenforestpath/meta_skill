@@ -1,0 +1,12 @@
+---
+source: tests/snapshots/diagnostics.rs
+expression: sanitized
+---
+ms doctor - Health Checks
+
+Checking lock status... ✓ No lock held
+Checking database... ✓ OK
+Checking Git archive... ✓ OK
+Checking transactions... ✓ OK
+
+✓ All checks passed
