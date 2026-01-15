@@ -9,11 +9,13 @@ use clap::{Args, Subcommand};
 use colored::Colorize;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
+use std::io::{self, Write};
 use std::path::PathBuf;
 use which::which;
 
 use crate::app::AppContext;
 use crate::beads::{BeadsClient, CreateIssueRequest, IssueType, Priority};
+use crate::core::spec_lens::{compile_markdown, parse_markdown};
 use crate::error::{MsError, Result};
 use crate::search::embeddings::VectorIndex;
 use crate::security::SafetyGate;
@@ -27,7 +29,7 @@ pub struct PruneArgs {
     #[command(subcommand)]
     pub command: Option<PruneCommand>,
 
-    /// Dry run - show what would be pruned (for list command)
+    /// Dry run - show what would be pruned (list/apply/review)
     #[arg(long, global = true)]
     pub dry_run: bool,
 
@@ -55,6 +57,12 @@ pub enum PruneCommand {
 
     /// Propose prune actions (merge/deprecate)
     Proposals(AnalyzeArgs),
+
+    /// Review proposals interactively
+    Review(ReviewArgs),
+
+    /// Apply a specific proposal
+    Apply(ApplyArgs),
 }
 
 #[derive(Args, Debug)]
@@ -83,9 +91,49 @@ pub struct AnalyzeArgs {
     #[arg(long, default_value = "5")]
     pub per_skill: usize,
 
+    /// Minimum sections before proposing a split
+    #[arg(long, default_value = "6")]
+    pub split_min_sections: usize,
+
+    /// Maximum child drafts per split proposal
+    #[arg(long, default_value = "3")]
+    pub split_max_children: usize,
+
     /// Emit beads issues for proposals
     #[arg(long)]
     pub emit_beads: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct ReviewArgs {
+    #[command(flatten)]
+    pub analyze: AnalyzeArgs,
+
+    /// Disable interactive prompts (print only)
+    #[arg(long)]
+    pub no_prompt: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct ApplyArgs {
+    /// Proposal spec (e.g., merge:a,b or deprecate:skill)
+    pub proposal: String,
+
+    /// Confirm apply (required unless --dry-run)
+    #[arg(long)]
+    pub approve: bool,
+
+    /// Optional replacement target (for deprecate)
+    #[arg(long)]
+    pub replacement: Option<String>,
+
+    /// Override target skill (for merge)
+    #[arg(long)]
+    pub target: Option<String>,
+
+    /// Optional reason override
+    #[arg(long)]
+    pub reason: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -117,7 +165,9 @@ pub fn run(ctx: &AppContext, args: &PruneArgs) -> Result<()> {
         PruneCommand::Restore(restore_args) => run_restore(ctx, restore_args),
         PruneCommand::Stats => run_stats(ctx),
         PruneCommand::Analyze(analyze_args) => run_analyze(ctx, analyze_args),
-        PruneCommand::Proposals(proposals_args) => run_proposals(ctx, proposals_args),
+        PruneCommand::Proposals(proposals_args) => run_proposals(ctx, proposals_args, args.dry_run),
+        PruneCommand::Review(review_args) => run_review(ctx, review_args, args.dry_run),
+        PruneCommand::Apply(apply_args) => run_apply(ctx, apply_args, args.dry_run),
     }
 }
 
@@ -167,6 +217,34 @@ struct MergeProposal {
     target_name: String,
     similarity: f32,
     rationale: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    draft_path: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ProposalSet {
+    deprecate: Vec<DeprecateProposal>,
+    merge: Vec<MergeProposal>,
+    split: Vec<SplitProposal>,
+    candidate_count: usize,
+    total_skills: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct SplitProposal {
+    skill_id: String,
+    name: String,
+    rationale: String,
+    children: Vec<SplitChildDraft>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    draft_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct SplitChildDraft {
+    id: String,
+    name: String,
+    sections: Vec<String>,
 }
 
 fn run_analyze(ctx: &AppContext, args: &AnalyzeArgs) -> Result<()> {
@@ -257,11 +335,10 @@ fn run_analyze(ctx: &AppContext, args: &AnalyzeArgs) -> Result<()> {
     Ok(())
 }
 
-fn run_proposals(ctx: &AppContext, args: &AnalyzeArgs) -> Result<()> {
+fn build_proposals(ctx: &AppContext, args: &AnalyzeArgs, dry_run: bool) -> Result<ProposalSet> {
     let analysis = analyze_candidates(ctx, args)?;
     let mut rationale_map: HashMap<String, Vec<String>> = HashMap::new();
     let mut candidate_ids: HashSet<String> = HashSet::new();
-    let mut created_beads = Vec::new();
 
     for candidate in &analysis.low_usage {
         rationale_map
@@ -319,18 +396,90 @@ fn run_proposals(ctx: &AppContext, args: &AnalyzeArgs) -> Result<()> {
             target_name,
             similarity: pair.similarity,
             rationale: format!("similarity {:.2} >= {:.2}", pair.similarity, args.similarity),
+            draft_path: None,
         });
         candidate_ids.insert(pair.skill_a.clone());
         candidate_ids.insert(pair.skill_b.clone());
     }
-    merge.sort_by(|a, b| b.similarity.partial_cmp(&a.similarity).unwrap());
+    merge.sort_by(|a, b| {
+        b.similarity
+            .partial_cmp(&a.similarity)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     if merge.len() > args.limit {
         merge.truncate(args.limit);
     }
-    let candidate_count = candidate_ids.len();
+    for proposal in &mut merge {
+        let draft_path = merge_draft_path(&ctx.ms_root, &proposal.target_id, &proposal.sources);
+        proposal.draft_path = Some(draft_path.display().to_string());
+        if !dry_run {
+            let mut records = Vec::new();
+            for source in &proposal.sources {
+                let Some(skill) = ctx.db.get_skill(source)? else {
+                    return Err(MsError::SkillNotFound(format!(
+                        "skill not found: {}",
+                        source
+                    )));
+                };
+                records.push(skill);
+            }
+            let spec = merge_spec_from_records(&records, &proposal.target_id, Some(&proposal.rationale))?;
+            let draft = compile_markdown(&spec);
+            write_draft(&draft_path, &draft)?;
+        }
+    }
+
+    let mut split = analysis.split_proposals.clone();
+    split.sort_by(|a, b| a.skill_id.cmp(&b.skill_id));
+    if split.len() > args.limit {
+        split.truncate(args.limit);
+    }
+    for proposal in &mut split {
+        let draft_paths = split_draft_paths(&ctx.ms_root, &proposal.skill_id, proposal.children.len());
+        proposal.draft_paths = draft_paths
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect();
+        if !dry_run {
+            let Some(skill) = ctx.db.get_skill(&proposal.skill_id)? else {
+                return Err(MsError::SkillNotFound(format!(
+                    "skill not found: {}",
+                    proposal.skill_id
+                )));
+            };
+            let specs = split_specs_from_skill(&skill, proposal.children.len(), Some(&proposal.rationale))?;
+            for (idx, spec) in specs.into_iter().enumerate() {
+                let draft = compile_markdown(&spec);
+                if let Some(path) = draft_paths.get(idx) {
+                    write_draft(path, &draft)?;
+                }
+            }
+        }
+    }
+    for proposal in &split {
+        candidate_ids.insert(proposal.skill_id.clone());
+    }
+
+    Ok(ProposalSet {
+        deprecate,
+        merge,
+        split,
+        candidate_count: candidate_ids.len(),
+        total_skills: analysis.skills.len(),
+    })
+}
+
+fn run_proposals(ctx: &AppContext, args: &AnalyzeArgs, dry_run: bool) -> Result<()> {
+    let proposals = build_proposals(ctx, args, dry_run)?;
+    let mut created_beads = Vec::new();
 
     if args.emit_beads {
-        created_beads = emit_beads(ctx, &deprecate, &merge)?;
+        created_beads = emit_beads(
+            ctx,
+            &proposals.deprecate,
+            &proposals.merge,
+            &proposals.split,
+        )?;
     }
 
     if ctx.robot_mode {
@@ -341,16 +490,16 @@ fn run_proposals(ctx: &AppContext, args: &AnalyzeArgs) -> Result<()> {
             "max_quality": args.max_quality,
             "similarity_threshold": args.similarity,
             "proposals": {
-                "deprecate": deprecate,
-                "merge": merge,
-                "split": [],
+                "deprecate": proposals.deprecate,
+                "merge": proposals.merge,
+                "split": proposals.split,
             },
             "stats": {
-                "total_skills": analysis.skills.len(),
-                "candidates": candidate_count,
-                "merge_proposals": merge.len(),
-                "deprecate_proposals": deprecate.len(),
-                "split_proposals": 0,
+                "total_skills": proposals.total_skills,
+                "candidates": proposals.candidate_count,
+                "merge_proposals": proposals.merge.len(),
+                "deprecate_proposals": proposals.deprecate.len(),
+                "split_proposals": proposals.split.len(),
             },
         });
         if args.emit_beads {
@@ -379,16 +528,17 @@ fn run_proposals(ctx: &AppContext, args: &AnalyzeArgs) -> Result<()> {
         .kv("Min usage", &args.min_usage.to_string())
         .kv("Max quality", &format!("{:.2}", args.max_quality))
         .kv("Similarity", &format!("{:.2}", args.similarity))
-        .kv("Candidates", &candidate_count.to_string())
-        .kv("Deprecate proposals", &deprecate.len().to_string())
-        .kv("Merge proposals", &merge.len().to_string())
+        .kv("Candidates", &proposals.candidate_count.to_string())
+        .kv("Deprecate proposals", &proposals.deprecate.len().to_string())
+        .kv("Merge proposals", &proposals.merge.len().to_string())
+        .kv("Split proposals", &proposals.split.len().to_string())
         .blank();
 
     layout.section("Deprecate");
-    if deprecate.is_empty() {
+    if proposals.deprecate.is_empty() {
         layout.bullet("None");
     } else {
-        for proposal in &deprecate {
+        for proposal in &proposals.deprecate {
             layout.bullet(&format!(
                 "{} ({}) - {}",
                 proposal.name, proposal.skill_id, proposal.rationale
@@ -397,18 +547,41 @@ fn run_proposals(ctx: &AppContext, args: &AnalyzeArgs) -> Result<()> {
     }
 
     layout.section("Merge");
-    if merge.is_empty() {
+    if proposals.merge.is_empty() {
         layout.bullet("None");
     } else {
-        for proposal in &merge {
-            layout.bullet(&format!(
+        for proposal in &proposals.merge {
+            let mut line = format!(
                 "{} + {} -> {} ({}) score {:.2}",
                 proposal.sources[0],
                 proposal.sources[1],
                 proposal.target_id,
                 proposal.target_name,
                 proposal.similarity
-            ));
+            );
+            if let Some(path) = &proposal.draft_path {
+                line.push_str(&format!(" (draft: {})", path));
+            }
+            layout.bullet(&line);
+        }
+    }
+
+    layout.section("Split");
+    if proposals.split.is_empty() {
+        layout.bullet("None");
+    } else {
+        for proposal in &proposals.split {
+            let mut line = format!(
+                "{} ({}) - {} ({} children)",
+                proposal.name,
+                proposal.skill_id,
+                proposal.rationale,
+                proposal.children.len()
+            );
+            if let Some(path) = proposal.draft_paths.first() {
+                line.push_str(&format!(" (draft: {})", path));
+            }
+            layout.bullet(&line);
         }
     }
 
@@ -427,6 +600,531 @@ fn run_proposals(ctx: &AppContext, args: &AnalyzeArgs) -> Result<()> {
     Ok(())
 }
 
+fn run_review(ctx: &AppContext, args: &ReviewArgs, dry_run: bool) -> Result<()> {
+    if ctx.robot_mode || args.no_prompt {
+        return run_proposals(ctx, &args.analyze, true);
+    }
+
+    let proposals = build_proposals(ctx, &args.analyze, true)?;
+    if proposals.deprecate.is_empty()
+        && proposals.merge.is_empty()
+        && proposals.split.is_empty()
+    {
+        println!("No proposals to review.");
+        return Ok(());
+    }
+
+    println!("Reviewing prune proposals{}", if dry_run { " (dry-run)" } else { "" });
+
+    for proposal in &proposals.deprecate {
+        println!(
+            "\nDeprecate: {} ({})\n  Rationale: {}",
+            proposal.name, proposal.skill_id, proposal.rationale
+        );
+        if prompt_yes_no("Apply deprecate? [y/N] ")? {
+            let replacement = prompt_optional("Replacement skill id (optional): ")?;
+            let reason = Some(proposal.rationale.clone());
+            let outcome = apply_deprecate(
+                ctx,
+                &proposal.skill_id,
+                replacement.as_deref(),
+                reason.as_deref(),
+                true,
+                dry_run,
+            )?;
+            print_apply_outcome(&outcome);
+        }
+    }
+
+    for proposal in &proposals.merge {
+        println!(
+            "\nMerge: {} + {} -> {} ({})\n  Rationale: {}",
+            proposal.sources[0],
+            proposal.sources[1],
+            proposal.target_id,
+            proposal.target_name,
+            proposal.rationale
+        );
+        if prompt_yes_no("Apply merge? [y/N] ")? {
+            let target_override = prompt_optional("Target skill id (optional): ")?;
+            let outcome = apply_merge(
+                ctx,
+                &proposal.sources,
+                target_override.as_deref().or(Some(&proposal.target_id)),
+                Some(proposal.rationale.as_str()),
+                true,
+                dry_run,
+            )?;
+            print_apply_outcome(&outcome);
+        }
+    }
+
+    for proposal in &proposals.split {
+        println!(
+            "\nSplit: {} ({})\n  Rationale: {}",
+            proposal.name, proposal.skill_id, proposal.rationale
+        );
+        println!("  Children: {}", proposal.children.len());
+        if prompt_yes_no("Apply split? [y/N] ")? {
+            let outcome = apply_split(
+                ctx,
+                &proposal.skill_id,
+                Some(proposal.children.len()),
+                Some(proposal.rationale.as_str()),
+                true,
+                dry_run,
+            )?;
+            print_apply_outcome(&outcome);
+        }
+    }
+
+    Ok(())
+}
+
+fn run_apply(ctx: &AppContext, args: &ApplyArgs, dry_run: bool) -> Result<()> {
+    if !dry_run && !args.approve {
+        return Err(MsError::ApprovalRequired(
+            "apply requires --approve (or use --dry-run)".to_string(),
+        ));
+    }
+
+    let spec = parse_proposal_spec(&args.proposal)?;
+    let outcome = match spec {
+        ProposalSpec::Merge { sources } => apply_merge(
+            ctx,
+            &sources,
+            args.target.as_deref(),
+            args.reason.as_deref(),
+            args.approve,
+            dry_run,
+        )?,
+        ProposalSpec::Deprecate { skill_id } => apply_deprecate(
+            ctx,
+            &skill_id,
+            args.replacement.as_deref(),
+            args.reason.as_deref(),
+            args.approve,
+            dry_run,
+        )?,
+        ProposalSpec::Split { skill_id } => apply_split(
+            ctx,
+            &skill_id,
+            None,
+            args.reason.as_deref(),
+            args.approve,
+            dry_run,
+        )?,
+    };
+
+    if ctx.robot_mode {
+        let payload = json!({
+            "status": "ok",
+            "action": outcome.action,
+            "dry_run": outcome.dry_run,
+            "message": outcome.message,
+            "drafts": outcome
+                .drafts
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>(),
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
+        print_apply_outcome(&outcome);
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct ApplyOutcome {
+    action: String,
+    dry_run: bool,
+    message: String,
+    drafts: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+enum ProposalSpec {
+    Merge { sources: Vec<String> },
+    Deprecate { skill_id: String },
+    Split { skill_id: String },
+}
+
+fn parse_proposal_spec(input: &str) -> Result<ProposalSpec> {
+    let input = input.trim();
+    let (kind, rest) = input
+        .split_once(':')
+        .ok_or_else(|| MsError::ValidationFailed("proposal must be type:id".to_string()))?;
+    match kind.trim().to_lowercase().as_str() {
+        "merge" => {
+            let sources: Vec<String> = rest
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if sources.len() < 2 {
+                return Err(MsError::ValidationFailed(
+                    "merge requires at least two sources".to_string(),
+                ));
+            }
+            Ok(ProposalSpec::Merge { sources })
+        }
+        "deprecate" => {
+            let skill_id = rest.trim();
+            if skill_id.is_empty() {
+                return Err(MsError::ValidationFailed(
+                    "deprecate requires a skill id".to_string(),
+                ));
+            }
+            Ok(ProposalSpec::Deprecate {
+                skill_id: skill_id.to_string(),
+            })
+        }
+        "split" => {
+            let skill_id = rest.trim();
+            if skill_id.is_empty() {
+                return Err(MsError::ValidationFailed(
+                    "split requires a skill id".to_string(),
+                ));
+            }
+            Ok(ProposalSpec::Split {
+                skill_id: skill_id.to_string(),
+            })
+        }
+        other => Err(MsError::ValidationFailed(format!(
+            "unknown proposal type: {other}"
+        ))),
+    }
+}
+
+fn merge_spec_from_records(
+    records: &[crate::storage::sqlite::SkillRecord],
+    target_id: &str,
+    reason: Option<&str>,
+) -> Result<crate::core::SkillSpec> {
+    let target_idx = records
+        .iter()
+        .position(|r| r.id == target_id)
+        .ok_or_else(|| {
+            MsError::ValidationFailed(format!("merge target not found: {}", target_id))
+        })?;
+
+    let mut target_spec = parse_markdown(&records[target_idx].body).map_err(|e| {
+        MsError::ValidationFailed(format!("failed to parse {}: {}", records[target_idx].id, e))
+    })?;
+    let mut title_set: HashSet<String> = target_spec
+        .sections
+        .iter()
+        .map(|s| s.title.trim().to_lowercase())
+        .collect();
+
+    for (idx, record) in records.iter().enumerate() {
+        if idx == target_idx {
+            continue;
+        }
+        let spec = parse_markdown(&record.body)
+            .map_err(|e| MsError::ValidationFailed(format!("failed to parse {}: {}", record.id, e)))?;
+        for section in spec.sections {
+            let key = section.title.trim().to_lowercase();
+            if title_set.insert(key) {
+                target_spec.sections.push(section);
+            }
+        }
+        for tag in spec.metadata.tags {
+            if !target_spec.metadata.tags.contains(&tag) {
+                target_spec.metadata.tags.push(tag);
+            }
+        }
+    }
+
+    if let Some(note) = reason {
+        let note = note.trim();
+        if !note.is_empty() {
+            if target_spec.metadata.description.is_empty() {
+                target_spec.metadata.description = note.to_string();
+            } else {
+                target_spec.metadata.description = format!(
+                    "{}\n\nMerge note: {}",
+                    target_spec.metadata.description.trim_end(),
+                    note
+                );
+            }
+        }
+    }
+
+    Ok(target_spec)
+}
+
+fn split_specs_from_skill(
+    skill: &crate::storage::sqlite::SkillRecord,
+    child_count: usize,
+    reason: Option<&str>,
+) -> Result<Vec<crate::core::SkillSpec>> {
+    let spec = parse_markdown(&skill.body)
+        .map_err(|e| MsError::ValidationFailed(format!("failed to parse {}: {}", skill.id, e)))?;
+    if spec.sections.len() < 2 {
+        return Err(MsError::ValidationFailed(
+            "not enough sections to split".to_string(),
+        ));
+    }
+
+    let child_count = child_count.max(2).min(spec.sections.len());
+    let chunk_size = (spec.sections.len() + child_count - 1) / child_count;
+    let mut specs = Vec::new();
+    for (idx, chunk) in spec.sections.chunks(chunk_size).enumerate() {
+        let mut child_spec = spec.clone();
+        child_spec.sections = chunk.to_vec();
+        child_spec.metadata.id = format!("{}-part-{}", skill.id, idx + 1);
+        child_spec.metadata.name = format!("{} (Part {})", skill.name, idx + 1);
+        let mut description = format!("Split from {}", skill.id);
+        if let Some(note) = reason {
+            let note = note.trim();
+            if !note.is_empty() {
+                description = format!("{description}. {note}");
+            }
+        }
+        child_spec.metadata.description = description;
+        specs.push(child_spec);
+    }
+    Ok(specs)
+}
+
+fn apply_deprecate(
+    ctx: &AppContext,
+    skill_id: &str,
+    replacement: Option<&str>,
+    reason: Option<&str>,
+    _approve: bool,
+    dry_run: bool,
+) -> Result<ApplyOutcome> {
+    let Some(skill) = ctx.db.get_skill(skill_id)? else {
+        return Err(MsError::SkillNotFound(format!("skill not found: {}", skill_id)));
+    };
+    if let Some(target) = replacement {
+        if ctx.db.get_skill(target)?.is_none() {
+            return Err(MsError::SkillNotFound(format!(
+                "replacement skill not found: {}",
+                target
+            )));
+        }
+    }
+
+    let reason = reason
+        .map(|r| r.trim().to_string())
+        .filter(|r| !r.is_empty())
+        .unwrap_or_else(|| match replacement {
+            Some(target) => format!("Deprecated; use {}", target),
+            None => "Deprecated via prune".to_string(),
+        });
+
+    if !dry_run {
+        ctx.db
+            .update_skill_deprecation(&skill.id, true, Some(&reason))?;
+        if let Some(target) = replacement {
+            let created_at = chrono::Utc::now().to_rfc3339();
+            ctx.db.upsert_alias(&skill.id, target, "deprecated", &created_at)?;
+        }
+        if let Some(record) = ctx.db.get_skill(&skill.id)? {
+            ctx.search.index_skill(&record)?;
+            ctx.search.commit()?;
+        }
+    }
+
+    Ok(ApplyOutcome {
+        action: "deprecate".to_string(),
+        dry_run,
+        message: format!(
+            "{} {}",
+            if dry_run { "Would deprecate" } else { "Deprecated" },
+            skill_id
+        ),
+        drafts: Vec::new(),
+    })
+}
+
+fn apply_merge(
+    ctx: &AppContext,
+    sources: &[String],
+    target_override: Option<&str>,
+    reason: Option<&str>,
+    _approve: bool,
+    dry_run: bool,
+) -> Result<ApplyOutcome> {
+    let mut records = Vec::new();
+    for source in sources {
+        let Some(skill) = ctx.db.get_skill(source)? else {
+            return Err(MsError::SkillNotFound(format!("skill not found: {}", source)));
+        };
+        records.push(skill);
+    }
+
+    if let Some(target) = target_override {
+        if !sources.iter().any(|id| id == target) {
+            return Err(MsError::ValidationFailed(format!(
+                "merge target must be one of the sources: {}",
+                target
+            )));
+        }
+    }
+
+    let target_id = target_override
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| sources[0].clone());
+
+    let target_spec = merge_spec_from_records(&records, &target_id, reason)?;
+
+    let draft = compile_markdown(&target_spec);
+    let draft_path = merge_draft_path(&ctx.ms_root, &target_id, sources);
+
+    if !dry_run {
+        write_draft(&draft_path, &draft)?;
+    }
+
+    Ok(ApplyOutcome {
+        action: "merge".to_string(),
+        dry_run,
+        message: if dry_run {
+            format!("Would create merge draft for {}", target_id)
+        } else {
+            format!("Created merge draft for {}", target_id)
+        },
+        drafts: vec![draft_path],
+    })
+}
+
+fn apply_split(
+    ctx: &AppContext,
+    skill_id: &str,
+    child_count_override: Option<usize>,
+    reason: Option<&str>,
+    _approve: bool,
+    dry_run: bool,
+) -> Result<ApplyOutcome> {
+    let Some(skill) = ctx.db.get_skill(skill_id)? else {
+        return Err(MsError::SkillNotFound(format!("skill not found: {}", skill_id)));
+    };
+    let mut drafts = Vec::new();
+    let section_count = parse_markdown(&skill.body)
+        .map_err(|e| MsError::ValidationFailed(format!("failed to parse {}: {}", skill_id, e)))?
+        .sections
+        .len();
+    let child_count = child_count_override
+        .filter(|c| *c >= 2)
+        .unwrap_or_else(|| split_child_count(section_count, 3));
+    let child_specs = split_specs_from_skill(&skill, child_count, reason)?;
+    let draft_paths = split_draft_paths(&ctx.ms_root, skill_id, child_specs.len());
+    for (idx, child_spec) in child_specs.into_iter().enumerate() {
+        let draft = compile_markdown(&child_spec);
+        if let Some(path) = draft_paths.get(idx) {
+            if !dry_run {
+                write_draft(path, &draft)?;
+            }
+            drafts.push(path.clone());
+        }
+    }
+
+    Ok(ApplyOutcome {
+        action: "split".to_string(),
+        dry_run,
+        message: if dry_run {
+            format!("Would create {} split drafts", drafts.len())
+        } else {
+            format!("Created {} split drafts", drafts.len())
+        },
+        drafts,
+    })
+}
+
+fn proposals_dir(ms_root: &PathBuf) -> PathBuf {
+    ms_root.join("proposals")
+}
+
+fn merge_draft_path(ms_root: &PathBuf, target_id: &str, sources: &[String]) -> PathBuf {
+    let draft_name = format!(
+        "merge-{}-{}.md",
+        safe_filename(target_id),
+        safe_filename(&sources.join("-"))
+    );
+    proposals_dir(ms_root).join(draft_name)
+}
+
+fn split_draft_paths(ms_root: &PathBuf, skill_id: &str, count: usize) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for idx in 0..count {
+        let draft_name = format!(
+            "split-{}-part-{}.md",
+            safe_filename(skill_id),
+            idx + 1
+        );
+        paths.push(proposals_dir(ms_root).join(draft_name));
+    }
+    paths
+}
+
+fn write_draft(path: &PathBuf, content: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|err| {
+            MsError::Config(format!("create proposals dir {}: {err}", parent.display()))
+        })?;
+    }
+    std::fs::write(path, content)
+        .map_err(|err| MsError::Config(format!("write proposal {}: {err}", path.display())))?;
+    Ok(())
+}
+
+fn safe_filename(input: &str) -> String {
+    input
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+fn prompt_yes_no(prompt: &str) -> Result<bool> {
+    print!("{prompt}");
+    io::stdout()
+        .flush()
+        .map_err(|err| MsError::Config(format!("prompt flush: {err}")))?;
+    let mut input = String::new();
+    io::stdin()
+        .read_line(&mut input)
+        .map_err(|err| MsError::Config(format!("prompt read: {err}")))?;
+    let normalized = input.trim().to_lowercase();
+    Ok(matches!(normalized.as_str(), "y" | "yes"))
+}
+
+fn prompt_optional(prompt: &str) -> Result<Option<String>> {
+    print!("{prompt}");
+    io::stdout()
+        .flush()
+        .map_err(|err| MsError::Config(format!("prompt flush: {err}")))?;
+    let mut input = String::new();
+    io::stdin()
+        .read_line(&mut input)
+        .map_err(|err| MsError::Config(format!("prompt read: {err}")))?;
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(trimmed.to_string()))
+    }
+}
+
+fn print_apply_outcome(outcome: &ApplyOutcome) {
+    println!("{}", outcome.message);
+    if !outcome.drafts.is_empty() {
+        for path in &outcome.drafts {
+            println!("  Draft: {}", path.display());
+        }
+    }
+}
+
 struct PruneAnalysis {
     skills: Vec<crate::storage::sqlite::SkillRecord>,
     name_map: HashMap<String, String>,
@@ -436,6 +1134,7 @@ struct PruneAnalysis {
     low_quality: Vec<QualityCandidate>,
     similarity_pairs: Vec<SimilarityCandidate>,
     toolchain_mismatch: Vec<ToolchainCandidate>,
+    split_proposals: Vec<SplitProposal>,
 }
 
 fn analyze_candidates(ctx: &AppContext, args: &AnalyzeArgs) -> Result<PruneAnalysis> {
@@ -495,10 +1194,15 @@ fn analyze_candidates(ctx: &AppContext, args: &AnalyzeArgs) -> Result<PruneAnaly
 
     low_usage.sort_by_key(|c| c.uses);
     low_usage.truncate(args.limit);
-    low_quality.sort_by(|a, b| a.quality_score.partial_cmp(&b.quality_score).unwrap());
+    low_quality.sort_by(|a, b| {
+        a.quality_score
+            .partial_cmp(&b.quality_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     low_quality.truncate(args.limit);
 
     let similarity_pairs = analyze_similarity(ctx, &name_map, args)?;
+    let split_proposals = analyze_splits(ctx, &skills, args)?;
     toolchain_mismatch.sort_by(|a, b| a.skill_id.cmp(&b.skill_id));
     toolchain_mismatch.truncate(args.limit);
 
@@ -511,6 +1215,7 @@ fn analyze_candidates(ctx: &AppContext, args: &AnalyzeArgs) -> Result<PruneAnaly
         low_quality,
         similarity_pairs,
         toolchain_mismatch,
+        split_proposals,
     })
 }
 
@@ -582,9 +1287,80 @@ fn analyze_similarity(
         }
     }
 
-    pairs.sort_by(|a, b| b.similarity.partial_cmp(&a.similarity).unwrap());
+    pairs.sort_by(|a, b| {
+        b.similarity
+            .partial_cmp(&a.similarity)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     pairs.truncate(args.limit);
     Ok(pairs)
+}
+
+fn analyze_splits(
+    _ctx: &AppContext,
+    skills: &[crate::storage::sqlite::SkillRecord],
+    args: &AnalyzeArgs,
+) -> Result<Vec<SplitProposal>> {
+    let mut proposals = Vec::new();
+    for skill in skills {
+        let Ok(spec) = parse_markdown(&skill.body) else {
+            continue;
+        };
+        let section_count = spec.sections.len();
+        if section_count < args.split_min_sections {
+            continue;
+        }
+        let child_count = split_child_count(section_count, args.split_max_children);
+        if child_count < 2 {
+            continue;
+        }
+        let children = build_split_children(&spec, &skill.id, &skill.name, child_count);
+        let rationale = format!(
+            "{} sections >= {}, consider splitting into focused children",
+            section_count, args.split_min_sections
+        );
+        proposals.push(SplitProposal {
+            skill_id: skill.id.clone(),
+            name: skill.name.clone(),
+            rationale,
+            children,
+            draft_paths: Vec::new(),
+        });
+    }
+    Ok(proposals)
+}
+
+fn split_child_count(section_count: usize, max_children: usize) -> usize {
+    if section_count < 2 {
+        return 0;
+    }
+    let max_children = max_children.max(2);
+    let desired = ((section_count + 3) / 4).max(2);
+    desired.min(max_children).min(section_count)
+}
+
+fn build_split_children(
+    spec: &crate::core::SkillSpec,
+    skill_id: &str,
+    skill_name: &str,
+    child_count: usize,
+) -> Vec<SplitChildDraft> {
+    if child_count == 0 {
+        return Vec::new();
+    }
+    let chunk_size = (spec.sections.len() + child_count - 1) / child_count;
+    let mut children = Vec::new();
+    for (idx, chunk) in spec.sections.chunks(chunk_size).enumerate() {
+        let child_id = format!("{}-part-{}", skill_id, idx + 1);
+        let child_name = format!("{} (Part {})", skill_name, idx + 1);
+        let sections = chunk.iter().map(|s| s.title.clone()).collect();
+        children.push(SplitChildDraft {
+            id: child_id,
+            name: child_name,
+            sections,
+        });
+    }
+    children
 }
 
 fn parse_toolchain_tools(metadata_json: &str) -> Vec<String> {
@@ -672,6 +1448,7 @@ fn emit_beads(
     ctx: &AppContext,
     deprecate: &[DeprecateProposal],
     merge: &[MergeProposal],
+    split: &[SplitProposal],
 ) -> Result<Vec<crate::beads::Issue>> {
     let work_dir = beads_work_dir(&ctx.ms_root);
     let client = BeadsClient::new().with_work_dir(work_dir);
@@ -705,6 +1482,26 @@ fn emit_beads(
             .with_label("prune")
             .with_label("proposal")
             .with_label("merge");
+        created.push(client.create(&req)?);
+        index += 1;
+    }
+
+    for proposal in split {
+        let title = format!("ms-prune-{:03}: Split {}", index, proposal.skill_id);
+        let description = format!(
+            "Type: split\nSkill: {} ({})\nRationale: {}\nChildren: {}",
+            proposal.skill_id,
+            proposal.name,
+            proposal.rationale,
+            proposal.children.len()
+        );
+        let req = CreateIssueRequest::new(title)
+            .with_type(IssueType::Task)
+            .with_priority(2 as Priority)
+            .with_description(description)
+            .with_label("prune")
+            .with_label("proposal")
+            .with_label("split");
         created.push(client.create(&req)?);
         index += 1;
     }
@@ -1115,6 +1912,8 @@ mod tests {
                 assert!((args.similarity - 0.85).abs() < f32::EPSILON);
                 assert_eq!(args.limit, 10);
                 assert_eq!(args.per_skill, 5);
+                assert_eq!(args.split_min_sections, 6);
+                assert_eq!(args.split_max_children, 3);
                 assert!(!args.emit_beads);
             }
             _ => panic!("Expected Analyze subcommand"),
@@ -1138,6 +1937,10 @@ mod tests {
             "12",
             "--per-skill",
             "8",
+            "--split-min-sections",
+            "5",
+            "--split-max-children",
+            "4",
         ])
         .unwrap();
         match cli.prune.command {
@@ -1148,6 +1951,8 @@ mod tests {
                 assert!((args.similarity - 0.9).abs() < f32::EPSILON);
                 assert_eq!(args.limit, 12);
                 assert_eq!(args.per_skill, 8);
+                assert_eq!(args.split_min_sections, 5);
+                assert_eq!(args.split_max_children, 4);
             }
             _ => panic!("Expected Analyze subcommand"),
         }
@@ -1164,6 +1969,8 @@ mod tests {
                 assert!((args.similarity - 0.85).abs() < f32::EPSILON);
                 assert_eq!(args.limit, 10);
                 assert_eq!(args.per_skill, 5);
+                assert_eq!(args.split_min_sections, 6);
+                assert_eq!(args.split_max_children, 3);
                 assert!(!args.emit_beads);
             }
             _ => panic!("Expected Proposals subcommand"),
@@ -1187,6 +1994,10 @@ mod tests {
             "3",
             "--per-skill",
             "4",
+            "--split-min-sections",
+            "7",
+            "--split-max-children",
+            "2",
         ])
         .unwrap();
         match cli.prune.command {
@@ -1197,6 +2008,8 @@ mod tests {
                 assert!((args.similarity - 0.88).abs() < f32::EPSILON);
                 assert_eq!(args.limit, 3);
                 assert_eq!(args.per_skill, 4);
+                assert_eq!(args.split_min_sections, 7);
+                assert_eq!(args.split_max_children, 2);
                 assert!(!args.emit_beads);
             }
             _ => panic!("Expected Proposals subcommand"),
@@ -1211,6 +2024,31 @@ mod tests {
                 assert!(args.emit_beads);
             }
             _ => panic!("Expected Proposals subcommand"),
+        }
+    }
+
+    #[test]
+    fn parse_prune_review_defaults() {
+        let cli = TestCli::try_parse_from(["test", "review"]).unwrap();
+        match cli.prune.command {
+            Some(PruneCommand::Review(args)) => {
+                assert!(!args.no_prompt);
+                assert_eq!(args.analyze.days, 30);
+                assert_eq!(args.analyze.split_min_sections, 6);
+            }
+            _ => panic!("Expected Review subcommand"),
+        }
+    }
+
+    #[test]
+    fn parse_prune_apply_merge() {
+        let cli = TestCli::try_parse_from(["test", "apply", "merge:a,b", "--approve"]).unwrap();
+        match cli.prune.command {
+            Some(PruneCommand::Apply(args)) => {
+                assert_eq!(args.proposal, "merge:a,b");
+                assert!(args.approve);
+            }
+            _ => panic!("Expected Apply subcommand"),
         }
     }
 
