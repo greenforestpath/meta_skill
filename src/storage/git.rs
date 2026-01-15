@@ -1,10 +1,12 @@
 //! Git archive layer for skill versioning
 
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use git2::{Commit, ErrorCode, Oid, Repository, Signature};
 use serde::{Deserialize, Serialize};
+use chrono::{DateTime, Utc};
 
 use crate::core::{SkillMetadata, SkillSpec};
 use crate::error::{MsError, Result};
@@ -90,6 +92,71 @@ impl GitArchive {
         }
         ids.sort();
         Ok(ids)
+    }
+
+    /// Efficiently get modification times for many files in a single pass.
+    /// Paths must be relative to the repository root.
+    pub fn get_bulk_last_modified(
+        &self,
+        paths: &[PathBuf],
+    ) -> Result<HashMap<PathBuf, DateTime<Utc>>> {
+        let mut results = HashMap::new();
+        let mut pending: HashSet<PathBuf> = paths.iter().cloned().collect();
+
+        if pending.is_empty() {
+            return Ok(results);
+        }
+
+        let mut revwalk = self.repo.revwalk()?;
+        match self.repo.head() {
+            Ok(head) => {
+                if let Some(oid) = head.target() {
+                    revwalk.push(oid)?;
+                } else {
+                    // No commits yet
+                    return Ok(results);
+                }
+            }
+            Err(_) => return Ok(results),
+        }
+        revwalk.set_sorting(git2::Sort::TIME).map_err(MsError::Git)?;
+
+        // Iterate commits
+        for oid in revwalk {
+            let oid = oid.map_err(MsError::Git)?;
+            let commit = self.repo.find_commit(oid)?;
+            let tree = commit.tree().map_err(MsError::Git)?;
+
+            let parent_tree = if let Ok(parent) = commit.parent(0) {
+                Some(parent.tree().map_err(MsError::Git)?)
+            } else {
+                None
+            };
+
+            let diff = self
+                .repo
+                .diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), None)
+                .map_err(MsError::Git)?;
+
+            // Check modified files in this commit
+            for delta in diff.deltas() {
+                if let Some(path) = delta.new_file().path() {
+                    let path_buf = path.to_path_buf();
+                    if pending.contains(&path_buf) {
+                        let time = DateTime::from_timestamp(commit.time().seconds(), 0)
+                            .ok_or_else(|| MsError::Git(git2::Error::from_str("invalid time")))?;
+                        results.insert(path_buf.clone(), time);
+                        pending.remove(&path_buf);
+                    }
+                }
+            }
+
+            if pending.is_empty() {
+                break;
+            }
+        }
+
+        Ok(results)
     }
 
     pub fn recent_commits(&self, limit: usize) -> Result<Vec<SkillCommit>> {

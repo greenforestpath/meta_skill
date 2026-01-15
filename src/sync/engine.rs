@@ -437,11 +437,43 @@ impl SyncEngine {
     }
 
     fn snapshot_archive(&self, archive: &GitArchive) -> Result<HashMap<String, SkillSnapshot>> {
+        let ids = archive.list_skill_ids()?;
+        let mut id_to_path = HashMap::new();
+        let mut paths = Vec::new();
+
+        for id in &ids {
+            if let Some(skill_path) = archive.skill_path(id) {
+                let spec_path = skill_path.join("skill.spec.json");
+                if let Ok(rel) = spec_path.strip_prefix(archive.root()) {
+                    let rel_buf = rel.to_path_buf();
+                    id_to_path.insert(id.clone(), rel_buf.clone());
+                    paths.push(rel_buf);
+                }
+            }
+        }
+
+        // Bulk fetch modification times (O(1) history walk)
+        let modified_times = archive.get_bulk_last_modified(&paths)?;
+
         let mut map = HashMap::new();
-        for id in archive.list_skill_ids()? {
+        for id in ids {
             let spec = archive.read_skill(&id)?;
             let hash = hash_skill_spec(&spec)?;
-            let modified = skill_modified_time(archive, &id)?;
+            
+            // Determine modified time: check bulk result, fallback to FS
+            let modified = if let Some(rel_path) = id_to_path.get(&id) {
+                if let Some(time) = modified_times.get(rel_path) {
+                    *time
+                } else {
+                    // Fallback to FS metadata
+                    let abs_path = archive.root().join(rel_path);
+                    let metadata = std::fs::metadata(&abs_path)?;
+                    DateTime::<Utc>::from(metadata.modified()?)
+                }
+            } else {
+                // Fallback (shouldn't happen if path logic is consistent)
+                Utc::now()
+            };
 
             map.insert(id.clone(), SkillSnapshot { id, hash, modified });
         }
@@ -480,77 +512,11 @@ fn resolve_archive_root(path: &Path) -> Result<PathBuf> {
     )))
 }
 
-fn skill_modified_time(archive: &GitArchive, id: &str) -> Result<DateTime<Utc>> {
-    let skill_path = archive
-        .skill_path(id)
-        .ok_or_else(|| MsError::ValidationFailed("invalid skill id".to_string()))?;
-    let spec_path = skill_path.join("skill.spec.json");
-    let repo_root = archive
-        .repo()
-        .workdir()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| archive.root().to_path_buf());
-    if let Ok(Some(committed)) = git_last_modified_time(archive.repo(), &repo_root, &spec_path) {
-        return Ok(committed);
-    }
-    let metadata = std::fs::metadata(&spec_path)?;
-    let modified = metadata.modified()?;
-    Ok(DateTime::<Utc>::from(modified))
-}
-
 fn hash_skill_spec(spec: &SkillSpec) -> Result<String> {
     let json = serde_json::to_vec(spec)?;
     let mut hasher = Sha256::new();
     hasher.update(&json);
     Ok(format!("{:x}", hasher.finalize()))
-}
-
-fn git_last_modified_time(
-    repo: &Repository,
-    repo_root: &Path,
-    file_path: &Path,
-) -> Result<Option<DateTime<Utc>>> {
-    let rel = match file_path.strip_prefix(repo_root) {
-        Ok(path) => path.to_path_buf(),
-        Err(_) => return Ok(None),
-    };
-
-    let mut revwalk = match repo.revwalk() {
-        Ok(walk) => walk,
-        Err(_) => return Ok(None),
-    };
-    if revwalk.push_head().is_err() {
-        return Ok(None);
-    }
-    revwalk.set_sorting(git2::Sort::TIME).map_err(MsError::Git)?;
-
-    for oid in revwalk {
-        let oid = oid.map_err(MsError::Git)?;
-        let commit = repo.find_commit(oid).map_err(MsError::Git)?;
-        let tree = commit.tree().map_err(MsError::Git)?;
-        let entry = match tree.get_path(&rel) {
-            Ok(entry) => entry,
-            Err(_) => continue,
-        };
-
-        if let Ok(parent) = commit.parent(0) {
-            if let Ok(parent_tree) = parent.tree() {
-                if let Ok(parent_entry) = parent_tree.get_path(&rel) {
-                    if parent_entry.id() == entry.id() {
-                        continue;
-                    }
-                }
-            }
-        }
-
-        let seconds = commit.time().seconds();
-        let Some(dt) = DateTime::from_timestamp(seconds, 0) else {
-            continue;
-        };
-        return Ok(Some(dt));
-    }
-
-    Ok(None)
 }
 
 fn open_git_remote(remote: &RemoteConfig, ms_root: &Path) -> Result<GitArchive> {
