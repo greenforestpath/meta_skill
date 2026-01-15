@@ -610,4 +610,375 @@ mod tests {
             PackMode::PitfallSafe
         ));
     }
+
+    // ==================== Argument Parsing Tests ====================
+
+    #[test]
+    fn test_load_args_minimal() {
+        use clap::Parser;
+
+        #[derive(Parser)]
+        struct TestCli {
+            #[command(flatten)]
+            args: LoadArgs,
+        }
+
+        let cli = TestCli::parse_from(["test", "my-skill"]);
+        assert_eq!(cli.args.skill, "my-skill");
+        assert!(cli.args.level.is_none());
+        assert!(cli.args.pack.is_none());
+        assert!(!cli.args.full);
+        assert!(!cli.args.complete);
+    }
+
+    #[test]
+    fn test_load_args_with_level_short() {
+        use clap::Parser;
+
+        #[derive(Parser)]
+        struct TestCli {
+            #[command(flatten)]
+            args: LoadArgs,
+        }
+
+        let cli = TestCli::parse_from(["test", "skill", "-l", "full"]);
+        assert_eq!(cli.args.level, Some("full".to_string()));
+    }
+
+    #[test]
+    fn test_load_args_with_level_long() {
+        use clap::Parser;
+
+        #[derive(Parser)]
+        struct TestCli {
+            #[command(flatten)]
+            args: LoadArgs,
+        }
+
+        let cli = TestCli::parse_from(["test", "skill", "--level", "minimal"]);
+        assert_eq!(cli.args.level, Some("minimal".to_string()));
+    }
+
+    #[test]
+    fn test_load_args_with_pack() {
+        use clap::Parser;
+
+        #[derive(Parser)]
+        struct TestCli {
+            #[command(flatten)]
+            args: LoadArgs,
+        }
+
+        let cli = TestCli::parse_from(["test", "skill", "--pack", "500"]);
+        assert_eq!(cli.args.pack, Some(500));
+    }
+
+    #[test]
+    fn test_load_args_with_pack_mode() {
+        use clap::Parser;
+
+        #[derive(Parser)]
+        struct TestCli {
+            #[command(flatten)]
+            args: LoadArgs,
+        }
+
+        let cli = TestCli::parse_from(["test", "skill", "--pack", "1000", "--mode", "utility-first"]);
+        assert_eq!(cli.args.pack, Some(1000));
+        assert!(matches!(cli.args.mode, CliPackMode::UtilityFirst));
+    }
+
+    #[test]
+    fn test_load_args_max_per_group_default() {
+        use clap::Parser;
+
+        #[derive(Parser)]
+        struct TestCli {
+            #[command(flatten)]
+            args: LoadArgs,
+        }
+
+        let cli = TestCli::parse_from(["test", "skill"]);
+        assert_eq!(cli.args.max_per_group, 2);
+    }
+
+    #[test]
+    fn test_load_args_max_per_group_custom() {
+        use clap::Parser;
+
+        #[derive(Parser)]
+        struct TestCli {
+            #[command(flatten)]
+            args: LoadArgs,
+        }
+
+        let cli = TestCli::parse_from(["test", "skill", "--max-per-group", "5"]);
+        assert_eq!(cli.args.max_per_group, 5);
+    }
+
+    #[test]
+    fn test_load_args_full_flag() {
+        use clap::Parser;
+
+        #[derive(Parser)]
+        struct TestCli {
+            #[command(flatten)]
+            args: LoadArgs,
+        }
+
+        let cli = TestCli::parse_from(["test", "skill", "--full"]);
+        assert!(cli.args.full);
+        assert!(!cli.args.complete);
+    }
+
+    #[test]
+    fn test_load_args_complete_flag() {
+        use clap::Parser;
+
+        #[derive(Parser)]
+        struct TestCli {
+            #[command(flatten)]
+            args: LoadArgs,
+        }
+
+        let cli = TestCli::parse_from(["test", "skill", "--complete"]);
+        assert!(cli.args.complete);
+        assert!(!cli.args.full);
+    }
+
+    #[test]
+    fn test_load_args_deps_modes() {
+        use clap::Parser;
+
+        #[derive(Parser)]
+        struct TestCli {
+            #[command(flatten)]
+            args: LoadArgs,
+        }
+
+        // Default is auto
+        let cli = TestCli::parse_from(["test", "skill"]);
+        assert!(matches!(cli.args.deps, DepsMode::Auto));
+
+        // Off
+        let cli = TestCli::parse_from(["test", "skill", "--deps", "off"]);
+        assert!(matches!(cli.args.deps, DepsMode::Off));
+
+        // Full
+        let cli = TestCli::parse_from(["test", "skill", "--deps", "full"]);
+        assert!(matches!(cli.args.deps, DepsMode::Full));
+    }
+
+    #[test]
+    fn test_load_args_all_pack_modes() {
+        use clap::Parser;
+
+        #[derive(Parser)]
+        struct TestCli {
+            #[command(flatten)]
+            args: LoadArgs,
+        }
+
+        for (name, expected_mode) in [
+            ("balanced", CliPackMode::Balanced),
+            ("utility-first", CliPackMode::UtilityFirst),
+            ("coverage-first", CliPackMode::CoverageFirst),
+            ("pitfall-safe", CliPackMode::PitfallSafe),
+        ] {
+            let cli = TestCli::parse_from(["test", "skill", "--mode", name]);
+            assert!(
+                std::mem::discriminant(&cli.args.mode) == std::mem::discriminant(&expected_mode),
+                "Expected mode {} to match",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn test_load_args_combined() {
+        use clap::Parser;
+
+        #[derive(Parser)]
+        struct TestCli {
+            #[command(flatten)]
+            args: LoadArgs,
+        }
+
+        let cli = TestCli::parse_from([
+            "test",
+            "my-skill",
+            "--pack",
+            "750",
+            "--mode",
+            "coverage-first",
+            "--max-per-group",
+            "3",
+            "--deps",
+            "off",
+        ]);
+
+        assert_eq!(cli.args.skill, "my-skill");
+        assert_eq!(cli.args.pack, Some(750));
+        assert!(matches!(cli.args.mode, CliPackMode::CoverageFirst));
+        assert_eq!(cli.args.max_per_group, 3);
+        assert!(matches!(cli.args.deps, DepsMode::Off));
+    }
+
+    // ==================== Disclosure Plan Edge Cases ====================
+
+    #[test]
+    fn test_determine_disclosure_plan_invalid_level_falls_back() {
+        let args = LoadArgs {
+            skill: "test".to_string(),
+            level: Some("invalid".to_string()),
+            pack: None,
+            mode: CliPackMode::Balanced,
+            max_per_group: 2,
+            full: false,
+            complete: false,
+            deps: DepsMode::Auto,
+        };
+
+        // Invalid level should fall through to Standard
+        match determine_disclosure_plan(&args) {
+            DisclosurePlan::Level(level) => {
+                assert_eq!(level, DisclosureLevel::Standard);
+            }
+            _ => panic!("Expected Level plan"),
+        }
+    }
+
+    #[test]
+    fn test_determine_disclosure_plan_complete_overrides_level() {
+        let args = LoadArgs {
+            skill: "test".to_string(),
+            level: Some("minimal".to_string()),
+            pack: None,
+            mode: CliPackMode::Balanced,
+            max_per_group: 2,
+            full: false,
+            complete: true, // Should override level
+            deps: DepsMode::Auto,
+        };
+
+        match determine_disclosure_plan(&args) {
+            DisclosurePlan::Level(level) => {
+                assert_eq!(level, DisclosureLevel::Complete);
+            }
+            _ => panic!("Expected Level plan"),
+        }
+    }
+
+    #[test]
+    fn test_determine_disclosure_plan_pack_overrides_all() {
+        let args = LoadArgs {
+            skill: "test".to_string(),
+            level: Some("full".to_string()),
+            pack: Some(100),
+            mode: CliPackMode::Balanced,
+            max_per_group: 2,
+            full: true,
+            complete: true, // Pack should override all flags
+            deps: DepsMode::Auto,
+        };
+
+        match determine_disclosure_plan(&args) {
+            DisclosurePlan::Pack(budget) => {
+                assert_eq!(budget.tokens, 100);
+            }
+            DisclosurePlan::Level(_) => panic!("Expected Pack plan, not Level"),
+        }
+    }
+
+    #[test]
+    fn test_determine_disclosure_plan_level_0() {
+        let args = LoadArgs {
+            skill: "test".to_string(),
+            level: Some("0".to_string()),
+            pack: None,
+            mode: CliPackMode::Balanced,
+            max_per_group: 2,
+            full: false,
+            complete: false,
+            deps: DepsMode::Auto,
+        };
+
+        match determine_disclosure_plan(&args) {
+            DisclosurePlan::Level(level) => {
+                assert_eq!(level, DisclosureLevel::Minimal);
+            }
+            _ => panic!("Expected Level plan"),
+        }
+    }
+
+    #[test]
+    fn test_determine_disclosure_plan_level_4() {
+        let args = LoadArgs {
+            skill: "test".to_string(),
+            level: Some("4".to_string()),
+            pack: None,
+            mode: CliPackMode::Balanced,
+            max_per_group: 2,
+            full: false,
+            complete: false,
+            deps: DepsMode::Auto,
+        };
+
+        match determine_disclosure_plan(&args) {
+            DisclosurePlan::Level(level) => {
+                assert_eq!(level, DisclosureLevel::Complete);
+            }
+            _ => panic!("Expected Level plan"),
+        }
+    }
+
+    // ==================== LoadResult Tests ====================
+
+    #[test]
+    fn test_load_result_struct() {
+        use crate::core::disclosure::{DisclosedContent, DisclosedFrontmatter};
+
+        let result = LoadResult {
+            skill_id: "test-skill".to_string(),
+            name: "Test Skill".to_string(),
+            disclosed: DisclosedContent {
+                level: DisclosureLevel::Standard,
+                frontmatter: DisclosedFrontmatter {
+                    id: "test-skill".to_string(),
+                    name: "Test Skill".to_string(),
+                    version: "1.0.0".to_string(),
+                    description: "A test".to_string(),
+                    tags: vec![],
+                    requires: vec![],
+                },
+                body: Some("Body content".to_string()),
+                scripts: vec![],
+                references: vec![],
+                token_estimate: 100,
+            },
+            dependencies_loaded: vec!["dep1".to_string()],
+            slices_included: None,
+        };
+
+        assert_eq!(result.skill_id, "test-skill");
+        assert_eq!(result.name, "Test Skill");
+        assert_eq!(result.dependencies_loaded.len(), 1);
+        assert!(result.slices_included.is_none());
+    }
+
+    // ==================== DepsMode Tests ====================
+
+    #[test]
+    fn test_deps_mode_default() {
+        let mode = DepsMode::default();
+        assert!(matches!(mode, DepsMode::Auto));
+    }
+
+    // ==================== CliPackMode Tests ====================
+
+    #[test]
+    fn test_cli_pack_mode_default() {
+        let mode = CliPackMode::default();
+        assert!(matches!(mode, CliPackMode::Balanced));
+    }
 }
