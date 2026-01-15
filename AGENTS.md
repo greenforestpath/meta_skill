@@ -505,11 +505,9 @@ bd sync  # Persist immediately
 
 ---
 
-## ms — Meta Skill CLI (PLANNED)
+## ms — Meta Skill CLI
 
-> **Status:** Not yet implemented. This documents the planned design from `PLAN_TO_MAKE_METASKILL_CLI.md`.
-
-`ms` will mine CASS sessions to generate production-quality Claude Code skills. Architecture will follow `/data/projects/xf` exactly.
+`ms` is a complete skill management platform—store skills, search them, track their effectiveness, package them for sharing, and integrate them natively with AI agents. Skills can come from hand-written files, CASS session mining, bundles, or guided workflows.
 
 ### Core Commands
 
@@ -522,12 +520,14 @@ ms search --robot                 # JSON output for automation
 ms load <skill> --level overview  # Levels: minimal|overview|standard|full|complete
 ms load <skill> --pack 2000       # Token-packed slices within budget
 ms suggest --cwd .                # Context-aware recommendations
-ms suggest --for-ntm --agents 4   # Swarm-aware pack planning
 ms build --from-cass "topic"      # Mine sessions → generate skill
-ms build --guided --duration 4h   # Hours-long autonomous generation
 ms bundle create my-skills        # Package for sharing
 ms doctor                         # Health checks (--fix auto-repairs)
 ms sync                           # Git + SQLite dual persistence sync
+ms mcp serve                      # MCP server for AI agent integration
+ms security scan                  # ACIP prompt injection detection
+ms safety check "<command>"       # DCG command safety classification
+ms evidence show <skill>          # Provenance tracking
 ```
 
 ### Key Concepts
@@ -540,6 +540,7 @@ ms sync                           # Git + SQLite dual persistence sync
 | **Dual Persistence** | SQLite for queries, Git for audit/sync |
 | **Robot Mode** | `--robot` flag: stdout=JSON, stderr=diagnostics, exit 0=success |
 | **Hash Embeddings** | FNV-1a based, 384 dims, no ML dependency |
+| **Thompson Sampling** | Bandit algorithm learns from usage to optimize suggestions |
 
 ### Skill Building from CASS
 
@@ -550,10 +551,6 @@ ms coverage --min-sessions 5
 # Single-shot extraction
 ms build --from-cass "error handling" --since "7 days"
 
-# Autonomous generation with checkpointing
-ms build --guided --autonomous --duration 4h --checkpoint-interval 30m
-ms build --resume <build-id>      # Resume interrupted build
-
 # Mark sessions for skill extraction
 ms mark <session> --exemplary --topics "debugging,rust"
 ms mark <session> --anti-pattern --reason "wrong approach"
@@ -562,13 +559,12 @@ ms mark <session> --anti-pattern --reason "wrong approach"
 ### Integration Points
 
 - **CASS**: Source of session transcripts for mining
-- **NTM**: `ms suggest --for-ntm` returns swarm packs per agent
-- **BV/Beads**: `ms prune --emit-beads` creates issues for review
-- **MCP Server**: `ms mcp serve` for native agent tool-use integration
+- **BV/Beads**: `ms graph` delegates to bv for PageRank, betweenness, cycles
+- **MCP Server**: `ms mcp serve` for native agent tool-use (search, load, evidence, list, show, doctor)
 
-### Safety Invariants
+### Safety Systems
 
-- Destructive ops require verbatim approval (mirrors AGENTS.md Rule 1)
-- Redaction pipeline strips secrets/PII before pattern extraction
-- Injection defense filters prompt-injection content from sessions
-- Mandatory policy slices cannot be omitted even under tight budgets
+- **ACIP**: Prompt injection detection with trust boundaries and quarantine
+- **DCG**: Command safety tiers (Safe/Caution/Danger/Critical)
+- **Path Policy**: Symlink escape prevention, path traversal guards
+- **Secret Scanner**: Entropy-based detection with automatic redaction
