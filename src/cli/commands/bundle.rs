@@ -1334,7 +1334,7 @@ mod tests {
             "my-bundle",
             "--skills",
             "skill1,skill2",
-            "--version",
+            "--bundle-version",
             "1.0.0",
             "--id",
             "custom-id",
