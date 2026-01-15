@@ -22,6 +22,7 @@ pub mod bundle;
 pub mod cm;
 pub mod config;
 pub mod conflicts;
+pub mod contract;
 pub mod diff;
 pub mod doctor;
 pub mod edit;
@@ -33,6 +34,7 @@ pub mod graph;
 pub mod index;
 pub mod init;
 pub mod install;
+pub mod inbox;
 pub mod list;
 pub mod load;
 pub mod machine;
@@ -49,6 +51,7 @@ pub mod search;
 pub mod security;
 pub mod shell;
 pub mod show;
+pub mod simulate;
 pub mod suggest;
 pub mod sync;
 pub mod template;
@@ -68,6 +71,7 @@ pub fn run(ctx: &AppContext, command: &Commands) -> Result<()> {
         Commands::Suggest(args) => suggest::run(ctx, args),
         Commands::Show(args) => show::run(ctx, args),
         Commands::List(args) => list::run(ctx, args),
+        Commands::Inbox(args) => inbox::run(ctx, args),
         Commands::Edit(args) => edit::run(ctx, args),
         Commands::Fmt(args) => fmt::run(ctx, args),
         Commands::Diff(args) => diff::run(ctx, args),
@@ -83,6 +87,7 @@ pub fn run(ctx: &AppContext, command: &Commands) -> Result<()> {
         Commands::Machine(args) => machine::run(ctx, args),
         Commands::Graph(args) => graph::run(ctx, args),
         Commands::Conflicts(args) => conflicts::run(ctx, args),
+        Commands::Contract(args) => contract::run(ctx, args),
         Commands::Migrate(args) => migrate::run(ctx, args),
         Commands::Cm(args) => cm::run(ctx, args),
         Commands::Update(args) => update::run(ctx, args),
@@ -97,6 +102,7 @@ pub fn run(ctx: &AppContext, command: &Commands) -> Result<()> {
         Commands::Safety(args) => safety::run(ctx, args),
         Commands::Validate(args) => validate::run(ctx, args),
         Commands::Test(args) => test::run(ctx, args),
+        Commands::Simulate(args) => simulate::run(ctx, args),
         Commands::Quality(args) => quality::run(ctx, args),
         Commands::Evidence(args) => evidence::run(ctx, args),
         Commands::Mcp(args) => mcp::run(ctx, args),

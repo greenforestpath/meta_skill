@@ -1,3 +1,4 @@
+pub mod agent_mail;
 pub mod antipatterns;
 pub mod app;
 pub mod beads;
@@ -14,6 +15,7 @@ pub mod meta_skills;
 pub mod quality;
 pub mod search;
 pub mod security;
+pub mod simulation;
 pub mod storage;
 pub mod suggestions;
 pub mod sync;
