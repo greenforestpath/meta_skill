@@ -158,6 +158,8 @@ impl Default for BuildState {
 pub struct BuildSession {
     /// Unique session identifier.
     pub session_id: String,
+    /// The CASS query for this build (stored for resume).
+    pub query: String,
     /// Current build phase.
     pub phase: BuildPhase,
     /// Progress within current phase (0.0-1.0).
@@ -180,13 +182,14 @@ pub struct BuildSession {
 
 impl BuildSession {
     /// Create a new build session.
-    pub fn new(_query: &str, gates: QualityGates) -> Self {
+    pub fn new(query: &str, gates: QualityGates) -> Self {
         let session_id = format!("build-{}", chrono::Utc::now().format("%Y%m%d-%H%M%S"));
         let now = Instant::now();
         let checkpoint = Checkpoint::new(&session_id, "build");
 
         Self {
             session_id,
+            query: query.to_string(),
             phase: BuildPhase::SearchSessions,
             phase_progress: 0.0,
             gates,
@@ -255,7 +258,11 @@ impl BuildSession {
         self.checkpoint.progress = self.overall_progress();
         self.checkpoint.updated_at = chrono::Utc::now();
 
-        // Store state
+        // Store state - including query for resume
+        self.checkpoint.state.insert(
+            "query".to_string(),
+            self.query.clone(),
+        );
         self.checkpoint.state.insert(
             "qualified_sessions".to_string(),
             self.state.qualified_session_ids.join(","),
@@ -324,6 +331,12 @@ pub fn parse_duration(s: &str) -> Result<Duration> {
         if c.is_ascii_digit() {
             current_num.push(c);
         } else {
+            if current_num.is_empty() {
+                return Err(MsError::Config(format!(
+                    "Missing number before '{}' in duration",
+                    c
+                )));
+            }
             let num: u64 = current_num.parse().map_err(|_| {
                 MsError::Config(format!("Invalid number in duration: {}", current_num))
             })?;
@@ -492,6 +505,81 @@ impl CmBuildContext {
 // Beads Build Integration
 // =============================================================================
 
+/// Build completion data for beads updates.
+#[derive(Debug, Clone, Serialize)]
+pub struct BuildCompletion {
+    pub duration_secs: f64,
+    pub success: bool,
+    pub tests_passed: Option<u32>,
+    pub tests_failed: Option<u32>,
+    pub tests_skipped: Option<u32>,
+    pub coverage_percent: Option<f64>,
+    pub error_summary: Option<String>,
+}
+
+impl BuildCompletion {
+    pub fn success(duration_secs: f64) -> Self {
+        Self {
+            duration_secs,
+            success: true,
+            tests_passed: None,
+            tests_failed: None,
+            tests_skipped: None,
+            coverage_percent: None,
+            error_summary: None,
+        }
+    }
+
+    pub fn failure(duration_secs: f64, error: impl Into<String>) -> Self {
+        Self {
+            duration_secs,
+            success: false,
+            tests_passed: None,
+            tests_failed: None,
+            tests_skipped: None,
+            coverage_percent: None,
+            error_summary: Some(error.into()),
+        }
+    }
+
+    /// Format as markdown for bead notes.
+    pub fn to_markdown(&self) -> String {
+        let mut md = String::new();
+
+        if self.success {
+            md.push_str("## Build Succeeded\n\n");
+        } else {
+            md.push_str("## Build Failed\n\n");
+        }
+
+        md.push_str(&format!("**Duration:** {:.1}s\n", self.duration_secs));
+
+        if let (Some(p), Some(f), Some(s)) =
+            (self.tests_passed, self.tests_failed, self.tests_skipped)
+        {
+            md.push_str(&format!(
+                "**Tests:** {} passed, {} failed, {} skipped\n",
+                p, f, s
+            ));
+        }
+
+        if let Some(cov) = self.coverage_percent {
+            md.push_str(&format!("**Coverage:** {:.1}%\n", cov));
+        }
+
+        if let Some(err) = &self.error_summary {
+            md.push_str("\n### Error Summary\n```\n");
+            md.push_str(err);
+            if !err.ends_with('\n') {
+                md.push('\n');
+            }
+            md.push_str("```\n");
+        }
+
+        md
+    }
+}
+
 /// Tracks build progress in a beads issue.
 ///
 /// When a bead_id is provided, this tracker:
@@ -501,13 +589,15 @@ impl CmBuildContext {
 pub struct BeadsTracker {
     client: BeadsClient,
     bead_id: String,
+    started_at: Instant,
+    close_on_success: bool,
 }
 
 impl BeadsTracker {
     /// Create a new tracker for the given bead ID.
     ///
     /// Returns None if beads is not available.
-    pub fn new(bead_id: String) -> Option<Self> {
+    pub fn new(bead_id: String, close_on_success: bool) -> Option<Self> {
         let client = BeadsClient::new();
         if !client.is_available() {
             eprintln!(
@@ -516,7 +606,12 @@ impl BeadsTracker {
             );
             return None;
         }
-        Some(Self { client, bead_id })
+        Some(Self {
+            client,
+            bead_id,
+            started_at: Instant::now(),
+            close_on_success,
+        })
     }
 
     /// Mark the bead as in_progress at build start.
@@ -545,33 +640,52 @@ impl BeadsTracker {
 
     /// Close the bead on successful build.
     pub fn on_success(&self, skill_name: &str) -> Result<()> {
-        let reason = format!("Build completed successfully: {}", skill_name);
-        match self.client.close(&self.bead_id, Some(&reason)) {
-            Ok(_) => {
-                eprintln!(
-                    "{} {} closed (build successful)",
-                    "Bead:".green(),
-                    self.bead_id
-                );
-                Ok(())
+        let completion = BuildCompletion::success(self.duration_secs());
+        if let Err(e) = self.append_completion_note(&completion) {
+            eprintln!(
+                "{} failed to append completion note for {}: {}",
+                "Warning:".yellow(),
+                self.bead_id,
+                e
+            );
+        }
+
+        if self.close_on_success {
+            match self.client.close(&self.bead_id, None) {
+                Ok(_) => {
+                    eprintln!(
+                        "{} {} closed (build successful: {})",
+                        "Bead:".green(),
+                        self.bead_id,
+                        skill_name
+                    );
+                    Ok(())
+                }
+                Err(e) => {
+                    eprintln!(
+                        "{} failed to close bead {}: {}",
+                        "Warning:".yellow(),
+                        self.bead_id,
+                        e
+                    );
+                    Ok(())
+                }
             }
-            Err(e) => {
-                eprintln!(
-                    "{} failed to close bead {}: {}",
-                    "Warning:".yellow(),
-                    self.bead_id,
-                    e
-                );
-                Ok(())
-            }
+        } else {
+            eprintln!(
+                "{} {} build completed (close disabled: {})",
+                "Bead:".green(),
+                self.bead_id,
+                skill_name
+            );
+            Ok(())
         }
     }
 
     /// Add failure note on build failure (keeps in_progress).
     pub fn on_failure(&self, error: &str) -> Result<()> {
-        let note = format!("Build failed: {}", error);
-        let req = UpdateIssueRequest::new().with_notes(&note);
-        match self.client.update(&self.bead_id, &req) {
+        let completion = BuildCompletion::failure(self.duration_secs(), error);
+        match self.append_completion_note(&completion) {
             Ok(_) => {
                 eprintln!(
                     "{} {} updated with failure note",
@@ -590,6 +704,32 @@ impl BeadsTracker {
                 Ok(())
             }
         }
+    }
+
+    fn duration_secs(&self) -> f64 {
+        self.started_at.elapsed().as_secs_f64()
+    }
+
+    fn append_completion_note(&self, completion: &BuildCompletion) -> Result<()> {
+        let note = completion.to_markdown();
+        let combined = match self.client.show(&self.bead_id) {
+            Ok(issue) => {
+                if let Some(existing) = issue.notes {
+                    if existing.trim().is_empty() {
+                        note
+                    } else {
+                        format!("{existing}\n\n{note}")
+                    }
+                } else {
+                    note
+                }
+            }
+            Err(_) => note,
+        };
+
+        let req = UpdateIssueRequest::new().with_notes(combined);
+        self.client.update(&self.bead_id, &req)?;
+        Ok(())
     }
 }
 
@@ -666,9 +806,10 @@ pub fn run(ctx: &AppContext, args: &BuildArgs) -> Result<()> {
     };
 
     // Initialize beads tracker if bead_id is provided
-    let bead_tracker = args.bead_id.as_ref().and_then(|id| {
-        BeadsTracker::new(id.clone())
-    });
+    let bead_tracker = args
+        .bead_id
+        .as_ref()
+        .and_then(|id| BeadsTracker::new(id.clone(), args.close_bead_on_success));
 
     // Mark bead as in_progress at build start
     if let Some(ref tracker) = bead_tracker {
@@ -692,7 +833,7 @@ pub fn run(ctx: &AppContext, args: &BuildArgs) -> Result<()> {
 
     // Auto mode
     if args.auto {
-        return run_auto(ctx, args, cm_context.as_ref(), bead_tracker);
+        return run_auto(ctx, args, cm_context.as_ref(), bead_tracker, None);
     }
 
     // Default: interactive but not guided
@@ -829,13 +970,18 @@ fn run_auto(
     args: &BuildArgs,
     cm_context: Option<&CmBuildContext>,
     tracker: Option<BeadsTracker>,
+    query_override: Option<&str>,
 ) -> Result<()> {
     use crate::cass::mining::{extract_from_session, ExtractedPattern};
     use crate::cass::QualityConfig;
 
-    let query = args.from_cass.clone().ok_or_else(|| {
-        MsError::Config("--from-cass is required for --auto builds".into())
-    })?;
+    // Use query_override (from checkpoint resume) or fall back to args.from_cass
+    let query = query_override
+        .map(|s| s.to_string())
+        .or_else(|| args.from_cass.clone())
+        .ok_or_else(|| {
+            MsError::Config("--from-cass is required for --auto builds".into())
+        })?;
 
     let output_dir = args.output.clone().unwrap_or_else(|| {
         ctx.ms_root.join("builds").join(
@@ -1561,9 +1707,9 @@ fn run_resume(
                     None
                 };
 
-                // Resume by restarting with same parameters
+                // Resume by restarting with same parameters, using query from checkpoint
                 // (full incremental resume would require more state)
-                return run_auto(ctx, args, cm_context.as_ref(), tracker);
+                return run_auto(ctx, args, cm_context.as_ref(), tracker, Some(&query));
             }
         }
         _ => {
@@ -2238,6 +2384,21 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_duration_missing_number_fails() {
+        // Unit without a preceding number
+        let result = parse_duration("h");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Missing number"));
+
+        let result = parse_duration("m");
+        assert!(result.is_err());
+
+        // Unit at start of combined duration
+        let result = parse_duration("h30m");
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn test_parse_duration_case_insensitive() {
         let dur_lower = parse_duration("2h30m").unwrap();
         let dur_upper = parse_duration("2H30M").unwrap();
@@ -2280,7 +2441,8 @@ mod tests {
         assert_eq!(loaded.phase, "quality_filter");
         assert!(loaded.progress > 0.0);
 
-        // Verify state data
+        // Verify state data including query (critical for resume)
+        assert_eq!(loaded.get_state("query"), Some("test-checkpoint"));
         assert_eq!(loaded.get_state("qualified_sessions"), Some("sess-1,sess-2"));
         assert_eq!(loaded.get_state("patterns_extracted"), Some("42"));
         assert_eq!(loaded.get_state("patterns_filtered"), Some("35"));
@@ -2321,6 +2483,9 @@ mod tests {
         // Verify we can recover the essential state
         assert_eq!(loaded.phase, "extract_patterns");
         assert!(loaded.progress >= 0.30, "Should be past first two phases");
+
+        // Critical: query must be recoverable for resume
+        assert_eq!(loaded.get_state("query"), Some("crash-test"));
 
         let qualified_sessions = loaded.get_state("qualified_sessions").unwrap();
         let session_ids: Vec<&str> = qualified_sessions.split(',').collect();
@@ -2372,6 +2537,36 @@ mod tests {
         assert_eq!(restored.qualified_session_ids, state.qualified_session_ids);
         assert_eq!(restored.patterns_extracted, state.patterns_extracted);
         assert_eq!(restored.patterns_filtered, state.patterns_filtered);
+    }
+
+    #[test]
+    fn test_build_completion_markdown_success() {
+        let completion = BuildCompletion {
+            duration_secs: 12.3,
+            success: true,
+            tests_passed: Some(10),
+            tests_failed: Some(1),
+            tests_skipped: Some(2),
+            coverage_percent: Some(87.5),
+            error_summary: None,
+        };
+
+        let md = completion.to_markdown();
+        assert!(md.contains("Build Succeeded"));
+        assert!(md.contains("Duration"));
+        assert!(md.contains("10 passed, 1 failed, 2 skipped"));
+        assert!(md.contains("87.5%"));
+        assert!(!md.contains("Error Summary"));
+    }
+
+    #[test]
+    fn test_build_completion_markdown_failure_includes_error() {
+        let completion = BuildCompletion::failure(4.2, "boom");
+        let md = completion.to_markdown();
+        assert!(md.contains("Build Failed"));
+        assert!(md.contains("Duration"));
+        assert!(md.contains("Error Summary"));
+        assert!(md.contains("boom"));
     }
 
     #[test]
@@ -2452,4 +2647,3 @@ mod tests {
         assert_eq!(session.phase, BuildPhase::Failed);
     }
 }
-
