@@ -4,7 +4,7 @@ use clap::Args;
 use semver::Version;
 
 use crate::app::AppContext;
-use crate::error::Result;
+use crate::error::{MsError, Result};
 use crate::updater::{
     UpdateChannel, UpdateCheckResponse, UpdateChecker, UpdateDownloader, UpdateInstallResponse,
     UpdateInstaller,
@@ -41,26 +41,50 @@ pub fn run(ctx: &AppContext, args: &UpdateArgs) -> Result<()> {
     // Determine channel from args or config
     let channel_str = args.channel.as_ref().unwrap_or(&ctx.config.update.channel);
     let channel: UpdateChannel = channel_str.parse()?;
+    let target_version = args
+        .target_version
+        .as_ref()
+        .map(|v| Version::parse(v))
+        .transpose()
+        .map_err(|err| MsError::ValidationFailed(format!("invalid target version: {err}")))?;
 
     let checker = UpdateChecker::new(current_version.clone(), channel, DEFAULT_REPO.to_string());
 
     if ctx.robot_mode {
-        run_robot(args, &checker)?;
+        run_robot(args, &checker, target_version.as_ref())?;
     } else {
-        run_interactive(args, &checker)?;
+        run_interactive(args, &checker, target_version.as_ref())?;
     }
 
     Ok(())
 }
 
-fn run_robot(args: &UpdateArgs, checker: &UpdateChecker) -> Result<()> {
+fn run_robot(
+    args: &UpdateArgs,
+    checker: &UpdateChecker,
+    target_version: Option<&Version>,
+) -> Result<()> {
     if args.check {
         // Check only
-        let update = checker.check()?;
+        let update = if let Some(target) = target_version {
+            checker.get_version(target)?
+        } else {
+            checker.check()?
+        };
+        if update.is_none() && target_version.is_some() {
+            return Err(MsError::NotFound(format!(
+                "target version not found: {}",
+                target_version.unwrap()
+            )));
+        }
+        let update_available = update
+            .as_ref()
+            .map(|u| u.version != *checker.current_version())
+            .unwrap_or(false);
         let response = UpdateCheckResponse {
             current_version: checker.current_version().to_string(),
             channel: checker.channel().to_string(),
-            update_available: update.is_some(),
+            update_available,
             latest_version: update.as_ref().map(|u| u.version.to_string()),
             changelog: update.as_ref().map(|u| u.changelog.clone()),
             download_size: update
@@ -71,13 +95,31 @@ fn run_robot(args: &UpdateArgs, checker: &UpdateChecker) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&response)?);
     } else {
         // Perform update
-        let update = if args.force {
+        let update = if let Some(target) = target_version {
+            checker.get_version(target)?
+        } else if args.force {
             checker.get_latest()?
         } else {
             checker.check()?
         };
 
         if let Some(release) = update {
+            if release.version == *checker.current_version()
+                && target_version.is_some()
+                && !args.force
+            {
+                let response = UpdateCheckResponse {
+                    current_version: checker.current_version().to_string(),
+                    channel: checker.channel().to_string(),
+                    update_available: false,
+                    latest_version: Some(release.version.to_string()),
+                    changelog: None,
+                    download_size: None,
+                    html_url: None,
+                };
+                println!("{}", serde_json::to_string_pretty(&response)?);
+                return Ok(());
+            }
             let downloader = UpdateDownloader::new()?;
             let binary_path = downloader.download_and_verify(&release)?;
             let installer = UpdateInstaller::new()?;
@@ -93,6 +135,12 @@ fn run_robot(args: &UpdateArgs, checker: &UpdateChecker) -> Result<()> {
             };
             println!("{}", serde_json::to_string_pretty(&response)?);
         } else {
+            if let Some(target) = target_version {
+                return Err(MsError::NotFound(format!(
+                    "target version not found: {}",
+                    target
+                )));
+            }
             let response = UpdateCheckResponse {
                 current_version: checker.current_version().to_string(),
                 channel: checker.channel().to_string(),
@@ -109,18 +157,33 @@ fn run_robot(args: &UpdateArgs, checker: &UpdateChecker) -> Result<()> {
     Ok(())
 }
 
-fn run_interactive(args: &UpdateArgs, checker: &UpdateChecker) -> Result<()> {
+fn run_interactive(
+    args: &UpdateArgs,
+    checker: &UpdateChecker,
+    target_version: Option<&Version>,
+) -> Result<()> {
     println!(
         "Current version: {} ({})",
         checker.current_version(),
         checker.channel()
     );
+    if let Some(target) = target_version {
+        println!("Target version: {target}");
+    }
 
     if args.check {
         // Check only mode
-        let update = checker.check()?;
+        let update = if let Some(target) = target_version {
+            checker.get_version(target)?
+        } else {
+            checker.check()?
+        };
         match update {
             Some(release) => {
+                if release.version == *checker.current_version() && !args.force {
+                    println!("\n✓ You are already running v{}", release.version);
+                    return Ok(());
+                }
                 println!("\n✓ Update available: v{}", release.version);
                 println!("  Released: {}", release.published_at.format("%Y-%m-%d"));
                 if !release.changelog.is_empty() {
@@ -136,6 +199,12 @@ fn run_interactive(args: &UpdateArgs, checker: &UpdateChecker) -> Result<()> {
                 println!("\nRun `ms update` to install.");
             }
             None => {
+                if let Some(target) = target_version {
+                    println!("\n✗ Target version not found: v{target}");
+                    return Err(MsError::NotFound(format!(
+                        "target version not found: {target}"
+                    )));
+                }
                 println!("\n✓ You are up to date!");
             }
         }
@@ -144,7 +213,9 @@ fn run_interactive(args: &UpdateArgs, checker: &UpdateChecker) -> Result<()> {
 
     // Perform update
     println!("Checking for updates...");
-    let update = if args.force {
+    let update = if let Some(target) = target_version {
+        checker.get_version(target)?
+    } else if args.force {
         checker.get_latest()?
     } else {
         checker.check()?
@@ -153,10 +224,21 @@ fn run_interactive(args: &UpdateArgs, checker: &UpdateChecker) -> Result<()> {
     let release = match update {
         Some(r) => r,
         None => {
+            if let Some(target) = target_version {
+                println!("✗ Target version not found: v{target}");
+                return Err(MsError::NotFound(format!(
+                    "target version not found: {target}"
+                )));
+            }
             println!("✓ You are already running the latest version.");
             return Ok(());
         }
     };
+
+    if release.version == *checker.current_version() && target_version.is_some() && !args.force {
+        println!("✓ You are already running v{}", release.version);
+        return Ok(());
+    }
 
     println!("\nUpdate available: v{}", release.version);
 
