@@ -8,8 +8,6 @@
 //! - **NEVER batch syncs**: If Agent 1 finishes, sync immediately
 //! - **Monitor for failures**: If any `bd update` or `bd sync` fails, STOP ALL AGENTS
 
-#![cfg(test)]
-
 use std::path::PathBuf;
 use std::process::Command;
 use std::thread;

@@ -3,8 +3,6 @@
 //! These tests verify that BeadsClient respects SQLite WAL safety requirements.
 //! Data loss from improper WAL handling is CRITICAL to avoid.
 
-#![cfg(test)]
-
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
