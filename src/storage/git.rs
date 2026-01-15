@@ -372,6 +372,7 @@ mod tests {
 
     fn sample_spec(id: &str) -> SkillSpec {
         SkillSpec {
+            format_version: SkillSpec::FORMAT_VERSION.to_string(),
             metadata: crate::core::SkillMetadata {
                 id: id.to_string(),
                 name: "Sample Skill".to_string(),

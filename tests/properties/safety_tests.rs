@@ -45,6 +45,7 @@ fn arb_skill_spec() -> impl Strategy<Value = SkillSpec> {
         prop::collection::vec(section, 0..3),
     )
         .prop_map(|(id, name, version, description, tags, sections)| SkillSpec {
+            format_version: SkillSpec::FORMAT_VERSION.to_string(),
             metadata: SkillMetadata {
                 id,
                 name,

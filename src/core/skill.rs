@@ -2,6 +2,12 @@
 
 use serde::{Deserialize, Serialize};
 
+const SKILL_SPEC_FORMAT_VERSION: &str = "1.0";
+
+fn default_format_version() -> String {
+    SkillSpec::FORMAT_VERSION.to_string()
+}
+
 /// A skill definition
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Skill {
@@ -34,6 +40,9 @@ impl Skill {
 /// The source-of-truth for a skill - SKILL.md is a compiled view of this.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillSpec {
+    /// Spec format version (for migrations)
+    #[serde(default = "default_format_version")]
+    pub format_version: String,
     /// Skill metadata
     pub metadata: SkillMetadata,
     /// Sections in the skill
@@ -44,24 +53,34 @@ pub struct SkillSpec {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SkillMetadata {
     /// Unique identifier
+    #[serde(default)]
     pub id: String,
     /// Human-readable name
+    #[serde(default)]
     pub name: String,
     /// Version
+    #[serde(default)]
     pub version: String,
     /// Description
+    #[serde(default)]
     pub description: String,
     /// Tags
+    #[serde(default)]
     pub tags: Vec<String>,
     /// Required capabilities
+    #[serde(default)]
     pub requires: Vec<String>,
     /// Provided capabilities
+    #[serde(default)]
     pub provides: Vec<String>,
     /// Supported platforms
+    #[serde(default)]
     pub platforms: Vec<String>,
     /// Author
+    #[serde(default)]
     pub author: Option<String>,
     /// License
+    #[serde(default)]
     pub license: Option<String>,
 }
 
@@ -113,6 +132,7 @@ impl SkillSpec {
     /// Create a new empty spec
     pub fn new(id: impl Into<String>, name: impl Into<String>) -> Self {
         Self {
+            format_version: Self::FORMAT_VERSION.to_string(),
             metadata: SkillMetadata {
                 id: id.into(),
                 name: name.into(),

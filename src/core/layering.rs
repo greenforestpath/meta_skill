@@ -661,6 +661,7 @@ mod tests {
 
     fn make_skill_spec(id: &str, name: &str, sections: Vec<SkillSection>) -> SkillSpec {
         SkillSpec {
+            format_version: SkillSpec::FORMAT_VERSION.to_string(),
             metadata: SkillMetadata {
                 id: id.to_string(),
                 name: name.to_string(),

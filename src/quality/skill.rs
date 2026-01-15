@@ -278,6 +278,7 @@ mod tests {
 
     fn minimal_spec() -> SkillSpec {
         SkillSpec {
+            format_version: SkillSpec::FORMAT_VERSION.to_string(),
             metadata: SkillMetadata {
                 id: "test".to_string(),
                 name: "Test".to_string(),

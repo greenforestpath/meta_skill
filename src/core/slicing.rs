@@ -169,6 +169,7 @@ mod tests {
     #[test]
     fn test_slice_attaches_section_title() {
         let spec = SkillSpec {
+            format_version: SkillSpec::FORMAT_VERSION.to_string(),
             metadata: SkillMetadata {
                 id: "test".to_string(),
                 name: "Test".to_string(),
@@ -194,6 +195,7 @@ mod tests {
     #[test]
     fn test_policy_detection() {
         let spec = SkillSpec {
+            format_version: SkillSpec::FORMAT_VERSION.to_string(),
             metadata: SkillMetadata {
                 id: "test".to_string(),
                 name: "Test".to_string(),

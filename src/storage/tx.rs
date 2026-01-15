@@ -875,6 +875,7 @@ mod tests {
 
     fn sample_skill(id: &str) -> SkillSpec {
         SkillSpec {
+            format_version: SkillSpec::FORMAT_VERSION.to_string(),
             metadata: SkillMetadata {
                 id: id.to_string(),
                 name: format!("Test Skill {}", id),

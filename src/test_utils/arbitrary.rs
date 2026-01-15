@@ -88,7 +88,11 @@ pub fn arb_skill_spec() -> impl Strategy<Value = SkillSpec> {
         arb_skill_metadata(),
         prop::collection::vec(arb_skill_section(), 0..4),
     )
-        .prop_map(|(metadata, sections)| SkillSpec { metadata, sections })
+        .prop_map(|(metadata, sections)| SkillSpec {
+            format_version: SkillSpec::FORMAT_VERSION.to_string(),
+            metadata,
+            sections,
+        })
 }
 
 fn arb_skill_paths() -> impl Strategy<Value = SkillPathsConfig> {
