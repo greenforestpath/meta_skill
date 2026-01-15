@@ -7,7 +7,7 @@ pub mod state;
 
 pub use config::{
     ConflictStrategy, RemoteAuth, RemoteConfig, RemoteType, SyncConfig, SyncDirection,
-    SyncSettings,
+    SyncSettings, validate_remote_name,
 };
 pub use engine::{SyncEngine, SyncOptions, SyncReport};
 pub use machine::{MachineIdentity, MachineMetadata};
