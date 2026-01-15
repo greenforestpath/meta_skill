@@ -23,6 +23,8 @@ pub mod cm;
 pub mod config;
 pub mod conflicts;
 pub mod contract;
+pub mod cross_project;
+pub mod dedup;
 pub mod diff;
 pub mod doctor;
 pub mod edit;
@@ -77,6 +79,7 @@ pub fn run(ctx: &AppContext, command: &Commands) -> Result<()> {
         Commands::Edit(args) => edit::run(ctx, args),
         Commands::Fmt(args) => fmt::run(ctx, args),
         Commands::Diff(args) => diff::run(ctx, args),
+        Commands::Dedup(args) => dedup::run(ctx, args),
         Commands::Alias(args) => alias::run(ctx, args),
         Commands::Requirements(args) => requirements::run(ctx, args),
         Commands::Feedback(args) => feedback::run(ctx, args),
@@ -89,6 +92,7 @@ pub fn run(ctx: &AppContext, command: &Commands) -> Result<()> {
         Commands::Machine(args) => machine::run(ctx, args),
         Commands::Meta(args) => meta::run(ctx, args),
         Commands::Graph(args) => graph::run(ctx, args),
+        Commands::CrossProject(args) => cross_project::run(ctx, args),
         Commands::Conflicts(args) => conflicts::run(ctx, args),
         Commands::Contract(args) => contract::run(ctx, args),
         Commands::Migrate(args) => migrate::run(ctx, args),

@@ -77,6 +77,9 @@ pub enum Commands {
     /// Semantic diff between skills
     Diff(commands::diff::DiffArgs),
 
+    /// Find and manage duplicate skills
+    Dedup(commands::dedup::DedupArgs),
+
     /// Manage skill aliases
     Alias(commands::alias::AliasArgs),
 
@@ -112,6 +115,9 @@ pub enum Commands {
 
     /// Skill graph analysis (bv integration)
     Graph(commands::graph::GraphArgs),
+
+    /// Cross-project learning and coverage analysis
+    CrossProject(commands::cross_project::CrossProjectArgs),
 
     /// Manage sync conflicts
     Conflicts(commands::conflicts::ConflictsArgs),

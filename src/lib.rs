@@ -9,6 +9,7 @@ pub mod cm;
 pub mod config;
 pub mod context;
 pub mod core;
+pub mod dedup;
 pub mod error;
 pub mod graph;
 pub mod meta_skills;
