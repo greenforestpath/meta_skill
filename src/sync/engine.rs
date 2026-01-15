@@ -199,21 +199,13 @@ impl SyncEngine {
             let local = local_map.get(&id);
             let remote_snap = remote_map.get(&id);
 
-            let status = match (local, remote_snap) {
-                (Some(l), Some(r)) if l.hash == r.hash => SkillSyncStatus::Synced,
-                (Some(l), Some(r)) => {
-                    if l.modified > r.modified {
-                        SkillSyncStatus::LocalAhead
-                    } else if r.modified > l.modified {
-                        SkillSyncStatus::RemoteAhead
-                    } else {
-                        SkillSyncStatus::Diverged
-                    }
-                }
-                (Some(_), None) => SkillSyncStatus::LocalOnly,
-                (None, Some(_)) => SkillSyncStatus::RemoteOnly,
-                (None, None) => continue,
-            };
+            let base_hash = self
+                .state
+                .skill_states
+                .get(&id)
+                .and_then(|state| state.remote_hashes.get(&remote.name).map(|s| s.as_str()));
+
+            let status = determine_sync_status(local, remote_snap, base_hash);
 
             let mut final_status = status.clone();
 
@@ -740,4 +732,126 @@ fn build_callbacks(auth: &ResolvedAuth) -> Result<RemoteCallbacks<'static>> {
         }
     });
     Ok(callbacks)
+}
+
+fn determine_sync_status(
+    local: Option<&SkillSnapshot>,
+    remote: Option<&SkillSnapshot>,
+    base_hash: Option<&str>,
+) -> SkillSyncStatus {
+    match (local, remote) {
+        (Some(l), Some(r)) => {
+            if l.hash == r.hash {
+                return SkillSyncStatus::Synced;
+            }
+
+            if let Some(base) = base_hash {
+                let local_changed = l.hash != base;
+                let remote_changed = r.hash != base;
+
+                if local_changed && remote_changed {
+                    SkillSyncStatus::Conflict
+                } else if local_changed {
+                    SkillSyncStatus::LocalAhead
+                } else if remote_changed {
+                    SkillSyncStatus::RemoteAhead
+                } else {
+                    // Theoretically unreachable if l != r and both == base
+                    SkillSyncStatus::Synced
+                }
+            } else {
+                // No base state, but contents differ -> Conflict
+                SkillSyncStatus::Conflict
+            }
+        }
+        (Some(_), None) => SkillSyncStatus::LocalOnly,
+        (None, Some(_)) => SkillSyncStatus::RemoteOnly,
+        (None, None) => SkillSyncStatus::Synced,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_snap(hash: &str, seconds_ago: i64) -> SkillSnapshot {
+        SkillSnapshot {
+            hash: hash.to_string(),
+            id: "test".to_string(),
+            modified: Utc::now() - chrono::Duration::seconds(seconds_ago),
+        }
+    }
+
+    #[test]
+    fn test_sync_logic_synced() {
+        let snap = make_snap("hash1", 10);
+        assert_eq!(
+            determine_sync_status(Some(&snap), Some(&snap), Some("hash1")),
+            SkillSyncStatus::Synced
+        );
+    }
+
+    #[test]
+    fn test_sync_logic_local_ahead() {
+        let local = make_snap("hash2", 0);
+        let remote = make_snap("hash1", 10);
+        // Base matches remote (remote hasn't changed, local has)
+        assert_eq!(
+            determine_sync_status(Some(&local), Some(&remote), Some("hash1")),
+            SkillSyncStatus::LocalAhead
+        );
+    }
+
+    #[test]
+    fn test_sync_logic_remote_ahead() {
+        let local = make_snap("hash1", 10);
+        let remote = make_snap("hash2", 0);
+        // Base matches local (local hasn't changed, remote has)
+        assert_eq!(
+            determine_sync_status(Some(&local), Some(&remote), Some("hash1")),
+            SkillSyncStatus::RemoteAhead
+        );
+    }
+
+    #[test]
+    fn test_sync_logic_conflict() {
+        let local = make_snap("hashA", 0);
+        let remote = make_snap("hashB", 0);
+        // Base matches neither (both changed independently)
+        assert_eq!(
+            determine_sync_status(Some(&local), Some(&remote), Some("hash1")),
+            SkillSyncStatus::Conflict
+        );
+    }
+
+    #[test]
+    fn test_sync_logic_conflict_no_base() {
+        let local = make_snap("hashA", 0);
+        let remote = make_snap("hashB", 0);
+        // No history, but content differs
+        assert_eq!(
+            determine_sync_status(Some(&local), Some(&remote), None),
+            SkillSyncStatus::Conflict
+        );
+    }
+
+    #[test]
+    fn test_sync_logic_lww_failure_reproduction() {
+        // Reproduce the LWW bug scenario from legacy logic
+        let local = make_snap("hashA", 100); // Modified older
+        let remote = make_snap("hashB", 50); // Modified newer
+        
+        // In legacy LWW logic: remote > local -> RemoteAhead.
+        // This would overwrite local changes (hashA).
+        
+        // In new 3-way logic:
+        // Case 1: We started from hash1.
+        // Local changed hash1 -> hashA.
+        // Remote changed hash1 -> hashB.
+        // Result should be Conflict.
+        assert_eq!(
+            determine_sync_status(Some(&local), Some(&remote), Some("hash1")),
+            SkillSyncStatus::Conflict
+        );
+    }
 }

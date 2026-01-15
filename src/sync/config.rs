@@ -25,6 +25,7 @@ impl Default for ConflictStrategy {
 pub enum RemoteType {
     FileSystem,
     Git,
+    Ru,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -49,8 +50,9 @@ impl RemoteType {
         match value {
             "filesystem" | "fs" => Ok(Self::FileSystem),
             "git" => Ok(Self::Git),
+            "ru" | "repo-updater" | "repo_updater" => Ok(Self::Ru),
             _ => Err(MsError::Config(format!(
-                "unknown remote type: {value} (use filesystem|git)"
+                "unknown remote type: {value} (use filesystem|git|ru)"
             ))),
         }
     }

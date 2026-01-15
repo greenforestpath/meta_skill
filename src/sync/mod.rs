@@ -3,6 +3,7 @@
 pub mod config;
 pub mod engine;
 pub mod machine;
+pub mod ru;
 pub mod state;
 
 pub use config::{
@@ -11,4 +12,5 @@ pub use config::{
 };
 pub use engine::{SyncEngine, SyncOptions, SyncReport};
 pub use machine::{MachineIdentity, MachineMetadata};
+pub use ru::{RuClient, RuConflict, RuError, RuExitCode, RuRepoStatus, RuSyncOptions, RuSyncResult};
 pub use state::{SkillSyncState, SkillSyncStatus, SyncState};
