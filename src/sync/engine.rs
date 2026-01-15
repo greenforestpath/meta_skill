@@ -253,7 +253,9 @@ impl SyncEngine {
                             report,
                             strategy,
                         )?;
-                        report.resolved.push(id.clone());
+                        if final_status == SkillSyncStatus::Synced {
+                            report.resolved.push(id.clone());
+                        }
                     } else {
                         report.conflicts.push(id.clone());
                         final_status = SkillSyncStatus::Conflict;
@@ -261,26 +263,29 @@ impl SyncEngine {
                 }
             }
 
+            let existing = self.state.skill_states.get(&id);
+            let mut remote_hashes = existing
+                .map(|entry| entry.remote_hashes.clone())
+                .unwrap_or_default();
+            let mut remote_modified = existing
+                .map(|entry| entry.remote_modified.clone())
+                .unwrap_or_default();
+            if let Some(snap) = remote_snap {
+                remote_hashes.insert(remote.name.clone(), snap.hash.clone());
+                remote_modified.insert(remote.name.clone(), snap.modified);
+            } else {
+                remote_hashes.remove(&remote.name);
+                remote_modified.remove(&remote.name);
+            }
+
             let state_entry = SkillSyncState {
                 skill_id: id.clone(),
                 local_hash: local.map(|s| s.hash.clone()),
-                remote_hashes: remote_snap
-                    .map(|s| {
-                        vec![(remote.name.clone(), s.hash.clone())]
-                            .into_iter()
-                            .collect()
-                    })
-                    .unwrap_or_default(),
+                remote_hashes,
                 local_modified: local.map(|s| s.modified),
-                remote_modified: remote_snap
-                    .map(|s| {
-                        vec![(remote.name.clone(), s.modified)]
-                            .into_iter()
-                            .collect()
-                    })
-                    .unwrap_or_default(),
+                remote_modified,
                 status: final_status,
-                last_modified_by: None,
+                last_modified_by: existing.and_then(|entry| entry.last_modified_by.clone()),
             };
             self.state.skill_states.insert(id, state_entry);
         }
@@ -484,7 +489,7 @@ fn sync_git_repo(
         .fetch(&["refs/heads/*:refs/remotes/origin/*"], Some(&mut fetch), None)
         .map_err(MsError::Git)?;
 
-    let branch = resolve_branch_name(repo, None)?;
+    let branch = resolve_branch_name(repo, branch_override)?;
     let remote_ref = format!("refs/remotes/origin/{}", branch);
     let remote_ref = repo
         .find_reference(&remote_ref)
