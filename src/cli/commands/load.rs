@@ -1,7 +1,10 @@
 //! ms load - Load a skill with progressive disclosure
 
+use std::collections::{HashMap, HashSet, VecDeque};
+
 use clap::{Args, ValueEnum};
 use colored::Colorize;
+use serde::Deserialize;
 
 use crate::app::AppContext;
 use crate::core::dependencies::{
@@ -10,7 +13,8 @@ use crate::core::dependencies::{
 use crate::core::disclosure::{
     DisclosedContent, DisclosureLevel, DisclosurePlan, PackMode, TokenBudget, disclose,
 };
-use crate::core::skill::{SkillAssets, SkillMetadata};
+use crate::core::pack_contracts::{PackContractPreset, custom_contracts_path, find_custom_contract};
+use crate::core::skill::{PackContract, SkillAssets, SkillMetadata};
 use crate::core::spec_lens::parse_markdown;
 use crate::error::{MsError, Result};
 use crate::storage::sqlite::SkillRecord;
@@ -51,6 +55,30 @@ pub enum CliPackMode {
     PitfallSafe,
 }
 
+/// Pack contract presets for packing strategies.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum CliPackContract {
+    Complete,
+    Debug,
+    Refactor,
+    Learn,
+    Quickref,
+    Codegen,
+}
+
+impl CliPackContract {
+    fn preset(self) -> PackContractPreset {
+        match self {
+            CliPackContract::Complete => PackContractPreset::Complete,
+            CliPackContract::Debug => PackContractPreset::Debug,
+            CliPackContract::Refactor => PackContractPreset::Refactor,
+            CliPackContract::Learn => PackContractPreset::Learn,
+            CliPackContract::Quickref => PackContractPreset::QuickRef,
+            CliPackContract::Codegen => PackContractPreset::CodeGen,
+        }
+    }
+}
+
 impl From<CliPackMode> for PackMode {
     fn from(mode: CliPackMode) -> Self {
         match mode {
@@ -79,6 +107,14 @@ pub struct LoadArgs {
     #[arg(long, value_enum, default_value = "balanced")]
     pub mode: CliPackMode,
 
+    /// Pack contract preset (requires --pack). Values: complete|debug|refactor|learn|quickref|codegen
+    #[arg(long, value_enum)]
+    pub contract: Option<CliPackContract>,
+
+    /// Custom pack contract id (requires --pack)
+    #[arg(long)]
+    pub contract_id: Option<String>,
+
     /// Max slices per coverage group
     #[arg(long, default_value = "2")]
     pub max_per_group: usize,
@@ -94,6 +130,14 @@ pub struct LoadArgs {
     /// Dependency loading strategy
     #[arg(long, value_enum, default_value = "auto")]
     pub deps: DepsMode,
+
+    /// Experiment id to attribute this load
+    #[arg(long)]
+    pub experiment_id: Option<String>,
+
+    /// Variant id for experiment attribution
+    #[arg(long)]
+    pub variant_id: Option<String>,
 }
 
 /// Result of loading a skill
@@ -107,11 +151,41 @@ pub struct LoadResult {
 }
 
 pub fn run(ctx: &AppContext, args: &LoadArgs) -> Result<()> {
+    let result = load_skill(ctx, args)?;
+
+    if ctx.robot_mode {
+        output_robot(ctx, &result, args)
+    } else {
+        output_human(ctx, &result, args)
+    }
+}
+
+pub(crate) fn load_skill(ctx: &AppContext, args: &LoadArgs) -> Result<LoadResult> {
     // Resolve skill by ID or alias
     let skill = resolve_skill(ctx, &args.skill)?;
 
+    if args.contract.is_some() && args.contract_id.is_some() {
+        return Err(MsError::Config(
+            "use either --contract or --contract-id".to_string(),
+        ));
+    }
+    if (args.contract.is_some() || args.contract_id.is_some()) && args.pack.is_none() {
+        return Err(MsError::Config(
+            "--contract requires --pack".to_string(),
+        ));
+    }
+
+    let contract = resolve_contract(ctx, args)?;
+
+    let (experiment_id, variant_id) = validate_experiment_usage(
+        ctx,
+        &skill.id,
+        args.experiment_id.as_deref(),
+        args.variant_id.as_deref(),
+    )?;
+
     // Determine disclosure plan
-    let disclosure_plan = determine_disclosure_plan(args);
+    let disclosure_plan = determine_disclosure_plan(args, contract);
 
     // Parse skill body into SkillSpec
     let spec = parse_markdown(&skill.body)
@@ -146,13 +220,15 @@ pub fn run(ctx: &AppContext, args: &LoadArgs) -> Result<()> {
         },
     };
 
-    record_usage(ctx, &skill.id, &disclosure_plan);
+    record_usage(
+        ctx,
+        &skill.id,
+        &disclosure_plan,
+        experiment_id.as_deref(),
+        variant_id.as_deref(),
+    );
 
-    if ctx.robot_mode {
-        output_robot(ctx, &result, args)
-    } else {
-        output_human(ctx, &result, args)
-    }
+    Ok(result)
 }
 
 fn resolve_skill(ctx: &AppContext, skill_ref: &str) -> Result<SkillRecord> {
@@ -174,13 +250,14 @@ fn resolve_skill(ctx: &AppContext, skill_ref: &str) -> Result<SkillRecord> {
     )))
 }
 
-fn determine_disclosure_plan(args: &LoadArgs) -> DisclosurePlan {
+fn determine_disclosure_plan(args: &LoadArgs, contract: Option<PackContract>) -> DisclosurePlan {
     // Token budget takes precedence
     if let Some(tokens) = args.pack {
         return DisclosurePlan::Pack(TokenBudget {
             tokens,
             mode: args.mode.into(),
             max_per_group: args.max_per_group,
+            contract,
         });
     }
 
@@ -205,7 +282,97 @@ fn determine_disclosure_plan(args: &LoadArgs) -> DisclosurePlan {
     DisclosurePlan::Level(DisclosureLevel::Standard)
 }
 
-fn record_usage(ctx: &AppContext, skill_id: &str, plan: &DisclosurePlan) {
+fn resolve_contract(ctx: &AppContext, args: &LoadArgs) -> Result<Option<PackContract>> {
+    if let Some(contract) = args.contract {
+        return Ok(Some(contract.preset().contract()));
+    }
+    if let Some(ref id) = args.contract_id {
+        let path = custom_contracts_path(&ctx.ms_root);
+        let Some(contract) = find_custom_contract(&path, id)? else {
+            return Err(MsError::SkillNotFound(format!(
+                "contract not found: {}",
+                id
+            )));
+        };
+        return Ok(Some(contract));
+    }
+    Ok(None)
+}
+
+#[derive(Deserialize)]
+struct ExperimentVariantRef {
+    id: String,
+}
+
+fn validate_experiment_usage(
+    ctx: &AppContext,
+    skill_id: &str,
+    experiment_id: Option<&str>,
+    variant_id: Option<&str>,
+) -> Result<(Option<String>, Option<String>)> {
+    match (experiment_id, variant_id) {
+        (None, None) => return Ok((None, None)),
+        (Some(_), None) => {
+            return Err(MsError::ValidationFailed(
+                "--variant-id is required when --experiment-id is set".to_string(),
+            ))
+        }
+        (None, Some(_)) => {
+            return Err(MsError::ValidationFailed(
+                "--experiment-id is required when --variant-id is set".to_string(),
+            ))
+        }
+        (Some(experiment_id), Some(variant_id)) => {
+            if experiment_id.trim().is_empty() {
+                return Err(MsError::ValidationFailed(
+                    "experiment id cannot be empty".to_string(),
+                ));
+            }
+            if variant_id.trim().is_empty() {
+                return Err(MsError::ValidationFailed(
+                    "variant id cannot be empty".to_string(),
+                ));
+            }
+        }
+    }
+
+    let experiment_id = experiment_id.expect("checked above");
+    let variant_id = variant_id.expect("checked above");
+
+    let record = ctx
+        .db
+        .get_skill_experiment(experiment_id)?
+        .ok_or_else(|| MsError::NotFound(format!("experiment not found: {experiment_id}")))?;
+
+    if record.skill_id != skill_id {
+        return Err(MsError::ValidationFailed(format!(
+            "experiment {} belongs to skill {}, not {}",
+            experiment_id, record.skill_id, skill_id
+        )));
+    }
+
+    let variants: Vec<ExperimentVariantRef> =
+        serde_json::from_str(&record.variants_json).map_err(|err| {
+            MsError::Serialization(format!("experiment variants parse: {err}"))
+        })?;
+
+    if !variants.iter().any(|variant| variant.id == variant_id) {
+        return Err(MsError::ValidationFailed(format!(
+            "unknown variant id for experiment {}: {}",
+            experiment_id, variant_id
+        )));
+    }
+
+    Ok((Some(experiment_id.to_string()), Some(variant_id.to_string())))
+}
+
+fn record_usage(
+    ctx: &AppContext,
+    skill_id: &str,
+    plan: &DisclosurePlan,
+    experiment_id: Option<&str>,
+    variant_id: Option<&str>,
+) {
     let disclosure_level = match plan {
         DisclosurePlan::Level(level) => level.level_num(),
         DisclosurePlan::Pack(_) => DisclosureLevel::Standard.level_num(),
@@ -219,8 +386,8 @@ fn record_usage(ctx: &AppContext, skill_id: &str, plan: &DisclosurePlan) {
         project_path.as_deref(),
         disclosure_level,
         None,
-        None,
-        None,
+        experiment_id,
+        variant_id,
     ) {
         if ctx.verbosity > 0 {
             eprintln!("warning: failed to record skill usage: {err}");
@@ -278,15 +445,7 @@ fn load_dependencies(
     // Parse requires from metadata
     let meta: serde_json::Value = serde_json::from_str(&skill.metadata_json).unwrap_or_default();
 
-    let requires: Vec<String> = meta
-        .get("requires")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
+    let requires = meta_list(&meta, "requires");
 
     if requires.is_empty() {
         return Ok(vec![]);
@@ -296,48 +455,44 @@ fn load_dependencies(
     let mut graph = DependencyGraph::new();
 
     // Add root skill
-    let provides: Vec<String> = meta
-        .get("provides")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
+    let provides = meta_list(&meta, "provides");
 
     graph.add_skill(skill.id.clone(), requires.clone(), provides);
 
-    // Try to resolve each required capability
+    let (skill_index, provider_index, meta_cache) = build_dependency_indexes(ctx)?;
+
+    // Resolve required capabilities using provides mappings (transitive).
     let mut loaded_deps = Vec::new();
+    let mut loaded_set = HashSet::new();
+    let mut seen_caps = HashSet::new();
+    let mut queue: VecDeque<String> = requires.into_iter().collect();
 
-    for cap in &requires {
-        // Try to find a skill that provides this capability
-        // For now, try direct ID match (capability might be skill ID)
-        if let Some(dep_skill) = ctx.db.get_skill(cap).ok().flatten() {
-            let dep_meta: serde_json::Value =
-                serde_json::from_str(&dep_skill.metadata_json).unwrap_or_default();
-            let dep_provides: Vec<String> = dep_meta
-                .get("provides")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect()
-                })
-                .unwrap_or_else(|| vec![cap.clone()]);
-            let dep_requires: Vec<String> = dep_meta
-                .get("requires")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect()
-                })
-                .unwrap_or_default();
+    while let Some(cap) = queue.pop_front() {
+        if !seen_caps.insert(cap.clone()) {
+            continue;
+        }
 
-            graph.add_skill(dep_skill.id.clone(), dep_requires, dep_provides);
-            loaded_deps.push(dep_skill.id.clone());
+        // Direct skill-id match (capability equals skill id).
+        if let Some(dep_skill) = skill_index.get(&cap) {
+            if add_dependency_node(&mut graph, dep_skill, &meta_cache, &cap, &mut queue) {
+                if loaded_set.insert(dep_skill.id.clone()) {
+                    loaded_deps.push(dep_skill.id.clone());
+                }
+            }
+            continue;
+        }
+
+        // Otherwise, resolve providers by capability.
+        if let Some(provider_ids) = provider_index.get(&cap) {
+            for provider_id in provider_ids {
+                if let Some(dep_skill) = skill_index.get(provider_id) {
+                    if add_dependency_node(&mut graph, dep_skill, &meta_cache, &cap, &mut queue) {
+                        if loaded_set.insert(dep_skill.id.clone()) {
+                            loaded_deps.push(dep_skill.id.clone());
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -353,6 +508,27 @@ fn load_dependencies(
     let resolver = DependencyResolver::new(&graph);
     let plan = resolver.resolve(&skill.id, dep_disclosure, args.deps.into())?;
 
+    if ctx.verbosity > 0 {
+        if !plan.missing.is_empty() {
+            let missing = plan
+                .missing
+                .iter()
+                .map(|m| format!("{} (required by {})", m.capability, m.required_by))
+                .collect::<Vec<_>>()
+                .join(", ");
+            eprintln!("warning: missing dependency capabilities: {missing}");
+        }
+        if !plan.cycles.is_empty() {
+            let cycles = plan
+                .cycles
+                .iter()
+                .map(|cycle| cycle.join(" -> "))
+                .collect::<Vec<_>>()
+                .join("; ");
+            eprintln!("warning: dependency cycles detected: {cycles}");
+        }
+    }
+
     // Return just the dependency IDs (not the root)
     Ok(plan
         .ordered
@@ -362,7 +538,107 @@ fn load_dependencies(
         .collect())
 }
 
-fn output_human(_ctx: &AppContext, result: &LoadResult, _args: &LoadArgs) -> Result<()> {
+fn meta_list(meta: &serde_json::Value, key: &str) -> Vec<String> {
+    meta.get(key)
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[derive(Clone)]
+struct CachedMeta {
+    requires: Vec<String>,
+    provides: Vec<String>,
+}
+
+fn build_dependency_indexes(
+    ctx: &AppContext,
+) -> Result<(
+    HashMap<String, SkillRecord>,
+    HashMap<String, Vec<String>>,
+    HashMap<String, CachedMeta>,
+)> {
+    let mut all_skills = Vec::new();
+    let mut offset = 0usize;
+    let limit = 200usize;
+    loop {
+        let batch = ctx.db.list_skills(limit, offset)?;
+        if batch.is_empty() {
+            break;
+        }
+        offset += batch.len();
+        all_skills.extend(batch);
+    }
+
+    let mut skill_index = HashMap::new();
+    let mut provider_index: HashMap<String, Vec<String>> = HashMap::new();
+    let mut meta_cache = HashMap::new();
+
+    for skill in all_skills {
+        let meta_json: serde_json::Value =
+            serde_json::from_str(&skill.metadata_json).unwrap_or_default();
+        let provides = meta_list(&meta_json, "provides");
+        let requires = meta_list(&meta_json, "requires");
+
+        for cap in &provides {
+            provider_index
+                .entry(cap.clone())
+                .or_default()
+                .push(skill.id.clone());
+        }
+        meta_cache.insert(
+            skill.id.clone(),
+            CachedMeta {
+                requires,
+                provides,
+            },
+        );
+        skill_index.insert(skill.id.clone(), skill);
+    }
+
+    Ok((skill_index, provider_index, meta_cache))
+}
+
+fn add_dependency_node(
+    graph: &mut DependencyGraph,
+    skill: &SkillRecord,
+    meta_cache: &HashMap<String, CachedMeta>,
+    fallback_capability: &str,
+    queue: &mut VecDeque<String>,
+) -> bool {
+    if graph.get_node(&skill.id).is_some() {
+        return false;
+    }
+
+    let meta = meta_cache.get(&skill.id);
+    let mut provides = meta
+        .map(|m| m.provides.clone())
+        .unwrap_or_default();
+    if provides.is_empty() {
+        provides.push(fallback_capability.to_string());
+    }
+
+    let requires = meta
+        .map(|m| m.requires.clone())
+        .unwrap_or_default();
+
+    for required in &requires {
+        queue.push_back(required.clone());
+    }
+
+    graph.add_skill(skill.id.clone(), requires, provides);
+    true
+}
+
+pub(crate) fn output_human(
+    _ctx: &AppContext,
+    result: &LoadResult,
+    _args: &LoadArgs,
+) -> Result<()> {
     let disclosed = &result.disclosed;
 
     // Header with skill name
@@ -420,10 +696,27 @@ fn output_human(_ctx: &AppContext, result: &LoadResult, _args: &LoadArgs) -> Res
     Ok(())
 }
 
-fn output_robot(_ctx: &AppContext, result: &LoadResult, _args: &LoadArgs) -> Result<()> {
+fn output_robot(_ctx: &AppContext, result: &LoadResult, args: &LoadArgs) -> Result<()> {
+    let output = build_robot_payload(result, args);
+    println!("{}", serde_json::to_string_pretty(&output)?);
+    Ok(())
+}
+
+pub(crate) fn build_robot_payload(result: &LoadResult, args: &LoadArgs) -> serde_json::Value {
     let disclosed = &result.disclosed;
 
-    let output = serde_json::json!({
+    let pack_info = if let Some(tokens) = args.pack {
+        serde_json::json!({
+            "budget": tokens,
+            "mode": format!("{:?}", args.mode),
+            "contract": args.contract.map(|c| format!("{:?}", c)),
+            "contract_id": args.contract_id.clone(),
+        })
+    } else {
+        serde_json::Value::Null
+    };
+
+    serde_json::json!({
         "status": "ok",
         "timestamp": chrono::Utc::now().to_rfc3339(),
         "version": env!("CARGO_PKG_VERSION"),
@@ -432,6 +725,7 @@ fn output_robot(_ctx: &AppContext, result: &LoadResult, _args: &LoadArgs) -> Res
             "name": result.name,
             "disclosure_level": disclosed.level.name(),
             "token_count": disclosed.token_estimate,
+            "pack": pack_info,
             "content": disclosed.body,
             "frontmatter": {
                 "id": disclosed.frontmatter.id,
@@ -457,11 +751,7 @@ fn output_robot(_ctx: &AppContext, result: &LoadResult, _args: &LoadArgs) -> Res
             }).collect::<Vec<_>>(),
         },
         "warnings": []
-    });
-
-    println!("{}", serde_json::to_string_pretty(&output)?);
-
-    Ok(())
+    })
 }
 
 #[cfg(test)]
@@ -475,13 +765,17 @@ mod tests {
             level: None,
             pack: None,
             mode: CliPackMode::Balanced,
+            contract: None,
+            contract_id: None,
             max_per_group: 2,
             full: false,
             complete: false,
             deps: DepsMode::Auto,
+            experiment_id: None,
+            variant_id: None,
         };
 
-        match determine_disclosure_plan(&args) {
+        match determine_disclosure_plan(&args, None) {
             DisclosurePlan::Level(level) => {
                 assert_eq!(level, DisclosureLevel::Standard);
             }
@@ -496,13 +790,17 @@ mod tests {
             level: None,
             pack: None,
             mode: CliPackMode::Balanced,
+            contract: None,
+            contract_id: None,
             max_per_group: 2,
             full: true,
             complete: false,
             deps: DepsMode::Auto,
+            experiment_id: None,
+            variant_id: None,
         };
 
-        match determine_disclosure_plan(&args) {
+        match determine_disclosure_plan(&args, None) {
             DisclosurePlan::Level(level) => {
                 assert_eq!(level, DisclosureLevel::Full);
             }
@@ -517,13 +815,17 @@ mod tests {
             level: None,
             pack: None,
             mode: CliPackMode::Balanced,
+            contract: None,
+            contract_id: None,
             max_per_group: 2,
             full: false,
             complete: true,
             deps: DepsMode::Auto,
+            experiment_id: None,
+            variant_id: None,
         };
 
-        match determine_disclosure_plan(&args) {
+        match determine_disclosure_plan(&args, None) {
             DisclosurePlan::Level(level) => {
                 assert_eq!(level, DisclosureLevel::Complete);
             }
@@ -538,17 +840,26 @@ mod tests {
             level: None,
             pack: Some(800),
             mode: CliPackMode::UtilityFirst,
+            contract: Some(CliPackContract::Debug),
+            contract_id: None,
             max_per_group: 3,
             full: true, // Should be ignored when pack is set
             complete: false,
             deps: DepsMode::Auto,
+            experiment_id: None,
+            variant_id: None,
         };
 
-        match determine_disclosure_plan(&args) {
+        let contract = args.contract.map(|c| c.preset().contract());
+        match determine_disclosure_plan(&args, contract) {
             DisclosurePlan::Pack(budget) => {
                 assert_eq!(budget.tokens, 800);
                 assert_eq!(budget.mode, PackMode::UtilityFirst);
                 assert_eq!(budget.max_per_group, 3);
+                assert_eq!(
+                    budget.contract.as_ref().map(|c| c.id.as_str()),
+                    Some("debug")
+                );
             }
             _ => panic!("Expected Pack plan"),
         }
@@ -561,13 +872,17 @@ mod tests {
             level: Some("overview".to_string()),
             pack: None,
             mode: CliPackMode::Balanced,
+            contract: None,
+            contract_id: None,
             max_per_group: 2,
             full: false,
             complete: false,
             deps: DepsMode::Auto,
+            experiment_id: None,
+            variant_id: None,
         };
 
-        match determine_disclosure_plan(&args) {
+        match determine_disclosure_plan(&args, None) {
             DisclosurePlan::Level(level) => {
                 assert_eq!(level, DisclosureLevel::Overview);
             }
@@ -582,13 +897,17 @@ mod tests {
             level: Some("1".to_string()),
             pack: None,
             mode: CliPackMode::Balanced,
+            contract: None,
+            contract_id: None,
             max_per_group: 2,
             full: false,
             complete: false,
             deps: DepsMode::Auto,
+            experiment_id: None,
+            variant_id: None,
         };
 
-        match determine_disclosure_plan(&args) {
+        match determine_disclosure_plan(&args, None) {
             DisclosurePlan::Level(level) => {
                 assert_eq!(level, DisclosureLevel::Overview);
             }
@@ -650,6 +969,8 @@ mod tests {
         assert!(cli.args.pack.is_none());
         assert!(!cli.args.full);
         assert!(!cli.args.complete);
+        assert!(cli.args.experiment_id.is_none());
+        assert!(cli.args.variant_id.is_none());
     }
 
     #[test]
@@ -833,6 +1154,8 @@ mod tests {
             "750",
             "--mode",
             "coverage-first",
+            "--contract",
+            "debug",
             "--max-per-group",
             "3",
             "--deps",
@@ -842,6 +1165,7 @@ mod tests {
         assert_eq!(cli.args.skill, "my-skill");
         assert_eq!(cli.args.pack, Some(750));
         assert!(matches!(cli.args.mode, CliPackMode::CoverageFirst));
+        assert!(matches!(cli.args.contract, Some(CliPackContract::Debug)));
         assert_eq!(cli.args.max_per_group, 3);
         assert!(matches!(cli.args.deps, DepsMode::Off));
     }
@@ -855,14 +1179,18 @@ mod tests {
             level: Some("invalid".to_string()),
             pack: None,
             mode: CliPackMode::Balanced,
+            contract: None,
+            contract_id: None,
             max_per_group: 2,
             full: false,
             complete: false,
             deps: DepsMode::Auto,
+            experiment_id: None,
+            variant_id: None,
         };
 
         // Invalid level should fall through to Standard
-        match determine_disclosure_plan(&args) {
+        match determine_disclosure_plan(&args, None) {
             DisclosurePlan::Level(level) => {
                 assert_eq!(level, DisclosureLevel::Standard);
             }
@@ -877,13 +1205,17 @@ mod tests {
             level: Some("minimal".to_string()),
             pack: None,
             mode: CliPackMode::Balanced,
+            contract: None,
+            contract_id: None,
             max_per_group: 2,
             full: false,
             complete: true, // Should override level
             deps: DepsMode::Auto,
+            experiment_id: None,
+            variant_id: None,
         };
 
-        match determine_disclosure_plan(&args) {
+        match determine_disclosure_plan(&args, None) {
             DisclosurePlan::Level(level) => {
                 assert_eq!(level, DisclosureLevel::Complete);
             }
@@ -898,13 +1230,17 @@ mod tests {
             level: Some("full".to_string()),
             pack: Some(100),
             mode: CliPackMode::Balanced,
+            contract: None,
+            contract_id: None,
             max_per_group: 2,
             full: true,
             complete: true, // Pack should override all flags
             deps: DepsMode::Auto,
+            experiment_id: None,
+            variant_id: None,
         };
 
-        match determine_disclosure_plan(&args) {
+        match determine_disclosure_plan(&args, None) {
             DisclosurePlan::Pack(budget) => {
                 assert_eq!(budget.tokens, 100);
             }
@@ -919,13 +1255,17 @@ mod tests {
             level: Some("0".to_string()),
             pack: None,
             mode: CliPackMode::Balanced,
+            contract: None,
+            contract_id: None,
             max_per_group: 2,
             full: false,
             complete: false,
             deps: DepsMode::Auto,
+            experiment_id: None,
+            variant_id: None,
         };
 
-        match determine_disclosure_plan(&args) {
+        match determine_disclosure_plan(&args, None) {
             DisclosurePlan::Level(level) => {
                 assert_eq!(level, DisclosureLevel::Minimal);
             }
@@ -940,13 +1280,17 @@ mod tests {
             level: Some("4".to_string()),
             pack: None,
             mode: CliPackMode::Balanced,
+            contract: None,
+            contract_id: None,
             max_per_group: 2,
             full: false,
             complete: false,
             deps: DepsMode::Auto,
+            experiment_id: None,
+            variant_id: None,
         };
 
-        match determine_disclosure_plan(&args) {
+        match determine_disclosure_plan(&args, None) {
             DisclosurePlan::Level(level) => {
                 assert_eq!(level, DisclosureLevel::Complete);
             }

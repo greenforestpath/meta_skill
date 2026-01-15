@@ -119,6 +119,7 @@ impl ConstrainedPacker {
         let excluded_groups = normalize_groups(&constraints.excluded_groups);
         let required_coverage = merge_required_coverage(constraints);
         let max_per_group = contract_max_per_group(constraints);
+        let contract = constraints.contract.as_ref();
         let mut selected: Vec<SkillSlice> = Vec::new();
         let mut selected_ids: HashSet<String> = HashSet::new();
 
@@ -137,8 +138,8 @@ impl ConstrainedPacker {
                 });
             }
             mandatory.sort_by(|a, b| {
-                score_slice(b, mode)
-                    .partial_cmp(&score_slice(a, mode))
+                score_slice_with_contract(b, mode, contract)
+                    .partial_cmp(&score_slice_with_contract(a, mode, contract))
                     .unwrap_or(Ordering::Equal)
             });
         }
@@ -187,6 +188,7 @@ impl ConstrainedPacker {
                 &group_counts,
                 &constraints.recent_slice_ids,
                 mode,
+                contract,
             );
             for slice in ranked {
                 if count >= quota.min_count {
@@ -219,6 +221,7 @@ impl ConstrainedPacker {
             &group_counts,
             &constraints.recent_slice_ids,
             mode,
+            contract,
         );
         for slice in ranked {
             if slice.token_estimate > remaining {
@@ -394,12 +397,13 @@ fn rank_by_density<'a>(
     group_counts: &HashMap<String, usize>,
     recent_slice_ids: &[String],
     mode: PackMode,
+    contract: Option<&PackContract>,
 ) -> Vec<&'a SkillSlice> {
     let recent: HashSet<&str> = recent_slice_ids.iter().map(|s| s.as_str()).collect();
     let mut scored: Vec<(f32, &'a SkillSlice)> = slices
         .iter()
         .map(|slice| {
-            let base = score_slice(slice, mode);
+            let base = score_slice_with_contract(slice, mode, contract);
             let density = base / slice.token_estimate.max(1) as f32;
             let group_penalty = slice
                 .coverage_group
@@ -439,6 +443,45 @@ fn score_slice(slice: &SkillSlice, mode: PackMode) -> f32 {
             _ => slice.utility_score,
         },
     }
+}
+
+fn score_slice_with_contract(
+    slice: &SkillSlice,
+    mode: PackMode,
+    contract: Option<&PackContract>,
+) -> f32 {
+    let base = score_slice(slice, mode);
+    base * contract_weight(slice, contract)
+}
+
+fn contract_weight(slice: &SkillSlice, contract: Option<&PackContract>) -> f32 {
+    let Some(contract) = contract else {
+        return 1.0;
+    };
+    let mut weight = 1.0;
+
+    if let Some(group_weights) = &contract.group_weights {
+        if let Some(group) = &slice.coverage_group {
+            let key = group.to_lowercase();
+            if let Some(value) = group_weights.get(&key) {
+                weight *= *value;
+            }
+        }
+    }
+
+    if let Some(tag_weights) = &contract.tag_weights {
+        let mut best = 1.0;
+        for tag in &slice.tags {
+            if let Some(value) = tag_weights.get(&tag.to_lowercase()) {
+                if *value > best {
+                    best = *value;
+                }
+            }
+        }
+        weight *= best;
+    }
+
+    weight.max(0.0)
 }
 
 fn check_coverage(slices: &[SkillSlice], quotas: &[CoverageQuota]) -> bool {
@@ -482,6 +525,7 @@ fn try_improve(
         &group_counts,
         &constraints.recent_slice_ids,
         mode,
+        constraints.contract.as_ref(),
     );
     let candidate = ranked.remove(0);
 
@@ -489,7 +533,7 @@ fn try_improve(
         .iter()
         .enumerate()
         .filter(|(_, slice)| !mandatory_ids.contains(&slice.id))
-        .map(|(idx, slice)| (score_slice(slice, mode), idx))
+        .map(|(idx, slice)| (score_slice_with_contract(slice, mode, constraints.contract.as_ref()), idx))
         .collect();
     if removable.is_empty() {
         return false;
@@ -571,6 +615,7 @@ mod tests {
             tags: vec![],
             requires: vec![],
             condition: None,
+            section_title: None,
             content: format!("slice {id}"),
         }
     }
@@ -609,6 +654,82 @@ mod tests {
             .pack(&slices, &constraints, PackMode::Balanced)
             .unwrap();
         assert!(result.slices.iter().any(|s| s.id == "command-1"));
+    }
+
+    #[test]
+    fn test_contract_required_groups_enforced() {
+        let slices = vec![
+            make_slice("rule-1", SliceType::Rule, 20, 0.8, "rules"),
+            make_slice("command-1", SliceType::Command, 20, 0.6, "commands"),
+        ];
+        let mut constraints = PackConstraints::new(40, 2);
+        constraints.contract = Some(PackContract {
+            id: "debug".to_string(),
+            description: "debug".to_string(),
+            required_groups: vec!["commands".to_string()],
+            mandatory_slices: Vec::new(),
+            max_per_group: None,
+            group_weights: None,
+            tag_weights: None,
+        });
+        let packer = ConstrainedPacker;
+        let result = packer
+            .pack(&slices, &constraints, PackMode::Balanced)
+            .unwrap();
+        assert!(result.slices.iter().any(|s| s.id == "command-1"));
+    }
+
+    #[test]
+    fn test_contract_weights_influence_selection() {
+        let slices = vec![
+            make_slice("rule-1", SliceType::Rule, 10, 0.5, "rules"),
+            make_slice("pitfall-1", SliceType::Pitfall, 10, 0.5, "pitfalls"),
+        ];
+        let mut weights = std::collections::HashMap::new();
+        weights.insert("pitfalls".to_string(), 2.0);
+        let mut constraints = PackConstraints::new(10, 2);
+        constraints.contract = Some(PackContract {
+            id: "debug".to_string(),
+            description: "debug".to_string(),
+            required_groups: Vec::new(),
+            mandatory_slices: Vec::new(),
+            max_per_group: None,
+            group_weights: Some(weights),
+            tag_weights: None,
+        });
+        let packer = ConstrainedPacker;
+        let result = packer
+            .pack(&slices, &constraints, PackMode::Balanced)
+            .unwrap();
+        assert!(result.slices.iter().any(|s| s.id == "pitfall-1"));
+        assert!(!result.slices.iter().any(|s| s.id == "rule-1"));
+    }
+
+    #[test]
+    fn test_contract_tag_weights_influence_selection() {
+        let mut favored = make_slice("rule-1", SliceType::Rule, 10, 0.5, "rules");
+        favored.tags.push("preferred".to_string());
+        let other = make_slice("rule-2", SliceType::Rule, 10, 0.5, "rules");
+        let slices = vec![favored, other];
+
+        let mut tag_weights = std::collections::HashMap::new();
+        tag_weights.insert("preferred".to_string(), 2.0);
+        let mut constraints = PackConstraints::new(10, 2);
+        constraints.contract = Some(PackContract {
+            id: "tag".to_string(),
+            description: "tag".to_string(),
+            required_groups: Vec::new(),
+            mandatory_slices: Vec::new(),
+            max_per_group: None,
+            group_weights: None,
+            tag_weights: Some(tag_weights),
+        });
+        let packer = ConstrainedPacker;
+        let result = packer
+            .pack(&slices, &constraints, PackMode::Balanced)
+            .unwrap();
+        assert_eq!(result.slices.len(), 1);
+        assert_eq!(result.slices[0].id, "rule-1");
     }
 
     #[test]

@@ -110,7 +110,7 @@ impl Default for DisclosurePlan {
 }
 
 /// Token budget for packing mode
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct TokenBudget {
     /// Maximum tokens to emit
     pub tokens: usize,
@@ -118,6 +118,8 @@ pub struct TokenBudget {
     pub mode: PackMode,
     /// Max slices per coverage group
     pub max_per_group: usize,
+    /// Optional pack contract
+    pub contract: Option<crate::core::skill::PackContract>,
 }
 
 impl TokenBudget {
@@ -127,6 +129,7 @@ impl TokenBudget {
             tokens,
             mode: PackMode::Balanced,
             max_per_group: 2,
+            contract: None,
         }
     }
 
@@ -136,6 +139,7 @@ impl TokenBudget {
             tokens,
             mode,
             max_per_group: 2,
+            contract: None,
         }
     }
 }
@@ -395,6 +399,7 @@ fn disclose_packed(
 
     let slice_index = SkillSlicer::slice(spec);
     let mut constraints = PackConstraints::new(slice_budget, budget.max_per_group);
+    constraints.contract = budget.contract.clone();
     constraints
         .mandatory_slices
         .push(MandatorySlice::ByPredicate(MandatoryPredicate::Always));
@@ -421,14 +426,7 @@ fn disclose_packed(
     let body = if packed.slices.is_empty() {
         None
     } else {
-        Some(
-            packed
-                .slices
-                .iter()
-                .map(|slice| slice.content.trim_end())
-                .collect::<Vec<_>>()
-                .join("\n\n"),
-        )
+        Some(render_packed_body(&packed.slices))
     };
 
     // Determine effective level based on content included
@@ -452,6 +450,35 @@ fn disclose_packed(
     }
 }
 
+fn render_packed_body(slices: &[crate::core::skill::SkillSlice]) -> String {
+    let mut out = String::new();
+    let mut last_section = None;
+
+    for slice in slices {
+        if let Some(title) = &slice.section_title {
+            if last_section.as_ref() != Some(title) {
+                if !out.is_empty() {
+                    out.push_str("\n\n");
+                }
+                out.push_str("## ");
+                out.push_str(title);
+                out.push_str("\n\n");
+                last_section = Some(title.clone());
+            } else {
+                // Same section, just add spacer
+                out.push_str("\n\n");
+            }
+        } else {
+            // No section title (e.g. Overview maybe?), just spacer
+            if !out.is_empty() {
+                out.push_str("\n\n");
+            }
+        }
+        out.push_str(slice.content.trim_end());
+    }
+    out
+}
+
 /// Determine optimal disclosure level based on context
 pub fn optimal_disclosure(context: &DisclosureContext) -> DisclosurePlan {
     // If explicitly requested, use that level
@@ -465,6 +492,7 @@ pub fn optimal_disclosure(context: &DisclosureContext) -> DisclosurePlan {
             tokens,
             mode: context.pack_mode.unwrap_or(PackMode::Balanced),
             max_per_group: context.max_per_group.unwrap_or(2),
+            contract: None,
         });
     }
 

@@ -1,5 +1,7 @@
 //! Skill data structure
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 fn default_format_version() -> String {
@@ -335,6 +337,9 @@ pub struct SkillSlice {
     /// Conditional inclusion predicate
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub condition: Option<SlicePredicate>,
+    /// Section title for context
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub section_title: Option<String>,
     /// Markdown content
     pub content: String,
 }
@@ -489,7 +494,14 @@ pub struct PackContract {
     /// Optional max slices per coverage group
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_per_group: Option<usize>,
+    /// Optional weighting by coverage group (lowercase keys)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_weights: Option<HashMap<String, f32>>,
+    /// Optional weighting by tag (lowercase keys)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag_weights: Option<HashMap<String, f32>>,
 }
+
 
 // =============================================================================
 // SPEC LENS (MARKDOWN MAPPING)

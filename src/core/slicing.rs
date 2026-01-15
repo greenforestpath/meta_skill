@@ -49,16 +49,25 @@ fn slice_section(
     slices: &mut Vec<SkillSlice>,
     counters: &mut HashMap<&'static str, usize>,
 ) {
-    let mut first = true;
     for block in &section.blocks {
         if block.content.trim().is_empty() {
             continue;
         }
 
         let slice_type = classify_block(block);
-        let content = slice_content(section, block, first);
+        // Content is just the block content, cleaned.
+        // We do NOT prepend the header here; the renderer (disclosure) handles that.
+        let content = block.content.trim_end().to_string();
         let id = slice_id(block, slice_type, counters);
-        let token_estimate = estimate_tokens(&content);
+        
+        // Calculate token estimate conservatively: includes header cost.
+        let header_cost = if !section.title.trim().is_empty() {
+            estimate_tokens(&format!("## {}\n\n", section.title.trim()))
+        } else {
+            0
+        };
+        let token_estimate = estimate_tokens(&content) + header_cost;
+
         let utility_score = utility_score(slice_type);
         let coverage_group = coverage_group(slice_type);
         let mut tags = spec.metadata.tags.clone();
@@ -73,10 +82,9 @@ fn slice_section(
             tags,
             requires: Vec::new(),
             condition: None,
+            section_title: Some(section.title.clone()),
             content,
         });
-
-        first = false;
     }
 }
 
@@ -100,15 +108,6 @@ fn classify_block(block: &SkillBlock) -> SliceType {
 fn is_policy_block(block: &SkillBlock) -> bool {
     let id = block.id.to_lowercase();
     id.starts_with("policy") || id.starts_with("invariant")
-}
-
-fn slice_content(section: &SkillSection, block: &SkillBlock, include_heading: bool) -> String {
-    let body = block.content.trim_end().to_string();
-    if include_heading && !section.title.trim().is_empty() {
-        format!("## {}\n\n{}", section.title.trim(), body)
-    } else {
-        body
-    }
 }
 
 fn slice_id(
@@ -179,7 +178,7 @@ mod tests {
     use crate::core::skill::{SkillMetadata, SkillSection};
 
     #[test]
-    fn test_slice_attaches_section_title() {
+    fn test_slice_captures_section_title() {
         let spec = SkillSpec {
             format_version: SkillSpec::FORMAT_VERSION.to_string(),
             metadata: SkillMetadata {
@@ -201,7 +200,9 @@ mod tests {
 
         let index = SkillSlicer::slice(&spec);
         assert_eq!(index.slices.len(), 1);
-        assert!(index.slices[0].content.starts_with("## Intro"));
+        assert_eq!(index.slices[0].section_title, Some("Intro".to_string()));
+        // Content should NOT contain header anymore
+        assert_eq!(index.slices[0].content, "Always sanitize input.");
     }
 
     #[test]

@@ -4,6 +4,7 @@ pub mod dependencies;
 pub mod disclosure;
 pub mod layering;
 pub mod overlay;
+pub mod pack_contracts;
 pub mod packing;
 pub mod recovery;
 pub mod requirements;
@@ -26,6 +27,7 @@ pub use packing::{
     ConstrainedPacker, CoverageQuota, MandatoryPredicate, MandatorySlice, PackConstraints,
     PackError, PackResult,
 };
+pub use pack_contracts::{PackContractPreset, contract_from_name};
 pub use recovery::{
     Checkpoint, FailureMode, RecoveryIssue, RecoveryManager, RecoveryReport, RetryConfig,
     with_retry, with_retry_if,
