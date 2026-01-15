@@ -19,9 +19,11 @@ pub struct InstallReport {
 /// Options for bundle installation.
 pub struct InstallOptions<'a, V: SignatureVerifier = crate::bundler::manifest::NoopSignatureVerifier>
 {
-    /// Allow installing unsigned bundles. Default: false (signatures required).
+    /// Skip signature verification entirely. When true, both unsigned bundles
+    /// and signed bundles (without verifying signatures) are allowed.
+    /// Default: false (signatures required and verified).
     pub allow_unsigned: bool,
-    /// Signature verifier for signed bundles.
+    /// Signature verifier for signed bundles. Only used when allow_unsigned is false.
     pub verifier: Option<&'a V>,
 }
 
@@ -35,7 +37,8 @@ impl<'a, V: SignatureVerifier> Default for InstallOptions<'a, V> {
 }
 
 impl<'a, V: SignatureVerifier> InstallOptions<'a, V> {
-    /// Create options that allow unsigned bundles (for development/testing).
+    /// Create options that skip signature verification (for development/testing).
+    /// Both unsigned bundles and signed bundles will be accepted without verification.
     pub fn allow_unsigned() -> Self {
         Self {
             allow_unsigned: true,
@@ -54,8 +57,10 @@ impl<'a, V: SignatureVerifier> InstallOptions<'a, V> {
 
 /// Install a bundle into the git archive root with signature enforcement.
 ///
-/// By default, bundles must be signed. Use `InstallOptions::allow_unsigned()`
-/// for development/testing scenarios where unsigned bundles are acceptable.
+/// By default, bundles must be signed and signatures must be verified.
+/// Use `InstallOptions::allow_unsigned()` for development/testing scenarios
+/// where signature verification should be skipped (works for both signed
+/// and unsigned bundles).
 pub fn install_with_options<V: SignatureVerifier>(
     package: &BundlePackage,
     archive_root: &Path,
@@ -71,6 +76,10 @@ pub fn install_with_options<V: SignatureVerifier>(
                 "bundle is unsigned; use --no-verify to install unsigned bundles".to_string(),
             ));
         }
+        false
+    } else if options.allow_unsigned {
+        // allow_unsigned also skips signature verification for signed bundles
+        // (used when --no-verify flag is specified at CLI level)
         false
     } else {
         let verifier = options.verifier.ok_or_else(|| {
