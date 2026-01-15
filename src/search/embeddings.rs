@@ -192,9 +192,11 @@ fn accumulate_embedding(embedding: &mut [f32], token: &str, weight: f32) {
 
     for i in 0..embedding.len() {
         let dim_hash = fnv1a_hash_with_salt(token_hash, i as u64);
-        let sign = if dim_hash & 1 == 0 { weight } else { -weight };
-        let dim = ((dim_hash >> 1) as usize) % embedding.len();
-        embedding[dim] += sign;
+        // Use 16 bits to create a continuous value in [-weight, weight]
+        // This reduces the probability of exact cancellation from ~1/2^n to ~0
+        let bits = (dim_hash & 0xFFFF) as f32;
+        let normalized = (bits / 32767.5) - 1.0; // Maps [0, 65535] to [-1, 1]
+        embedding[i] += normalized * weight;
     }
 }
 
