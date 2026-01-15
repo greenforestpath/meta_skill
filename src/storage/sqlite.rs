@@ -205,6 +205,42 @@ impl Database {
         Ok(count.max(0) as u64)
     }
 
+    /// Record a skill usage entry (lightweight summary table).
+    pub fn record_skill_usage(
+        &self,
+        skill_id: &str,
+        project_path: Option<&str>,
+        disclosure_level: u8,
+        context_keywords: Option<&[String]>,
+        experiment_id: Option<&str>,
+        variant_id: Option<&str>,
+    ) -> Result<()> {
+        let used_at = chrono::Utc::now().to_rfc3339();
+        let keywords_json = if let Some(keys) = context_keywords {
+            Some(serde_json::to_string(keys).map_err(|err| {
+                MsError::Config(format!("encode context keywords: {err}"))
+            })?)
+        } else {
+            None
+        };
+
+        self.conn.execute(
+            "INSERT INTO skill_usage (
+                skill_id, project_path, used_at, disclosure_level, context_keywords, success_signal, experiment_id, variant_id
+             ) VALUES (?, ?, ?, ?, ?, NULL, ?, ?)",
+            params![
+                skill_id,
+                project_path,
+                used_at,
+                disclosure_level as i64,
+                keywords_json,
+                experiment_id,
+                variant_id
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Count evidence records for a skill.
     pub fn count_skill_evidence(&self, skill_id: &str) -> Result<u64> {
         let count: i64 = self.conn.query_row(
@@ -983,12 +1019,29 @@ impl Database {
     pub fn record_skill_outcome(&self, skill_id: &str, success: bool) -> Result<()> {
         let id = Uuid::new_v4().to_string();
         let created_at = chrono::Utc::now().to_rfc3339();
-        // We use skill_usage_events for outcomes for now
+        let success_signal = if success { 1 } else { 0 };
+        let updated = self.conn.execute(
+            "UPDATE skill_usage
+             SET success_signal = ?
+             WHERE id = (
+                 SELECT id FROM skill_usage
+                 WHERE skill_id = ?
+                 ORDER BY used_at DESC
+                 LIMIT 1
+             )",
+            params![success_signal, skill_id],
+        )?;
+
+        // Append a detailed event record for analysis even when we update summary usage.
         self.conn.execute(
             "INSERT INTO skill_usage_events (id, skill_id, session_id, loaded_at, disclosure_level, discovery_method, outcome, feedback)
              VALUES (?, ?, 'manual', ?, 'full', 'manual', ?, 'null')",
             params![id, skill_id, created_at, if success { "success" } else { "failure" }],
         )?;
+
+        if updated == 0 {
+            // No usage row existed; we still recorded an event above.
+        }
         Ok(())
     }
 

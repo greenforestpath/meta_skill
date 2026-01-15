@@ -146,6 +146,8 @@ pub fn run(ctx: &AppContext, args: &LoadArgs) -> Result<()> {
         },
     };
 
+    record_usage(ctx, &skill.id, &disclosure_plan);
+
     if ctx.robot_mode {
         output_robot(ctx, &result, args)
     } else {
@@ -201,6 +203,29 @@ fn determine_disclosure_plan(args: &LoadArgs) -> DisclosurePlan {
 
     // Default to Standard
     DisclosurePlan::Level(DisclosureLevel::Standard)
+}
+
+fn record_usage(ctx: &AppContext, skill_id: &str, plan: &DisclosurePlan) {
+    let disclosure_level = match plan {
+        DisclosurePlan::Level(level) => level.level_num(),
+        DisclosurePlan::Pack(_) => DisclosureLevel::Standard.level_num(),
+    };
+    let project_path = std::env::current_dir()
+        .ok()
+        .map(|path| path.to_string_lossy().to_string());
+
+    if let Err(err) = ctx.db.record_skill_usage(
+        skill_id,
+        project_path.as_deref(),
+        disclosure_level,
+        None,
+        None,
+        None,
+    ) {
+        if ctx.verbosity > 0 {
+            eprintln!("warning: failed to record skill usage: {err}");
+        }
+    }
 }
 
 fn merge_metadata(skill: &SkillRecord, parsed_meta: &SkillMetadata) -> SkillMetadata {
