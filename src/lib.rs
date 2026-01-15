@@ -19,6 +19,7 @@ pub mod suggestions;
 pub mod sync;
 pub mod test_utils;
 pub mod testing;
+pub mod templates;
 pub mod tui;
 pub mod updater;
 pub mod utils;
