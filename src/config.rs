@@ -125,6 +125,9 @@ impl Config {
         if let Some(patch) = patch.cm {
             self.cm.merge(patch);
         }
+        if let Some(patch) = patch.ru {
+            self.ru.merge(patch);
+        }
         if let Some(patch) = patch.cache {
             self.cache.merge(patch);
         }
@@ -837,6 +840,7 @@ struct ConfigPatch {
     pub search: Option<SearchPatch>,
     pub cass: Option<CassPatch>,
     pub cm: Option<CmPatch>,
+    pub ru: Option<RuPatch>,
     pub cache: Option<CachePatch>,
     pub update: Option<UpdatePatch>,
     pub robot: Option<RobotPatch>,
