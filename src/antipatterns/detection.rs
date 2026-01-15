@@ -505,13 +505,33 @@ fn detect_rollback_command(cmd: &str) -> Option<(RollbackType, Option<String>)> 
 
 /// Extract annotation from marked anti-pattern
 fn extract_annotation(content: &str, marker: &str) -> Option<String> {
-    // Try to find text after the marker
-    if let Some(pos) = content.to_lowercase().find(marker) {
-        let after = &content[pos + marker.len()..];
-        let annotation = after.trim().lines().next()?.trim().to_string();
-        if !annotation.is_empty() && annotation.len() < 200 {
-            return Some(annotation);
-        }
+    // Find marker position using case-insensitive search on the original string
+    // We iterate by char indices to ensure we get correct byte positions in the original
+    let content_lower = content.to_lowercase();
+    let marker_lower = marker.to_lowercase();
+
+    // Find the marker in the lowercased content
+    let lower_pos = content_lower.find(&marker_lower)?;
+
+    // Map the position from lowercase back to original by counting characters
+    // Both strings have the same number of characters, so we can use char count
+    let char_offset = content_lower[..lower_pos].chars().count();
+
+    // Verify we can find this character offset in the original (they should match)
+    let _original_start = content.char_indices().nth(char_offset).map(|(i, _)| i)?;
+
+    // Find the end position by counting marker characters
+    let marker_char_count = marker_lower.chars().count();
+    let end_pos = content
+        .char_indices()
+        .nth(char_offset + marker_char_count)
+        .map(|(i, _)| i)
+        .unwrap_or(content.len());
+
+    let after = &content[end_pos..];
+    let annotation = after.trim().lines().next()?.trim().to_string();
+    if !annotation.is_empty() && annotation.len() < 200 {
+        return Some(annotation);
     }
     None
 }
@@ -792,5 +812,41 @@ mod tests {
         assert!(compute_correction_confidence("that's wrong") > 0.7);
         assert!(compute_correction_confidence("no, do this instead") > 0.6);
         assert!(compute_correction_confidence("maybe try something else") < 0.6);
+    }
+
+    #[test]
+    fn test_extract_annotation_ascii() {
+        // Simple ASCII case
+        let result = extract_annotation("This is an anti-pattern example", "anti-pattern");
+        assert_eq!(result, Some("example".to_string()));
+    }
+
+    #[test]
+    fn test_extract_annotation_case_insensitive() {
+        // Case insensitive matching
+        let result = extract_annotation("This is an ANTI-PATTERN example", "anti-pattern");
+        assert_eq!(result, Some("example".to_string()));
+    }
+
+    #[test]
+    fn test_extract_annotation_unicode_before_marker() {
+        // Non-ASCII characters before the marker (emoji, CJK, etc.)
+        let result = extract_annotation("日本語テスト anti-pattern example here", "anti-pattern");
+        assert_eq!(result, Some("example here".to_string()));
+
+        // Emoji before marker
+        let result = extract_annotation("🦀🦀 This is anti-pattern test", "anti-pattern");
+        assert_eq!(result, Some("test".to_string()));
+    }
+
+    #[test]
+    fn test_extract_annotation_empty() {
+        // No annotation after marker
+        let result = extract_annotation("This is an anti-pattern", "anti-pattern");
+        assert_eq!(result, None);
+
+        // Only whitespace after marker
+        let result = extract_annotation("This is an anti-pattern   ", "anti-pattern");
+        assert_eq!(result, None);
     }
 }
