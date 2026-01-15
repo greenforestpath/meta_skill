@@ -274,7 +274,7 @@ impl TestFixture {
         std::fs::create_dir_all(&skill_dir).expect("Failed to create skill dir");
 
         let skill_file = skill_dir.join("SKILL.md");
-        std::fs::write(&skill_file, &skill.content).expect("Failed to write skill");
+        std::fs::write(&skill_file, skill.to_markdown()).expect("Failed to write skill");
 
         println!(
             "[FIXTURE] Added skill: {} ({} bytes)",
@@ -597,6 +597,8 @@ impl Drop for TestFixture {
 pub struct TestSkill {
     pub name: String,
     pub content: String,
+    pub tags: Vec<String>,
+    pub layer: Option<String>,
 }
 
 impl TestSkill {
@@ -609,6 +611,8 @@ impl TestSkill {
         Self {
             name: name.to_string(),
             content,
+            tags: Vec::new(),
+            layer: None,
         }
     }
 
@@ -616,7 +620,45 @@ impl TestSkill {
         Self {
             name: name.to_string(),
             content: content.to_string(),
+            tags: Vec::new(),
+            layer: None,
         }
+    }
+
+    pub fn with_tags(mut self, tags: Vec<&str>) -> Self {
+        self.tags = tags.into_iter().map(String::from).collect();
+        self
+    }
+
+    pub fn with_layer(mut self, layer: &str) -> Self {
+        self.layer = Some(layer.to_string());
+        self
+    }
+
+    pub fn to_markdown(&self) -> String {
+        let mut md = String::new();
+        
+        // Add frontmatter if we have metadata
+        if !self.tags.is_empty() || self.layer.is_some() {
+            md.push_str("---\n");
+            md.push_str(&format!("name: {}\n", self.name));
+            if !self.tags.is_empty() {
+                md.push_str(&format!("tags: [{}]\n", self.tags.join(", ")));
+            }
+            // Note: layer is usually determined by directory structure in ms, 
+            // but for tests we might want to simulate it or put it in frontmatter 
+            // if ms supports overriding it via frontmatter (which it generally doesn't for security/structure reasons, 
+            // but let's check. Actually ms determines layer by path).
+            // 
+            // However, we can still put it in metadata for 'ms list' to pick up if it parses it?
+            // Re-reading list.rs: it filters by s.source_layer.
+            // s.source_layer comes from where the file was found.
+            // So to test layer filtering, we need to place the file in the correct directory structure.
+            md.push_str("---\n\n");
+        }
+        
+        md.push_str(&self.content);
+        md
     }
 }
 

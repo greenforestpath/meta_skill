@@ -37,12 +37,24 @@ pub fn parse_markdown(content: &str) -> Result<SkillSpec> {
     let mut name = String::new();
     let mut description_lines = Vec::new();
     let mut sections: Vec<SkillSection> = Vec::new();
+    let mut metadata = SkillMetadata::default();
 
     let mut current_section: Option<SkillSection> = None;
     let mut in_description = false;
     let mut in_code_block = false;
     let mut code_lines: Vec<String> = Vec::new();
     let mut paragraph_lines: Vec<String> = Vec::new();
+    let mut in_frontmatter = false;
+    let mut frontmatter_lines: Vec<String> = Vec::new();
+    let mut lines_iter = content.lines().peekable();
+
+    // Check for frontmatter start
+    if let Some(first_line) = lines_iter.peek() {
+        if first_line.trim() == "---" {
+            in_frontmatter = true;
+            lines_iter.next(); // Consume first ---
+        }
+    }
 
     let flush_paragraph = |section: &mut SkillSection, lines: &mut Vec<String>| {
         if lines.is_empty() {
@@ -60,7 +72,20 @@ pub fn parse_markdown(content: &str) -> Result<SkillSpec> {
         });
     };
 
-    for line in content.lines() {
+    for line in lines_iter {
+        if in_frontmatter {
+            if line.trim() == "---" {
+                in_frontmatter = false;
+                let yaml = frontmatter_lines.join("\n");
+                if let Ok(meta) = serde_yaml::from_str::<SkillMetadata>(&yaml) {
+                    metadata = meta;
+                }
+                continue;
+            }
+            frontmatter_lines.push(line.to_string());
+            continue;
+        }
+
         if let Some(title) = line.strip_prefix("# ") {
             name = title.trim().to_string();
             in_description = true;
@@ -147,17 +172,33 @@ pub fn parse_markdown(content: &str) -> Result<SkillSpec> {
         sections.push(section);
     }
 
-    let id = if name.is_empty() { "".to_string() } else { slugify(&name) };
-    let description = description_lines.join("\n").trim().to_string();
+    let id = if !metadata.id.is_empty() {
+        metadata.id.clone()
+    } else if name.is_empty() {
+        "".to_string()
+    } else {
+        slugify(&name)
+    };
+
+    // If description wasn't in frontmatter, use extracted one
+    if metadata.description.is_empty() {
+        metadata.description = description_lines.join("\n").trim().to_string();
+    }
+    
+    // If name wasn't in frontmatter, use extracted one
+    if metadata.name.is_empty() {
+        metadata.name = name;
+    }
+    
+    if metadata.version.is_empty() {
+        metadata.version = "0.1.0".to_string();
+    }
+
+    metadata.id = id;
 
     Ok(SkillSpec {
-        metadata: SkillMetadata {
-            id,
-            name,
-            description,
-            version: "0.1.0".to_string(),
-            ..Default::default()
-        },
+        format_version: SkillSpec::FORMAT_VERSION.to_string(),
+        metadata,
         sections,
     })
 }
@@ -165,6 +206,13 @@ pub fn parse_markdown(content: &str) -> Result<SkillSpec> {
 /// Compile a SkillSpec back to markdown.
 pub fn compile_markdown(spec: &SkillSpec) -> String {
     let mut output = String::new();
+
+    // Serialize metadata to YAML frontmatter
+    if let Ok(yaml) = serde_yaml::to_string(&spec.metadata) {
+        output.push_str("---\n");
+        output.push_str(yaml.trim());
+        output.push_str("\n---\n\n");
+    }
 
     output.push_str(&format!("# {}\n\n", spec.metadata.name));
 
@@ -242,6 +290,16 @@ mod tests {
         let md = "# Sample Skill\n\nA short description.\n\n## Usage\n\nDo the thing.\n\n```bash\nls -la\n```\n";
         let parsed = parse_markdown(md).expect("parse");
         let compiled = compile_markdown(&parsed);
-        assert_eq!(compiled, md);
+        
+        let expected = "---\nid: sample-skill\nname: Sample Skill\nversion: 0.1.0\ndescription: A short description.\ntags: []\nrequires: []\nprovides: []\nplatforms: []\nauthor: null\nlicense: null\n---\n\n# Sample Skill\n\nA short description.\n\n## Usage\n\nDo the thing.\n\n```bash\nls -la\n```\n";
+        
+        assert_eq!(compiled, expected);
+    }
+    #[test]
+    fn parse_frontmatter_tags() {
+        let md = "---\nname: Tagged Skill\ntags: [rust, backend]\n---\n\n# Tagged Skill\n\nDescription.\n";
+        let parsed = parse_markdown(md).expect("parse");
+        assert_eq!(parsed.metadata.name, "Tagged Skill");
+        assert_eq!(parsed.metadata.tags, vec!["rust", "backend"]);
     }
 }

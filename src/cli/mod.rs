@@ -53,6 +53,9 @@ pub enum Commands {
     /// Load a skill with progressive disclosure
     Load(commands::load::LoadArgs),
 
+    /// Install a bundle from URL or path (alias for bundle install)
+    Install(commands::install::InstallArgs),
+
     /// Get context-aware skill suggestions
     Suggest(commands::suggest::SuggestArgs),
 
@@ -77,11 +80,23 @@ pub enum Commands {
     /// Check environment requirements
     Requirements(commands::requirements::RequirementsArgs),
 
+    /// Record and inspect skill feedback
+    Feedback(commands::feedback::FeedbackArgs),
+
+    /// Record implicit success/failure outcomes
+    Outcome(commands::outcome::OutcomeArgs),
+
+    /// Manage skill experiments
+    Experiment(commands::experiment::ExperimentArgs),
+
     /// Build skills from CASS sessions
     Build(commands::build::BuildArgs),
 
     /// Manage skill bundles
     Bundle(commands::bundle::BundleArgs),
+
+    /// Migrate skills to latest spec format
+    Migrate(commands::migrate::MigrateArgs),
 
     /// Check for and apply updates
     Update(commands::update::UpdateArgs),
@@ -106,6 +121,9 @@ pub enum Commands {
 
     /// Security and prompt-injection defenses
     Security(commands::security::SecurityArgs),
+
+    /// Shell integration hooks
+    Shell(commands::shell::ShellArgs),
 
     /// Command safety (DCG) logs and status
     Safety(commands::safety::SafetyArgs),

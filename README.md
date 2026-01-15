@@ -295,17 +295,63 @@ ms search "async" --search-type bm25
 ms search "async" --search-type semantic
 ```
 
-### `ms load` (planned)
+### `ms load`
 
-Stubbed. Intended to load skills with progressive disclosure and token budgets.
+Loads skills with progressive disclosure and token budgets.
+
+```bash
+ms load rust-error-handling --level overview
+ms load rust-error-handling --pack 2000
+```
 
 ### `ms suggest`
 
-Captures context + computes a fingerprint. Suggestions currently return an empty list, but cooldown tracking is implemented.
+Captures context, computes a fingerprint, and returns suggestions with cooldown suppression.
 
 ```bash
 ms suggest
 ms suggest --cwd /path/to/project
+```
+
+### `ms feedback`
+
+Record or list skill feedback signals.
+
+```bash
+ms feedback add rust-error-handling --positive --comment "helpful"
+ms feedback add rust-error-handling --rating 4
+ms feedback list --limit 20
+ms feedback list --skill rust-error-handling
+```
+
+### `ms outcome`
+
+Mark the latest usage of a skill as success or failure (implicit outcome signal).
+
+```bash
+ms outcome rust-error-handling --success
+ms outcome rust-error-handling --failure
+```
+
+### `ms experiment`
+
+Create and list basic A/B experiment records.
+
+```bash
+ms experiment create rust-error-handling --variant control --variant concise
+ms experiment create rust-error-handling --scope slice --scope-id intro --variant control --variant alt
+ms experiment list
+ms experiment list --skill rust-error-handling
+```
+
+### `ms shell`
+
+Print shell hook snippets for bash/zsh/fish to call `ms suggest` with rate limiting.
+
+```bash
+ms shell --shell bash
+ms shell --shell zsh
+ms shell --shell fish
 ```
 
 ### `ms edit`
@@ -326,25 +372,54 @@ Semantic diff between skills.
 
 Manage skill aliases.
 
-### `ms requirements` (planned)
+### `ms requirements`
 
-Stubbed. Intended for dependency checks.
+Checks for system requirements and dependencies.
 
-### `ms build` (planned)
+```bash
+ms requirements
+ms requirements --json
+```
 
-Stubbed. Intended to mine CASS sessions into skills.
+### `ms build`
+
+Mines CASS sessions into skills using autonomous or guided (Brenner Method) workflows.
 
 ```bash
 ms build --from-cass "error handling"
+ms build --guided --from-cass "error handling"
 ```
 
 ### `ms bundle`
 
 Package skills into portable bundles.
 
-### `ms update` (planned)
+### `ms migrate`
 
-Stubbed. Intended to update `ms` itself.
+Upgrade skill specs in the archive to the latest format version.
+
+```bash
+ms migrate
+ms migrate rust-error-handling
+ms migrate --check
+```
+
+### `ms install`
+
+Install a bundle from a URL or path (alias for `ms bundle install`).
+
+```bash
+ms install https://example.com/bundle.msb
+```
+
+### `ms update`
+
+Checks for and applies updates to the ms CLI.
+
+```bash
+ms update
+ms update --check
+```
 
 ### `ms doctor`
 
@@ -358,9 +433,14 @@ ms doctor --check-lock
 
 Runs UBS checks on staged files.
 
-### `ms prune` (planned)
+### `ms prune`
 
-Stubbed. Intended to remove tombstoned or outdated data safely.
+Removes tombstoned or outdated data safely.
+
+```bash
+ms prune list
+ms prune purge all --older-than 30 --approve
+```
 
 ### `ms config`
 
@@ -532,8 +612,7 @@ ms search "query"
 
 ## Limitations
 
-- `ms build`, `ms load`, `ms update`, `ms requirements`, and `ms prune` are not implemented yet.
-- The suggestion engine currently returns an empty list (context fingerprinting is implemented).
+- The suggestion engine's bandit algorithm is currently running with a default exploration config.
 - Prebuilt binaries are not published yet.
 
 ---

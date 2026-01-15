@@ -12,9 +12,10 @@ use crate::updater::{
 };
 
 /// Default repository for updates.
-const DEFAULT_REPO: &str = "anthropics/meta_skill";
+const DEFAULT_REPO: &str = "Dicklesworthstone/meta_skill";
 
 #[derive(Args, Debug)]
+#[command(disable_version_flag = true)]
 pub struct UpdateArgs {
     /// Check for updates without applying
     #[arg(long)]
@@ -26,7 +27,7 @@ pub struct UpdateArgs {
 
     /// Update to specific version
     #[arg(long)]
-    pub version: Option<String>,
+    pub target_version: Option<String>,
 
     /// Update channel (stable, beta, nightly)
     #[arg(long)]

@@ -32,10 +32,6 @@ pub struct TestArgs {
     #[arg(long)]
     pub timeout: Option<String>,
 
-    /// Show verbose test output
-    #[arg(long)]
-    pub verbose: bool,
-
     /// Stop on first failure
     #[arg(long)]
     pub fail_fast: bool,
@@ -43,7 +39,7 @@ pub struct TestArgs {
 
 pub fn run(ctx: &AppContext, args: &TestArgs) -> Result<()> {
     let options = TestOptions {
-        verbose: args.verbose,
+        verbose: ctx.verbosity > 0,
         fail_fast: args.fail_fast,
         test_name: args.test.clone(),
         include_tags: parse_tags(args.tags.as_deref()),
