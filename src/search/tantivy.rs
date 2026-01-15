@@ -438,6 +438,7 @@ fn parse_metadata(metadata_json: &str) -> (String, String) {
             tags = tag_array
                 .iter()
                 .filter_map(|v| v.as_str())
+                .map(|tag| tag.to_lowercase())
                 .collect::<Vec<_>>()
                 .join(" ");
         }
@@ -447,6 +448,7 @@ fn parse_metadata(metadata_json: &str) -> (String, String) {
             aliases = alias_array
                 .iter()
                 .filter_map(|v| v.as_str())
+                .map(|alias| alias.to_lowercase())
                 .collect::<Vec<_>>()
                 .join(" ");
         }

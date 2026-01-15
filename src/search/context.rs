@@ -200,7 +200,7 @@ impl SearchFilters {
     pub fn parse_tags(tags_str: &str) -> Vec<String> {
         tags_str
             .split(',')
-            .map(|s| s.trim().to_string())
+            .map(|s| s.trim().to_lowercase())
             .filter(|s| !s.is_empty())
             .collect()
     }
