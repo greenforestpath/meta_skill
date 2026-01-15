@@ -4,7 +4,7 @@
 //! and link anti-patterns to positive patterns they constrain.
 
 use clap::{Args, Subcommand};
-use colored::Colorize;
+use colored::{Color, Colorize};
 
 use crate::antipatterns::{
     format_anti_patterns, mine_anti_patterns, AntiPattern, AntiPatternSeverity, DefaultDetector,
@@ -68,7 +68,7 @@ pub struct ListArgs {
     #[arg(long, default_value = "50")]
     pub limit: usize,
 
-    /// Filter by severity (advisory, warning, error, critical)
+    /// Filter by severity (advisory, warning, blocking)
     #[arg(long)]
     pub severity: Option<String>,
 
@@ -305,8 +305,6 @@ fn output_mine_robot(anti_patterns: &[AntiPattern]) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(&output)?);
     Ok(())
 }
-
-use colored::Color;
 
 #[cfg(test)]
 mod tests {

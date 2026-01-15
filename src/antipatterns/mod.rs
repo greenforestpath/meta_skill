@@ -299,12 +299,14 @@ fn extract_failure_modes(evidence: &[AntiPatternEvidence]) -> Vec<FailureMode> {
     modes.into_values().collect()
 }
 
-/// Truncate string with ellipsis
-fn truncate(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
+/// Truncate string with ellipsis (character-aware for UTF-8 safety)
+fn truncate(s: &str, max_chars: usize) -> String {
+    let char_count = s.chars().count();
+    if char_count <= max_chars {
         s.to_string()
     } else {
-        format!("{}...", &s[..max_len])
+        let truncated: String = s.chars().take(max_chars).collect();
+        format!("{}...", truncated)
     }
 }
 
@@ -402,5 +404,19 @@ mod tests {
     fn test_truncate() {
         assert_eq!(truncate("short", 10), "short");
         assert_eq!(truncate("this is a long string", 10), "this is a ...");
+    }
+
+    #[test]
+    fn test_truncate_utf8_safety() {
+        // Multi-byte UTF-8 characters should not panic
+        let emoji_str = "Hello 🦀🦀🦀 world!";
+        let result = truncate(emoji_str, 8);
+        // Should truncate to 8 characters: "Hello 🦀🦀"
+        assert_eq!(result, "Hello 🦀🦀...");
+
+        // Japanese characters (3 bytes each)
+        let japanese = "日本語テスト";
+        let result = truncate(japanese, 3);
+        assert_eq!(result, "日本語...");
     }
 }

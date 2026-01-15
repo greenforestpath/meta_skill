@@ -327,12 +327,14 @@ impl AntiPatternDetector for DefaultDetector {
 // Helper Functions
 // =============================================================================
 
-/// Truncate content to a maximum length
-fn truncate_content(content: &str, max_len: usize) -> String {
-    if content.len() <= max_len {
+/// Truncate content to a maximum length (character-aware for UTF-8 safety)
+fn truncate_content(content: &str, max_chars: usize) -> String {
+    let char_count = content.chars().count();
+    if char_count <= max_chars {
         content.to_string()
     } else {
-        format!("{}...", &content[..max_len])
+        let truncated: String = content.chars().take(max_chars).collect();
+        format!("{}...", truncated)
     }
 }
 
