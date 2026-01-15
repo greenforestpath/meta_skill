@@ -88,9 +88,10 @@ pub fn run(ctx: &AppContext, args: &DoctorArgs) -> Result<()> {
             "safety" => check_safety(ctx, verbose)?,
             "security" => check_security(ctx, verbose)?,
             "recovery" => run_comprehensive_check(ctx, args.fix, verbose, &mut issues_fixed)?,
+            "perf" => check_perf(ctx, verbose)?,
             other => {
                 println!("{} Unknown check: {}", "!".yellow(), other);
-                println!("  Available checks: safety, security, recovery");
+                println!("  Available checks: safety, security, recovery, perf");
                 1
             }
         };
@@ -636,6 +637,58 @@ fn print_recovery_report(report: &RecoveryReport, verbose: bool) {
     }
 }
 
+/// Check performance metrics
+fn check_perf(ctx: &AppContext, verbose: bool) -> Result<usize> {
+    print!("Checking performance... ");
+    
+    let mut issues = 0;
+    
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(statm) = std::fs::read_to_string("/proc/self/statm") {
+            let parts: Vec<&str> = statm.split_whitespace().collect();
+            if let Some(rss_pages) = parts.get(1) {
+                if let Ok(pages) = rss_pages.parse::<u64>() {
+                    let page_size = 4096; // Standard page size assumption
+                    let rss_bytes = pages * page_size;
+                    let rss_mb = rss_bytes as f64 / (1024.0 * 1024.0);
+                    
+                    if rss_mb > 100.0 {
+                        println!("{} High memory usage: {:.2} MB (target < 100 MB)", "!".yellow(), rss_mb);
+                        issues += 1;
+                    } else {
+                        println!("{} Memory usage: {:.2} MB", "✓".green(), rss_mb);
+                    }
+                }
+            }
+        } else {
+             println!("{} Memory check failed (cannot read /proc/self/statm)", "!".yellow());
+        }
+    }
+    
+    #[cfg(not(target_os = "linux"))]
+    {
+        println!("{} Memory check skipped (not supported on this OS)", "-".dimmed());
+    }
+
+    // Check search latency (simple benchmark)
+    let start = std::time::Instant::now();
+    // Use a simple query that should be fast
+    let _ = ctx.db.search_fts("test", 1).ok();
+    let elapsed = start.elapsed();
+    
+    if elapsed.as_millis() > 50 {
+        println!("{} Search latency high: {:?} (target < 50ms)", "!".yellow(), elapsed);
+        issues += 1;
+    } else {
+        if verbose {
+             println!("  Search latency: {:?}", elapsed);
+        }
+    }
+
+    Ok(issues)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -795,7 +848,7 @@ mod tests {
     #[test]
     fn available_checks_are_documented() {
         // This test documents the available check types
-        let available_checks = ["safety", "security", "recovery"];
+        let available_checks = ["safety", "security", "recovery", "perf"];
 
         for check in &available_checks {
             let cli = TestCli::try_parse_from(["test", "--check", check]).unwrap();
