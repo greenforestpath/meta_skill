@@ -44,9 +44,24 @@ pub fn run(ctx: &AppContext, args: &SuggestArgs) -> Result<()> {
     let fingerprint = ContextFingerprint::capture(&capture);
 
     let cache_path = cooldown_path();
-    let mut cache = SuggestionCooldownCache::load(&cache_path)?;
+    let cache = if args.reset_cooldowns {
+        SuggestionCooldownCache::new()
+    } else {
+        match SuggestionCooldownCache::load(&cache_path) {
+            Ok(c) => c,
+            Err(e) => {
+                if !ctx.robot_mode {
+                    eprintln!(
+                        "Warning: Failed to load cooldown cache: {}. Starting with empty cache.",
+                        e
+                    );
+                }
+                SuggestionCooldownCache::new()
+            }
+        }
+    };
+
     if args.reset_cooldowns {
-        cache = SuggestionCooldownCache::new();
         cache.save(&cache_path)?;
     }
 
@@ -77,7 +92,19 @@ pub fn run(ctx: &AppContext, args: &SuggestArgs) -> Result<()> {
             bandit_weights = Some(weights);
         }
     } else if bandit_enabled {
-        let mut bandit = SignalBandit::load(&bandit_path)?;
+        let mut bandit = match SignalBandit::load(&bandit_path) {
+            Ok(b) => b,
+            Err(e) => {
+                if !ctx.robot_mode {
+                    eprintln!(
+                        "Warning: Failed to load bandit state: {}. Starting with new state.",
+                        e
+                    );
+                }
+                SignalBandit::new()
+            }
+        };
+
         if let Some(value) = bandit_exploration {
             bandit.config.exploration_factor = value;
         } else {
