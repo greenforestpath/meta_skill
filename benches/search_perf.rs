@@ -6,13 +6,17 @@
 //! - packing: < 50ms for constrained optimization
 //! - vector_search: < 50ms p99 for 1000 embeddings
 
-use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use std::hint::black_box;
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
 use ms::core::disclosure::PackMode;
 use ms::core::packing::{ConstrainedPacker, PackConstraints};
 use ms::core::skill::{SkillSlice, SliceType};
 use ms::search::embeddings::{HashEmbedder, VectorIndex};
 use ms::search::hybrid::{RrfConfig, fuse_results};
+use ms::suggestions::bandit::bandit::SignalBandit;
+use ms::suggestions::bandit::context::{ProjectSize, SuggestionContext, TimeOfDay};
+use ms::suggestions::bandit::types::{Reward, SignalType};
 
 // =============================================================================
 // Hash Embedding Benchmarks
@@ -200,6 +204,7 @@ fn packing_benchmarks(c: &mut Criterion) {
                 tags: vec![format!("tag-{}", i % 3)],
                 requires: Vec::new(),
                 condition: None,
+                section_title: Some(format!("Section {}", i % 3)),
                 content: format!("Content for slice {} with some text.", i),
             })
             .collect()
@@ -293,6 +298,103 @@ fn similarity_benchmarks(c: &mut Criterion) {
     group.finish();
 }
 
+// =============================================================================
+// Suggest / Thompson Sampling Bandit Benchmarks
+// =============================================================================
+
+fn suggest_benchmarks(c: &mut Criterion) {
+    let mut group = c.benchmark_group("suggest_bandit");
+
+    // Benchmark weight selection (Thompson sampling)
+    group.bench_function("select_weights_empty_context", |b| {
+        let mut bandit = SignalBandit::new();
+        let context = SuggestionContext::default();
+
+        b.iter(|| bandit.select_weights(black_box(&context)))
+    });
+
+    // Benchmark with full context
+    group.bench_function("select_weights_full_context", |b| {
+        let mut bandit = SignalBandit::new();
+        let context = SuggestionContext {
+            tech_stack: Some("rust".to_string()),
+            time_of_day: Some(TimeOfDay::Morning),
+            project_size: Some(ProjectSize::Large),
+            activity_pattern: Some("coding".to_string()),
+        };
+
+        b.iter(|| bandit.select_weights(black_box(&context)))
+    });
+
+    // Benchmark estimated weights (deterministic, no sampling)
+    group.bench_function("estimated_weights", |b| {
+        let bandit = SignalBandit::new();
+        let context = SuggestionContext::default();
+
+        b.iter(|| bandit.estimated_weights(black_box(&context)))
+    });
+
+    // Benchmark update operation
+    group.bench_function("update_single", |b| {
+        let mut bandit = SignalBandit::new();
+        let context = SuggestionContext::default();
+
+        b.iter(|| {
+            bandit.update(
+                black_box(SignalType::Bm25),
+                black_box(Reward::Success),
+                black_box(&context),
+            )
+        })
+    });
+
+    group.finish();
+
+    // Benchmark bandit with history (many observations)
+    let mut history_group = c.benchmark_group("suggest_bandit_trained");
+
+    for observations in [10, 100, 500, 1000].iter() {
+        let mut bandit = SignalBandit::new();
+        let context = SuggestionContext {
+            tech_stack: Some("python".to_string()),
+            time_of_day: Some(TimeOfDay::Afternoon),
+            project_size: Some(ProjectSize::Medium),
+            activity_pattern: None,
+        };
+
+        // Train bandit with observations
+        for i in 0..*observations {
+            let signal = match i % 8 {
+                0 => SignalType::Bm25,
+                1 => SignalType::Embedding,
+                2 => SignalType::Trigger,
+                3 => SignalType::Freshness,
+                4 => SignalType::ProjectMatch,
+                5 => SignalType::FileTypeMatch,
+                6 => SignalType::CommandPattern,
+                _ => SignalType::UserHistory,
+            };
+            let reward = if i % 3 == 0 {
+                Reward::Success
+            } else {
+                Reward::Failure
+            };
+            bandit.update(signal, reward, &context);
+        }
+
+        history_group.bench_with_input(
+            BenchmarkId::new("select_weights_after", observations),
+            &(&bandit, &context),
+            |b, (bandit, context)| {
+                let mut bandit = (*bandit).clone();
+                b.iter(|| bandit.select_weights(black_box(context)))
+            },
+        );
+    }
+
+    history_group.finish();
+}
+
 criterion_group!(
     benches,
     hash_embedding_benchmarks,
@@ -300,6 +402,7 @@ criterion_group!(
     vector_search_benchmarks,
     packing_benchmarks,
     similarity_benchmarks,
+    suggest_benchmarks,
 );
 
 criterion_main!(benches);

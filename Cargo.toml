@@ -102,6 +102,7 @@ rand = "0.9.2"
 rand_distr = "0.5.1"
 which = "8.0.0"
 humantime-serde = "1.1.1"
+lru = "0.14"
 
 [build-dependencies]
 vergen-gix = { version = "1.0.9", features = ["build", "cargo", "rustc"] }
@@ -132,6 +133,14 @@ strip = true
 
 [profile.dev]
 opt-level = 1
+
+# Profiling profile: release optimizations with debug symbols for flamegraph/perf
+# Usage: cargo build --profile=profiling
+# Then: cargo flamegraph --profile=profiling --bin ms -- search "query"
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = false
 
 [lints.rust]
 unsafe_code = "forbid"
