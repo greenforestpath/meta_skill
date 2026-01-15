@@ -1069,7 +1069,7 @@ fn read_u64(input: &[u8], cursor: &mut usize) -> Result<u64> {
     let mut buf = [0u8; 8];
     buf.copy_from_slice(&input[*cursor..*cursor + 8]);
     *cursor += 8;
-    Ok(u64::from_le_bytes(buf))
+    Ok(u64::from_be_bytes(buf))
 }
 
 fn read_slice<'a>(input: &'a [u8], cursor: &mut usize, len: usize) -> Result<&'a [u8]> {
