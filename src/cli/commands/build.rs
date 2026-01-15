@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::app::AppContext;
+use crate::beads::{BeadsClient, IssueStatus, UpdateIssueRequest};
 use crate::cass::{
     brenner::{generate_skill_md, run_interactive, BrennerConfig, BrennerWizard, WizardOutput},
     CassClient, QualityScorer,
@@ -364,6 +365,14 @@ pub struct BuildArgs {
     #[arg(long)]
     pub from_cass: Option<String>,
 
+    /// Track build progress against a beads issue
+    #[arg(long)]
+    pub bead_id: Option<String>,
+
+    /// Close bead automatically on successful build (default: true)
+    #[arg(long, default_value = "true")]
+    pub close_bead_on_success: bool,
+
     /// Interactive guided build using Brenner Method
     #[arg(long)]
     pub guided: bool,
@@ -479,6 +488,111 @@ impl CmBuildContext {
     }
 }
 
+// =============================================================================
+// Beads Build Integration
+// =============================================================================
+
+/// Tracks build progress in a beads issue.
+///
+/// When a bead_id is provided, this tracker:
+/// - Sets the issue to in_progress at build start
+/// - Closes the issue on successful build
+/// - Adds failure notes on build failure (keeps in_progress)
+pub struct BeadsTracker {
+    client: BeadsClient,
+    bead_id: String,
+}
+
+impl BeadsTracker {
+    /// Create a new tracker for the given bead ID.
+    ///
+    /// Returns None if beads is not available.
+    pub fn new(bead_id: String) -> Option<Self> {
+        let client = BeadsClient::new();
+        if !client.is_available() {
+            eprintln!(
+                "{} beads (bd) not available, skipping bead tracking",
+                "Warning:".yellow()
+            );
+            return None;
+        }
+        Some(Self { client, bead_id })
+    }
+
+    /// Mark the bead as in_progress at build start.
+    pub fn on_start(&self) -> Result<()> {
+        match self.client.update_status(&self.bead_id, IssueStatus::InProgress) {
+            Ok(_) => {
+                eprintln!(
+                    "{} {} set to in_progress",
+                    "Bead:".cyan(),
+                    self.bead_id
+                );
+                Ok(())
+            }
+            Err(e) => {
+                // Non-blocking: log warning but don't fail the build
+                eprintln!(
+                    "{} failed to update bead {}: {}",
+                    "Warning:".yellow(),
+                    self.bead_id,
+                    e
+                );
+                Ok(())
+            }
+        }
+    }
+
+    /// Close the bead on successful build.
+    pub fn on_success(&self, skill_name: &str) -> Result<()> {
+        let reason = format!("Build completed successfully: {}", skill_name);
+        match self.client.close(&self.bead_id, Some(&reason)) {
+            Ok(_) => {
+                eprintln!(
+                    "{} {} closed (build successful)",
+                    "Bead:".green(),
+                    self.bead_id
+                );
+                Ok(())
+            }
+            Err(e) => {
+                eprintln!(
+                    "{} failed to close bead {}: {}",
+                    "Warning:".yellow(),
+                    self.bead_id,
+                    e
+                );
+                Ok(())
+            }
+        }
+    }
+
+    /// Add failure note on build failure (keeps in_progress).
+    pub fn on_failure(&self, error: &str) -> Result<()> {
+        let note = format!("Build failed: {}", error);
+        let req = UpdateIssueRequest::new().with_notes(&note);
+        match self.client.update(&self.bead_id, &req) {
+            Ok(_) => {
+                eprintln!(
+                    "{} {} updated with failure note",
+                    "Bead:".yellow(),
+                    self.bead_id
+                );
+                Ok(())
+            }
+            Err(e) => {
+                eprintln!(
+                    "{} failed to update bead {}: {}",
+                    "Warning:".yellow(),
+                    self.bead_id,
+                    e
+                );
+                Ok(())
+            }
+        }
+    }
+}
+
 pub fn run(ctx: &AppContext, args: &BuildArgs) -> Result<()> {
     // Validate incompatible options
     if args.guided && args.auto {
@@ -551,9 +665,19 @@ pub fn run(ctx: &AppContext, args: &BuildArgs) -> Result<()> {
         None
     };
 
+    // Initialize beads tracker if bead_id is provided
+    let bead_tracker = args.bead_id.as_ref().and_then(|id| {
+        BeadsTracker::new(id.clone())
+    });
+
+    // Mark bead as in_progress at build start
+    if let Some(ref tracker) = bead_tracker {
+        tracker.on_start()?;
+    }
+
     // Handle resume
     if let Some(ref session_id) = args.resume {
-        return run_resume(ctx, args, session_id);
+        return run_resume(ctx, args, session_id, bead_tracker);
     }
 
     // Handle resolve uncertainties
@@ -563,20 +687,25 @@ pub fn run(ctx: &AppContext, args: &BuildArgs) -> Result<()> {
 
     // Guided mode uses Brenner wizard
     if args.guided {
-        return run_guided(ctx, args, cm_context.as_ref());
+        return run_guided(ctx, args, cm_context.as_ref(), bead_tracker);
     }
 
     // Auto mode
     if args.auto {
-        return run_auto(ctx, args, cm_context.as_ref());
+        return run_auto(ctx, args, cm_context.as_ref(), bead_tracker);
     }
 
     // Default: interactive but not guided
-    run_interactive_build(ctx, args, cm_context.as_ref())
+    run_interactive_build(ctx, args, cm_context.as_ref(), bead_tracker)
 }
 
 /// Run guided build using Brenner Method wizard
-fn run_guided(ctx: &AppContext, args: &BuildArgs, cm_context: Option<&CmBuildContext>) -> Result<()> {
+fn run_guided(
+    ctx: &AppContext,
+    args: &BuildArgs,
+    cm_context: Option<&CmBuildContext>,
+    tracker: Option<BeadsTracker>,
+) -> Result<()> {
     let query = args
         .from_cass
         .clone()
@@ -672,6 +801,10 @@ fn run_guided(ctx: &AppContext, args: &BuildArgs, cm_context: Option<&CmBuildCon
             println!("  Skill: {}", skill_path.display());
             println!("  Manifest: {}", manifest_path.display());
             println!("  Calibration: {}", calibration_path.display());
+
+            if let Some(t) = tracker {
+                t.on_success(&draft.name)?;
+            }
         }
         WizardOutput::Cancelled {
             reason,
@@ -681,6 +814,9 @@ fn run_guided(ctx: &AppContext, args: &BuildArgs, cm_context: Option<&CmBuildCon
             if let Some(id) = checkpoint_id {
                 println!("  Resume with: ms build --resume {}", id);
             }
+            if let Some(t) = tracker {
+                t.on_failure(&format!("Cancelled: {}", reason))?;
+            }
         }
     }
 
@@ -688,7 +824,12 @@ fn run_guided(ctx: &AppContext, args: &BuildArgs, cm_context: Option<&CmBuildCon
 }
 
 /// Run automatic build (no user interaction)
-fn run_auto(ctx: &AppContext, args: &BuildArgs, cm_context: Option<&CmBuildContext>) -> Result<()> {
+fn run_auto(
+    ctx: &AppContext,
+    args: &BuildArgs,
+    cm_context: Option<&CmBuildContext>,
+    tracker: Option<BeadsTracker>,
+) -> Result<()> {
     use crate::cass::mining::{extract_from_session, ExtractedPattern};
     use crate::cass::QualityConfig;
 
@@ -783,6 +924,9 @@ fn run_auto(ctx: &AppContext, args: &BuildArgs, cm_context: Option<&CmBuildConte
 
     // Check for timeout before starting phase
     if session.is_timed_out() {
+        if let Some(t) = &tracker {
+            t.on_failure("Build timed out during session search")?;
+        }
         return output_timeout(ctx, &mut session, &output_dir);
     }
 
@@ -793,6 +937,9 @@ fn run_auto(ctx: &AppContext, args: &BuildArgs, cm_context: Option<&CmBuildConte
     session.advance_phase(); // -> QualityFilter
 
     if session_matches.is_empty() {
+        if let Some(t) = &tracker {
+            t.on_failure("No matching sessions found")?;
+        }
         return output_no_sessions(ctx, &session, &query);
     }
 
@@ -816,6 +963,9 @@ fn run_auto(ctx: &AppContext, args: &BuildArgs, cm_context: Option<&CmBuildConte
     }
 
     if session.is_timed_out() {
+        if let Some(t) = &tracker {
+            t.on_failure("Build timed out during quality filtering")?;
+        }
         return output_timeout(ctx, &mut session, &output_dir);
     }
 
@@ -849,6 +999,9 @@ fn run_auto(ctx: &AppContext, args: &BuildArgs, cm_context: Option<&CmBuildConte
 
         // Check timeout during processing
         if session.is_timed_out() {
+            if let Some(t) = &tracker {
+                t.on_failure("Build timed out during quality filtering loop")?;
+            }
             return output_timeout(ctx, &mut session, &output_dir);
         }
     }
@@ -857,6 +1010,9 @@ fn run_auto(ctx: &AppContext, args: &BuildArgs, cm_context: Option<&CmBuildConte
     session.advance_phase(); // -> ExtractPatterns
 
     if quality_sessions.is_empty() {
+        if let Some(t) = &tracker {
+            t.on_failure("No sessions passed quality threshold")?;
+        }
         return output_no_quality(ctx, &session, &query, &skipped_sessions, args.min_session_quality);
     }
 
@@ -887,6 +1043,9 @@ fn run_auto(ctx: &AppContext, args: &BuildArgs, cm_context: Option<&CmBuildConte
     }
 
     if session.is_timed_out() {
+        if let Some(t) = &tracker {
+            t.on_failure("Build timed out during pattern extraction")?;
+        }
         return output_timeout(ctx, &mut session, &output_dir);
     }
 
@@ -912,6 +1071,9 @@ fn run_auto(ctx: &AppContext, args: &BuildArgs, cm_context: Option<&CmBuildConte
         }
 
         if session.is_timed_out() {
+            if let Some(t) = &tracker {
+                t.on_failure("Build timed out during pattern extraction loop")?;
+            }
             return output_timeout(ctx, &mut session, &output_dir);
         }
     }
@@ -920,6 +1082,9 @@ fn run_auto(ctx: &AppContext, args: &BuildArgs, cm_context: Option<&CmBuildConte
     session.advance_phase(); // -> FilterPatterns
 
     if all_patterns.is_empty() {
+        if let Some(t) = &tracker {
+            t.on_failure("No patterns extracted from sessions")?;
+        }
         return output_no_patterns(ctx, &session, &query, quality_sessions.len());
     }
 
@@ -935,6 +1100,9 @@ fn run_auto(ctx: &AppContext, args: &BuildArgs, cm_context: Option<&CmBuildConte
     }
 
     if session.is_timed_out() {
+        if let Some(t) = &tracker {
+            t.on_failure("Build timed out during pattern filtering")?;
+        }
         return output_timeout(ctx, &mut session, &output_dir);
     }
 
@@ -977,6 +1145,9 @@ fn run_auto(ctx: &AppContext, args: &BuildArgs, cm_context: Option<&CmBuildConte
 
     // Check quality gates before synthesis
     if let Err(gate_error) = session.check_quality_gates() {
+        if let Some(t) = &tracker {
+            t.on_failure(&format!("Quality gate failed: {}", gate_error))?;
+        }
         return output_gate_fail(ctx, &session, &gate_error);
     }
 
@@ -988,6 +1159,9 @@ fn run_auto(ctx: &AppContext, args: &BuildArgs, cm_context: Option<&CmBuildConte
     }
 
     if session.is_timed_out() {
+        if let Some(t) = &tracker {
+            t.on_failure("Build timed out during synthesis")?;
+        }
         return output_timeout(ctx, &mut session, &output_dir);
     }
 
@@ -1065,6 +1239,10 @@ fn run_auto(ctx: &AppContext, args: &BuildArgs, cm_context: Option<&CmBuildConte
         println!("  Sessions processed: {}", quality_sessions.len());
         println!("  Patterns extracted: {}", filtered_patterns.len());
         println!("  Output directory: {}", output_dir.display());
+    }
+
+    if let Some(t) = tracker {
+        t.on_success(&format!("Auto build: {}", query))?;
     }
 
     Ok(())
@@ -1203,7 +1381,12 @@ fn output_gate_fail(ctx: &AppContext, session: &BuildSession, error: &str) -> Re
 }
 
 /// Run interactive build (not guided)
-fn run_interactive_build(ctx: &AppContext, args: &BuildArgs, cm_context: Option<&CmBuildContext>) -> Result<()> {
+fn run_interactive_build(
+    ctx: &AppContext,
+    args: &BuildArgs,
+    cm_context: Option<&CmBuildContext>,
+    tracker: Option<BeadsTracker>,
+) -> Result<()> {
     if ctx.robot_mode {
         let output = json!({
             "error": true,
@@ -1243,11 +1426,16 @@ fn run_interactive_build(ctx: &AppContext, args: &BuildArgs, cm_context: Option<
     }
 
     // Default to guided for interactive use
-    run_guided(ctx, args, cm_context)
+    run_guided(ctx, args, cm_context, tracker)
 }
 
 /// Resume a previous build session
-fn run_resume(ctx: &AppContext, args: &BuildArgs, session_id: &str) -> Result<()> {
+fn run_resume(
+    ctx: &AppContext,
+    args: &BuildArgs,
+    session_id: &str,
+    tracker: Option<BeadsTracker>,
+) -> Result<()> {
     use crate::core::recovery::Checkpoint;
 
     // Try to load checkpoint
@@ -1375,7 +1563,7 @@ fn run_resume(ctx: &AppContext, args: &BuildArgs, session_id: &str) -> Result<()
 
                 // Resume by restarting with same parameters
                 // (full incremental resume would require more state)
-                return run_auto(ctx, args, cm_context.as_ref());
+                return run_auto(ctx, args, cm_context.as_ref(), tracker);
             }
         }
         _ => {
@@ -1813,6 +2001,10 @@ fn format_uncertainty_reason(reason: &crate::cass::UncertaintyReason) -> String 
         }
     }
 }
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {
