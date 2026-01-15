@@ -17,14 +17,346 @@ use clap::Args;
 use colored::Colorize;
 use serde_json::json;
 
+use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
+
 use crate::app::AppContext;
 use crate::cass::{
     brenner::{generate_skill_md, run_interactive, BrennerConfig, BrennerWizard, WizardOutput},
     CassClient, QualityScorer,
 };
+use crate::core::recovery::Checkpoint;
 use crate::tui::build_tui::run_build_tui;
 use crate::cm::CmClient;
 use crate::error::{MsError, Result};
+
+// =============================================================================
+// BuildSession State Machine
+// =============================================================================
+
+/// Phases of the autonomous build process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BuildPhase {
+    /// Searching CASS for matching sessions.
+    SearchSessions,
+    /// Filtering sessions by quality score.
+    QualityFilter,
+    /// Extracting patterns from qualified sessions.
+    ExtractPatterns,
+    /// Filtering patterns by confidence and taint.
+    FilterPatterns,
+    /// Synthesizing final skill specification.
+    Synthesize,
+    /// Build completed successfully.
+    Complete,
+    /// Build failed with an error.
+    Failed,
+}
+
+impl BuildPhase {
+    /// Get the next phase in the pipeline.
+    pub fn next(&self) -> Option<BuildPhase> {
+        match self {
+            BuildPhase::SearchSessions => Some(BuildPhase::QualityFilter),
+            BuildPhase::QualityFilter => Some(BuildPhase::ExtractPatterns),
+            BuildPhase::ExtractPatterns => Some(BuildPhase::FilterPatterns),
+            BuildPhase::FilterPatterns => Some(BuildPhase::Synthesize),
+            BuildPhase::Synthesize => Some(BuildPhase::Complete),
+            BuildPhase::Complete | BuildPhase::Failed => None,
+        }
+    }
+
+    /// Get phase weight for overall progress calculation.
+    fn weight(&self) -> f64 {
+        match self {
+            BuildPhase::SearchSessions => 0.15,
+            BuildPhase::QualityFilter => 0.15,
+            BuildPhase::ExtractPatterns => 0.30,
+            BuildPhase::FilterPatterns => 0.15,
+            BuildPhase::Synthesize => 0.25,
+            BuildPhase::Complete | BuildPhase::Failed => 0.0,
+        }
+    }
+
+    /// Get cumulative weight of all phases before this one.
+    fn cumulative_weight(&self) -> f64 {
+        match self {
+            BuildPhase::SearchSessions => 0.0,
+            BuildPhase::QualityFilter => 0.15,
+            BuildPhase::ExtractPatterns => 0.30,
+            BuildPhase::FilterPatterns => 0.60,
+            BuildPhase::Synthesize => 0.75,
+            BuildPhase::Complete => 1.0,
+            BuildPhase::Failed => 0.0,
+        }
+    }
+}
+
+impl std::fmt::Display for BuildPhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            BuildPhase::SearchSessions => "search_sessions",
+            BuildPhase::QualityFilter => "quality_filter",
+            BuildPhase::ExtractPatterns => "extract_patterns",
+            BuildPhase::FilterPatterns => "filter_patterns",
+            BuildPhase::Synthesize => "synthesize",
+            BuildPhase::Complete => "complete",
+            BuildPhase::Failed => "failed",
+        };
+        write!(f, "{}", name)
+    }
+}
+
+/// Quality gates for build validation.
+#[derive(Debug, Clone)]
+pub struct QualityGates {
+    /// Minimum quality score for sessions (0.0-1.0).
+    pub min_session_quality: f32,
+    /// Minimum confidence for patterns (0.0-1.0).
+    pub min_pattern_confidence: f32,
+    /// Minimum number of sessions required.
+    pub min_sessions: usize,
+    /// Minimum number of patterns required.
+    pub min_patterns: usize,
+}
+
+impl Default for QualityGates {
+    fn default() -> Self {
+        Self {
+            min_session_quality: 0.6,
+            min_pattern_confidence: 0.8,
+            min_sessions: 3,
+            min_patterns: 5,
+        }
+    }
+}
+
+/// Persistent state for resumable builds.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BuildState {
+    /// Session IDs that passed quality filter.
+    pub qualified_session_ids: Vec<String>,
+    /// Number of patterns extracted so far.
+    pub patterns_extracted: usize,
+    /// Number of patterns after filtering.
+    pub patterns_filtered: usize,
+}
+
+impl Default for BuildState {
+    fn default() -> Self {
+        Self {
+            qualified_session_ids: Vec::new(),
+            patterns_extracted: 0,
+            patterns_filtered: 0,
+        }
+    }
+}
+
+/// State machine for autonomous build execution.
+pub struct BuildSession {
+    /// Unique session identifier.
+    pub session_id: String,
+    /// Current build phase.
+    pub phase: BuildPhase,
+    /// Progress within current phase (0.0-1.0).
+    pub phase_progress: f64,
+    /// Quality gates for validation.
+    pub gates: QualityGates,
+    /// Persistent state for resumption.
+    pub state: BuildState,
+    /// When the session started.
+    pub started_at: Instant,
+    /// Maximum duration for the build (if set).
+    pub max_duration: Option<Duration>,
+    /// Checkpoint interval for persistence.
+    pub checkpoint_interval: Option<Duration>,
+    /// Last checkpoint time.
+    pub last_checkpoint: Instant,
+    /// Checkpoint for persistence.
+    checkpoint: Checkpoint,
+}
+
+impl BuildSession {
+    /// Create a new build session.
+    pub fn new(_query: &str, gates: QualityGates) -> Self {
+        let session_id = format!("build-{}", chrono::Utc::now().format("%Y%m%d-%H%M%S"));
+        let now = Instant::now();
+        let checkpoint = Checkpoint::new(&session_id, "build");
+
+        Self {
+            session_id,
+            phase: BuildPhase::SearchSessions,
+            phase_progress: 0.0,
+            gates,
+            state: BuildState::default(),
+            started_at: now,
+            max_duration: None,
+            checkpoint_interval: None,
+            last_checkpoint: now,
+            checkpoint,
+        }
+    }
+
+    /// Set maximum duration for the build.
+    pub fn with_max_duration(mut self, duration: Duration) -> Self {
+        self.max_duration = Some(duration);
+        self
+    }
+
+    /// Set checkpoint interval.
+    pub fn with_checkpoint_interval(mut self, interval: Duration) -> Self {
+        self.checkpoint_interval = Some(interval);
+        self
+    }
+
+    /// Calculate overall progress (0.0-1.0).
+    pub fn overall_progress(&self) -> f64 {
+        let base = self.phase.cumulative_weight();
+        let phase_contribution = self.phase.weight() * self.phase_progress;
+        (base + phase_contribution).min(1.0)
+    }
+
+    /// Advance to the next phase.
+    pub fn advance_phase(&mut self) {
+        if let Some(next) = self.phase.next() {
+            self.phase = next;
+            self.phase_progress = 0.0;
+        }
+    }
+
+    /// Mark the build as failed.
+    pub fn fail(&mut self) {
+        self.phase = BuildPhase::Failed;
+    }
+
+    /// Check if the build has timed out.
+    pub fn is_timed_out(&self) -> bool {
+        if let Some(max_duration) = self.max_duration {
+            self.started_at.elapsed() >= max_duration
+        } else {
+            false
+        }
+    }
+
+    /// Check if a checkpoint should be saved.
+    pub fn should_checkpoint(&self) -> bool {
+        if let Some(interval) = self.checkpoint_interval {
+            self.last_checkpoint.elapsed() >= interval
+        } else {
+            false
+        }
+    }
+
+    /// Update the checkpoint with current state.
+    fn update_checkpoint(&mut self) {
+        self.checkpoint.phase = self.phase.to_string();
+        self.checkpoint.progress = self.overall_progress();
+        self.checkpoint.updated_at = chrono::Utc::now();
+
+        // Store state
+        self.checkpoint.state.insert(
+            "qualified_sessions".to_string(),
+            self.state.qualified_session_ids.join(","),
+        );
+        self.checkpoint.state.insert(
+            "patterns_extracted".to_string(),
+            self.state.patterns_extracted.to_string(),
+        );
+        self.checkpoint.state.insert(
+            "patterns_filtered".to_string(),
+            self.state.patterns_filtered.to_string(),
+        );
+    }
+
+    /// Save checkpoint to disk.
+    pub fn save_checkpoint(&mut self, ms_root: &std::path::Path) -> Result<()> {
+        self.update_checkpoint();
+        self.checkpoint.save(ms_root)?;
+        self.last_checkpoint = Instant::now();
+        Ok(())
+    }
+
+    /// Check if quality gates pass.
+    pub fn check_quality_gates(&self) -> std::result::Result<(), String> {
+        if self.state.qualified_session_ids.len() < self.gates.min_sessions {
+            return Err(format!(
+                "Insufficient sessions: {} < {} required",
+                self.state.qualified_session_ids.len(),
+                self.gates.min_sessions
+            ));
+        }
+        if self.state.patterns_filtered < self.gates.min_patterns {
+            return Err(format!(
+                "Insufficient patterns: {} < {} required",
+                self.state.patterns_filtered,
+                self.gates.min_patterns
+            ));
+        }
+        Ok(())
+    }
+
+    /// Get remaining time if duration is set.
+    pub fn remaining_time(&self) -> Option<Duration> {
+        self.max_duration.map(|max| {
+            let elapsed = self.started_at.elapsed();
+            if elapsed >= max {
+                Duration::ZERO
+            } else {
+                max - elapsed
+            }
+        })
+    }
+}
+
+/// Parse a duration string like "4h", "30m", "2h30m", "1h15m30s".
+pub fn parse_duration(s: &str) -> Result<Duration> {
+    let s = s.trim().to_lowercase();
+    if s.is_empty() {
+        return Err(MsError::Config("Empty duration string".into()));
+    }
+
+    let mut total_secs: u64 = 0;
+    let mut current_num = String::new();
+
+    for c in s.chars() {
+        if c.is_ascii_digit() {
+            current_num.push(c);
+        } else {
+            let num: u64 = current_num.parse().map_err(|_| {
+                MsError::Config(format!("Invalid number in duration: {}", current_num))
+            })?;
+            current_num.clear();
+
+            match c {
+                'h' => total_secs += num * 3600,
+                'm' => total_secs += num * 60,
+                's' => total_secs += num,
+                _ => {
+                    return Err(MsError::Config(format!(
+                        "Invalid duration unit '{}'. Use h, m, or s.",
+                        c
+                    )));
+                }
+            }
+        }
+    }
+
+    // Handle trailing number (e.g., "30" defaults to minutes)
+    if !current_num.is_empty() {
+        let num: u64 = current_num.parse().map_err(|_| {
+            MsError::Config(format!("Invalid number in duration: {}", current_num))
+        })?;
+        // If no unit specified, assume minutes for backwards compatibility
+        total_secs += num * 60;
+    }
+
+    if total_secs == 0 {
+        return Err(MsError::Config("Duration must be greater than zero".into()));
+    }
+
+    Ok(Duration::from_secs(total_secs))
+}
 
 #[derive(Args, Debug)]
 pub struct BuildArgs {
@@ -103,6 +435,14 @@ pub struct BuildArgs {
     /// Minimum confidence for automatic acceptance
     #[arg(long, default_value = "0.8")]
     pub min_confidence: f32,
+
+    /// Minimum number of sessions required (quality gate)
+    #[arg(long)]
+    pub min_sessions: Option<usize>,
+
+    /// Minimum number of patterns required (quality gate)
+    #[arg(long)]
+    pub min_patterns: Option<usize>,
 
     /// Fully automatic build (no prompts)
     #[arg(long)]
@@ -368,28 +708,60 @@ fn run_auto(ctx: &AppContext, args: &BuildArgs, cm_context: Option<&CmBuildConte
     // Ensure output directory exists
     fs::create_dir_all(&output_dir)?;
 
+    // Initialize BuildSession with quality gates
+    let gates = QualityGates {
+        min_session_quality: args.min_session_quality,
+        min_pattern_confidence: args.min_confidence,
+        min_sessions: args.min_sessions.unwrap_or(3),
+        min_patterns: args.min_patterns.unwrap_or(5),
+    };
+
+    let mut session = BuildSession::new(&query, gates);
+
+    // Configure duration limit if specified
+    if let Some(ref duration_str) = args.duration {
+        let duration = parse_duration(duration_str)?;
+        session = session.with_max_duration(duration);
+    }
+
+    // Configure checkpoint interval if specified
+    if let Some(ref interval_str) = args.checkpoint_interval {
+        let interval = parse_duration(interval_str)?;
+        session = session.with_checkpoint_interval(interval);
+    }
+
     if ctx.robot_mode {
         let output = json!({
             "status": "auto_build_started",
+            "session_id": session.session_id,
             "query": query,
             "sessions": args.sessions,
             "min_confidence": args.min_confidence,
+            "min_sessions": session.gates.min_sessions,
+            "min_patterns": session.gates.min_patterns,
+            "duration": args.duration,
             "output_dir": output_dir.display().to_string(),
             "cm_available": cm_context.is_some(),
         });
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
         println!("{}", "Starting automatic build...".bold());
+        println!("  Session: {}", session.session_id);
         println!("  Query: {}", query);
         println!("  Sessions: {}", args.sessions);
         println!("  Min confidence: {:.0}%", args.min_confidence * 100.0);
+        println!("  Min sessions: {}", session.gates.min_sessions);
+        println!("  Min patterns: {}", session.gates.min_patterns);
+        if let Some(ref d) = args.duration {
+            println!("  Duration limit: {}", d);
+        }
         println!("  Output: {}", output_dir.display());
         if let Some(cm_ctx) = cm_context {
             println!("  CM rules: {}", cm_ctx.seed_rules.len());
         }
     }
 
-    // Step 1: Create CASS client and quality scorer
+    // Create CASS client and quality scorer
     let cass_client = if let Some(ref cass_path) = ctx.config.cass.cass_path {
         CassClient::with_binary(cass_path)
     } else {
@@ -402,46 +774,65 @@ fn run_auto(ctx: &AppContext, args: &BuildArgs, cm_context: Option<&CmBuildConte
     };
     let quality_scorer = QualityScorer::new(quality_config.clone());
 
-    // Step 2: Search CASS for sessions
+    // =========================================================================
+    // Phase 1: Search CASS for sessions
+    // =========================================================================
     if !ctx.robot_mode {
-        println!("\n{} Searching CASS...", "Step 1:".cyan());
+        println!("\n{} Searching CASS...", "Phase 1:".cyan());
     }
 
-    let search_limit = args.sessions * 3; // Search more to account for quality filtering
+    // Check for timeout before starting phase
+    if session.is_timed_out() {
+        return output_timeout(ctx, &mut session, &output_dir);
+    }
+
+    let search_limit = args.sessions * 3;
     let session_matches = cass_client.search(&query, search_limit)?;
 
+    session.phase_progress = 1.0;
+    session.advance_phase(); // -> QualityFilter
+
     if session_matches.is_empty() {
-        if ctx.robot_mode {
-            let output = json!({
-                "status": "no_sessions",
-                "query": query,
-                "message": "No sessions found matching query"
-            });
-            println!("{}", serde_json::to_string_pretty(&output)?);
-        } else {
-            println!("{} No sessions found matching query: {}", "Error:".red(), query);
-        }
-        return Ok(());
+        return output_no_sessions(ctx, &session, &query);
     }
 
     if !ctx.robot_mode {
         println!("  Found {} potential sessions", session_matches.len());
     }
 
-    // Step 3: Score and filter sessions by quality
+    // Save checkpoint if interval elapsed
+    if session.should_checkpoint() {
+        session.save_checkpoint(&ctx.ms_root)?;
+        if !ctx.robot_mode {
+            println!("  {} Checkpoint saved", "📌".cyan());
+        }
+    }
+
+    // =========================================================================
+    // Phase 2: Quality filtering
+    // =========================================================================
     if !ctx.robot_mode {
-        println!("\n{} Quality filtering...", "Step 2:".cyan());
+        println!("\n{} Quality filtering...", "Phase 2:".cyan());
+    }
+
+    if session.is_timed_out() {
+        return output_timeout(ctx, &mut session, &output_dir);
     }
 
     let mut quality_sessions = Vec::new();
     let mut skipped_sessions = Vec::new();
+    let total_to_process = session_matches.len().min(search_limit);
 
-    for session_match in session_matches.into_iter().take(search_limit) {
+    for (i, session_match) in session_matches.into_iter().take(search_limit).enumerate() {
+        // Update phase progress
+        session.phase_progress = (i + 1) as f64 / total_to_process as f64;
+
         match cass_client.get_session(&session_match.session_id) {
-            Ok(session) => {
-                let quality = quality_scorer.score(&session);
+            Ok(cass_session) => {
+                let quality = quality_scorer.score(&cass_session);
                 if quality.passes_threshold(&quality_config) {
-                    quality_sessions.push((session, quality));
+                    quality_sessions.push((cass_session, quality));
+                    session.state.qualified_session_ids.push(session_match.session_id.clone());
                     if quality_sessions.len() >= args.sessions {
                         break;
                     }
@@ -455,32 +846,18 @@ fn run_auto(ctx: &AppContext, args: &BuildArgs, cm_context: Option<&CmBuildConte
                 }
             }
         }
+
+        // Check timeout during processing
+        if session.is_timed_out() {
+            return output_timeout(ctx, &mut session, &output_dir);
+        }
     }
 
+    session.phase_progress = 1.0;
+    session.advance_phase(); // -> ExtractPatterns
+
     if quality_sessions.is_empty() {
-        if ctx.robot_mode {
-            let output = json!({
-                "status": "no_quality_sessions",
-                "query": query,
-                "skipped": skipped_sessions.len(),
-                "min_quality": args.min_session_quality,
-                "message": "No sessions passed quality threshold"
-            });
-            println!("{}", serde_json::to_string_pretty(&output)?);
-        } else {
-            println!(
-                "{} No sessions passed quality threshold (min: {:.0}%)",
-                "Error:".red(),
-                args.min_session_quality * 100.0
-            );
-            if !skipped_sessions.is_empty() {
-                println!("  {} sessions were below threshold:", skipped_sessions.len());
-                for (id, score) in skipped_sessions.iter().take(5) {
-                    println!("    - {} ({:.0}%)", id, score * 100.0);
-                }
-            }
-        }
-        return Ok(());
+        return output_no_quality(ctx, &session, &query, &skipped_sessions, args.min_session_quality);
     }
 
     if !ctx.robot_mode {
@@ -489,62 +866,84 @@ fn run_auto(ctx: &AppContext, args: &BuildArgs, cm_context: Option<&CmBuildConte
             quality_sessions.len(),
             args.min_session_quality * 100.0
         );
-        for (session, quality) in &quality_sessions {
-            println!("    - {} ({:.0}%)", session.id, quality.score * 100.0);
+        for (s, q) in &quality_sessions {
+            println!("    - {} ({:.0}%)", s.id, q.score * 100.0);
         }
     }
 
-    // Step 4: Extract patterns from sessions
+    // Save checkpoint if interval elapsed
+    if session.should_checkpoint() {
+        session.save_checkpoint(&ctx.ms_root)?;
+        if !ctx.robot_mode {
+            println!("  {} Checkpoint saved", "📌".cyan());
+        }
+    }
+
+    // =========================================================================
+    // Phase 3: Extract patterns
+    // =========================================================================
     if !ctx.robot_mode {
-        println!("\n{} Extracting patterns...", "Step 3:".cyan());
+        println!("\n{} Extracting patterns...", "Phase 3:".cyan());
+    }
+
+    if session.is_timed_out() {
+        return output_timeout(ctx, &mut session, &output_dir);
     }
 
     let mut all_patterns: Vec<ExtractedPattern> = Vec::new();
+    let total_sessions = quality_sessions.len();
 
-    for (session, _quality) in &quality_sessions {
-        match extract_from_session(session) {
+    for (i, (cass_session, _quality)) in quality_sessions.iter().enumerate() {
+        session.phase_progress = (i + 1) as f64 / total_sessions as f64;
+
+        match extract_from_session(cass_session) {
             Ok(patterns) => {
                 if !ctx.robot_mode && !patterns.is_empty() {
-                    println!("  {} patterns from {}", patterns.len(), session.id);
+                    println!("  {} patterns from {}", patterns.len(), cass_session.id);
                 }
+                session.state.patterns_extracted += patterns.len();
                 all_patterns.extend(patterns);
             }
             Err(e) => {
                 if !ctx.robot_mode {
-                    eprintln!("  Warning: Failed to extract from {}: {}", session.id, e);
+                    eprintln!("  Warning: Failed to extract from {}: {}", cass_session.id, e);
                 }
             }
         }
+
+        if session.is_timed_out() {
+            return output_timeout(ctx, &mut session, &output_dir);
+        }
     }
 
+    session.phase_progress = 1.0;
+    session.advance_phase(); // -> FilterPatterns
+
     if all_patterns.is_empty() {
-        if ctx.robot_mode {
-            let output = json!({
-                "status": "no_patterns",
-                "query": query,
-                "sessions_processed": quality_sessions.len(),
-                "message": "No patterns extracted from sessions"
-            });
-            println!("{}", serde_json::to_string_pretty(&output)?);
-        } else {
-            println!("{} No patterns extracted from sessions", "Error:".red());
-        }
-        return Ok(());
+        return output_no_patterns(ctx, &session, &query, quality_sessions.len());
     }
 
     if !ctx.robot_mode {
         println!("  Total: {} patterns extracted", all_patterns.len());
     }
 
-    // Step 5: Filter patterns by confidence
+    // =========================================================================
+    // Phase 4: Filter patterns
+    // =========================================================================
     if !ctx.robot_mode {
-        println!("\n{} Filtering by confidence...", "Step 4:".cyan());
+        println!("\n{} Filtering by confidence...", "Phase 4:".cyan());
+    }
+
+    if session.is_timed_out() {
+        return output_timeout(ctx, &mut session, &output_dir);
     }
 
     let high_confidence_patterns: Vec<_> = all_patterns
         .into_iter()
         .filter(|p| p.confidence >= args.min_confidence)
         .collect();
+
+    session.phase_progress = 0.5;
 
     if !ctx.robot_mode {
         println!(
@@ -554,7 +953,7 @@ fn run_auto(ctx: &AppContext, args: &BuildArgs, cm_context: Option<&CmBuildConte
         );
     }
 
-    // Step 6: Filter out tainted patterns (unless --no-injection-filter)
+    // Filter out tainted patterns (unless --no-injection-filter)
     let pre_taint_count = high_confidence_patterns.len();
     let filtered_patterns: Vec<_> = if args.no_injection_filter {
         high_confidence_patterns
@@ -565,6 +964,10 @@ fn run_auto(ctx: &AppContext, args: &BuildArgs, cm_context: Option<&CmBuildConte
             .collect()
     };
 
+    session.state.patterns_filtered = filtered_patterns.len();
+    session.phase_progress = 1.0;
+    session.advance_phase(); // -> Synthesize
+
     if !ctx.robot_mode && filtered_patterns.len() < pre_taint_count {
         println!(
             "  {} patterns after taint filtering",
@@ -572,15 +975,28 @@ fn run_auto(ctx: &AppContext, args: &BuildArgs, cm_context: Option<&CmBuildConte
         );
     }
 
-    // Step 7: Output results
+    // Check quality gates before synthesis
+    if let Err(gate_error) = session.check_quality_gates() {
+        return output_gate_fail(ctx, &session, &gate_error);
+    }
+
+    // =========================================================================
+    // Phase 5: Synthesize (write outputs)
+    // =========================================================================
     if !ctx.robot_mode {
-        println!("\n{} Writing outputs...", "Step 5:".cyan());
+        println!("\n{} Writing outputs...", "Phase 5:".cyan());
+    }
+
+    if session.is_timed_out() {
+        return output_timeout(ctx, &mut session, &output_dir);
     }
 
     // Write patterns JSON
     let patterns_path = output_dir.join("patterns.json");
     let patterns_json = serde_json::to_string_pretty(&filtered_patterns)?;
     fs::write(&patterns_path, &patterns_json)?;
+
+    session.phase_progress = 0.5;
 
     if !ctx.robot_mode {
         println!("  Patterns: {}", patterns_path.display());
@@ -589,6 +1005,7 @@ fn run_auto(ctx: &AppContext, args: &BuildArgs, cm_context: Option<&CmBuildConte
     // Write build manifest
     let manifest = json!({
         "version": "1.0.0",
+        "session_id": session.session_id,
         "query": query,
         "build_type": "auto",
         "sessions_used": quality_sessions.iter().map(|(s, q)| json!({
@@ -596,8 +1013,12 @@ fn run_auto(ctx: &AppContext, args: &BuildArgs, cm_context: Option<&CmBuildConte
             "quality_score": q.score,
         })).collect::<Vec<_>>(),
         "patterns_extracted": filtered_patterns.len(),
-        "min_confidence": args.min_confidence,
-        "min_session_quality": args.min_session_quality,
+        "quality_gates": {
+            "min_confidence": args.min_confidence,
+            "min_session_quality": args.min_session_quality,
+            "min_sessions": session.gates.min_sessions,
+            "min_patterns": session.gates.min_patterns,
+        },
         "cm_context_used": cm_context.is_some(),
         "filters": {
             "redaction_enabled": !args.no_redact,
@@ -607,6 +1028,9 @@ fn run_auto(ctx: &AppContext, args: &BuildArgs, cm_context: Option<&CmBuildConte
     });
     let manifest_path = output_dir.join("build-manifest.json");
     fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?)?;
+
+    session.phase_progress = 1.0;
+    session.advance_phase(); // -> Complete
 
     if !ctx.robot_mode {
         println!("  Manifest: {}", manifest_path.display());
@@ -624,9 +1048,12 @@ fn run_auto(ctx: &AppContext, args: &BuildArgs, cm_context: Option<&CmBuildConte
     if ctx.robot_mode {
         let output = json!({
             "status": "complete",
+            "session_id": session.session_id,
             "query": query,
             "sessions_used": quality_sessions.len(),
             "patterns_extracted": filtered_patterns.len(),
+            "progress": session.overall_progress(),
+            "elapsed_ms": session.started_at.elapsed().as_millis(),
             "output_dir": output_dir.display().to_string(),
             "patterns_path": patterns_path.display().to_string(),
             "manifest_path": manifest_path.display().to_string(),
@@ -634,11 +1061,144 @@ fn run_auto(ctx: &AppContext, args: &BuildArgs, cm_context: Option<&CmBuildConte
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
         println!("\n{} Auto build complete!", "Success:".green());
+        println!("  Session: {}", session.session_id);
         println!("  Sessions processed: {}", quality_sessions.len());
         println!("  Patterns extracted: {}", filtered_patterns.len());
         println!("  Output directory: {}", output_dir.display());
     }
 
+    Ok(())
+}
+
+/// Output helper for timeout condition.
+fn output_timeout(
+    ctx: &AppContext,
+    session: &mut BuildSession,
+    _output_dir: &std::path::Path,
+) -> Result<()> {
+    // Save final checkpoint before exiting
+    session.save_checkpoint(&ctx.ms_root)?;
+
+    if ctx.robot_mode {
+        let output = json!({
+            "status": "timeout",
+            "session_id": session.session_id,
+            "phase": session.phase.to_string(),
+            "progress": session.overall_progress(),
+            "elapsed_ms": session.started_at.elapsed().as_millis(),
+            "checkpoint_saved": true,
+            "resume_command": format!("ms build --resume {}", session.session_id),
+        });
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        println!(
+            "\n{} Build timed out at phase: {}",
+            "Timeout:".yellow(),
+            session.phase
+        );
+        println!("  Progress: {:.0}%", session.overall_progress() * 100.0);
+        println!("  Checkpoint saved. Resume with:");
+        println!("    ms build --resume {}", session.session_id);
+    }
+    Ok(())
+}
+
+/// Output helper for no sessions found.
+fn output_no_sessions(ctx: &AppContext, session: &BuildSession, query: &str) -> Result<()> {
+    if ctx.robot_mode {
+        let output = json!({
+            "status": "no_sessions",
+            "session_id": session.session_id,
+            "query": query,
+            "message": "No sessions found matching query"
+        });
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        println!("{} No sessions found matching query: {}", "Error:".red(), query);
+    }
+    Ok(())
+}
+
+/// Output helper for no quality sessions.
+fn output_no_quality(
+    ctx: &AppContext,
+    session: &BuildSession,
+    query: &str,
+    skipped: &[(String, f32)],
+    min_quality: f32,
+) -> Result<()> {
+    if ctx.robot_mode {
+        let output = json!({
+            "status": "no_quality_sessions",
+            "session_id": session.session_id,
+            "query": query,
+            "skipped": skipped.len(),
+            "min_quality": min_quality,
+            "message": "No sessions passed quality threshold"
+        });
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        println!(
+            "{} No sessions passed quality threshold (min: {:.0}%)",
+            "Error:".red(),
+            min_quality * 100.0
+        );
+        if !skipped.is_empty() {
+            println!("  {} sessions were below threshold:", skipped.len());
+            for (id, score) in skipped.iter().take(5) {
+                println!("    - {} ({:.0}%)", id, score * 100.0);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Output helper for no patterns extracted.
+fn output_no_patterns(
+    ctx: &AppContext,
+    session: &BuildSession,
+    query: &str,
+    sessions_processed: usize,
+) -> Result<()> {
+    if ctx.robot_mode {
+        let output = json!({
+            "status": "no_patterns",
+            "session_id": session.session_id,
+            "query": query,
+            "sessions_processed": sessions_processed,
+            "message": "No patterns extracted from sessions"
+        });
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        println!("{} No patterns extracted from sessions", "Error:".red());
+    }
+    Ok(())
+}
+
+/// Output helper for quality gate failure.
+fn output_gate_fail(ctx: &AppContext, session: &BuildSession, error: &str) -> Result<()> {
+    if ctx.robot_mode {
+        let output = json!({
+            "status": "quality_gate_failed",
+            "session_id": session.session_id,
+            "error": error,
+            "gates": {
+                "min_sessions": session.gates.min_sessions,
+                "min_patterns": session.gates.min_patterns,
+                "actual_sessions": session.state.qualified_session_ids.len(),
+                "actual_patterns": session.state.patterns_filtered,
+            },
+        });
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        println!("{} Quality gate failed: {}", "Error:".red(), error);
+        println!("  Required: {} sessions, {} patterns",
+            session.gates.min_sessions,
+            session.gates.min_patterns);
+        println!("  Actual: {} sessions, {} patterns",
+            session.state.qualified_session_ids.len(),
+            session.state.patterns_filtered);
+    }
     Ok(())
 }
 
