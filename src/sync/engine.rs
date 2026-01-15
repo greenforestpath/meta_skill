@@ -13,7 +13,7 @@ use crate::error::{MsError, Result};
 use crate::storage::{Database, GitArchive, TxManager};
 
 use super::SyncConfig;
-use super::config::{ConflictStrategy, RemoteAuth, RemoteConfig, RemoteType};
+use super::config::{ConflictStrategy, RemoteAuth, RemoteConfig, RemoteType, validate_remote_name};
 use super::machine::MachineIdentity;
 use super::state::{SkillSyncState, SkillSyncStatus, SyncState};
 
@@ -111,6 +111,7 @@ impl SyncEngine {
     }
 
     pub fn sync_remote(&mut self, remote_name: &str, options: &SyncOptions) -> Result<SyncReport> {
+        validate_remote_name(remote_name)?;
         let Some(remote) = self
             .config
             .remotes
@@ -173,6 +174,12 @@ impl SyncEngine {
     ) -> Result<()> {
         let allow_push = remote.direction.allows_push() && !options.pull_only;
         let allow_pull = remote.direction.allows_pull() && !options.push_only;
+        let git_auth = if remote.remote_type == RemoteType::Git {
+            Some(resolve_auth(remote)?)
+        } else {
+            None
+        };
+        let mut needs_git_push = false;
 
         let local_map = self.snapshot_archive(self.git.as_ref())?;
         let remote_map = self.snapshot_archive(remote_git)?;
@@ -214,6 +221,9 @@ impl SyncEngine {
                         if !options.dry_run {
                             let spec = self.git.read_skill(&id)?;
                             remote_git.write_skill(&spec)?;
+                            if remote.remote_type == RemoteType::Git {
+                                needs_git_push = true;
+                            }
                         }
                         report.pushed.push(id.clone());
                         final_status = SkillSyncStatus::Synced;
@@ -252,6 +262,8 @@ impl SyncEngine {
                             &tx_mgr,
                             report,
                             strategy,
+                            remote.remote_type == RemoteType::Git,
+                            &mut needs_git_push,
                         )?;
                         if final_status == SkillSyncStatus::Synced {
                             report.resolved.push(id.clone());
@@ -290,6 +302,12 @@ impl SyncEngine {
             self.state.skill_states.insert(id, state_entry);
         }
 
+        if needs_git_push && !options.dry_run {
+            if let Some(auth) = git_auth.as_ref() {
+                push_git_repo(remote_git.repo(), &remote.url, remote.branch.as_deref(), auth)?;
+            }
+        }
+
         Ok(())
     }
 
@@ -317,6 +335,8 @@ impl SyncEngine {
         tx_mgr: &TxManager,
         report: &mut SyncReport,
         strategy: ConflictStrategy,
+        remote_is_git: bool,
+        needs_git_push: &mut bool,
     ) -> Result<SkillSyncStatus> {
         match strategy {
             ConflictStrategy::PreferLocal => {
@@ -324,6 +344,9 @@ impl SyncEngine {
                     if !options.dry_run {
                         let spec = self.git.read_skill(id)?;
                         remote_git.write_skill(&spec)?;
+                        if remote_is_git {
+                            *needs_git_push = true;
+                        }
                     }
                     report.pushed.push(id.to_string());
                     Ok(SkillSyncStatus::Synced)
@@ -360,6 +383,8 @@ impl SyncEngine {
                         tx_mgr,
                         report,
                         ConflictStrategy::PreferLocal,
+                        remote_is_git,
+                        needs_git_push,
                     )
                 } else {
                     self.apply_conflict_strategy(
@@ -373,21 +398,35 @@ impl SyncEngine {
                         tx_mgr,
                         report,
                         ConflictStrategy::PreferRemote,
+                        remote_is_git,
+                        needs_git_push,
                     )
                 }
             }
             ConflictStrategy::KeepBoth => {
-                if allow_pull {
+                if !allow_pull {
+                    report.conflicts.push(id.to_string());
+                    return Ok(SkillSyncStatus::Conflict);
+                }
+
+                let fork_id = unique_fork_id(&self.git, id)?;
+                if !options.dry_run {
+                    let mut spec = remote_git.read_skill(id)?;
+                    spec.metadata.id = fork_id.clone();
+                    spec.metadata.name = format!("{} (remote)", spec.metadata.name);
+                    tx_mgr.write_skill_locked(&spec)?;
+                }
+                report.forked.push(fork_id);
+
+                if allow_push {
                     if !options.dry_run {
-                        let mut spec = remote_git.read_skill(id)?;
-                        let fork_id = format!("{}-remote", id);
-                        spec.metadata.id = fork_id.clone();
-                        spec.metadata.name = format!("{} (remote)", spec.metadata.name);
-                        tx_mgr.write_skill_locked(&spec)?;
-                        report.forked.push(fork_id);
-                    } else {
-                        report.forked.push(format!("{}-remote", id));
+                        let spec = self.git.read_skill(id)?;
+                        remote_git.write_skill(&spec)?;
+                        if remote_is_git {
+                            *needs_git_push = true;
+                        }
                     }
+                    report.pushed.push(id.to_string());
                     Ok(SkillSyncStatus::Synced)
                 } else {
                     report.conflicts.push(id.to_string());
@@ -410,6 +449,23 @@ impl SyncEngine {
     }
 }
 
+fn unique_fork_id(archive: &GitArchive, id: &str) -> Result<String> {
+    let base = format!("{}-remote", id);
+    if !archive.skill_exists(&base) {
+        return Ok(base);
+    }
+    for suffix in 2..=1000 {
+        let candidate = format!("{}-remote-{}", id, suffix);
+        if !archive.skill_exists(&candidate) {
+            return Ok(candidate);
+        }
+    }
+    Err(MsError::Config(format!(
+        "unable to allocate fork id for {}",
+        id
+    )))
+}
+
 fn resolve_archive_root(path: &Path) -> Result<PathBuf> {
     if path.join("skills").join("by-id").exists() {
         return Ok(path.to_path_buf());
@@ -429,6 +485,14 @@ fn skill_modified_time(archive: &GitArchive, id: &str) -> Result<DateTime<Utc>> 
         .skill_path(id)
         .ok_or_else(|| MsError::ValidationFailed("invalid skill id".to_string()))?;
     let spec_path = skill_path.join("skill.spec.json");
+    let repo_root = archive
+        .repo()
+        .workdir()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| archive.root().to_path_buf());
+    if let Ok(Some(committed)) = git_last_modified_time(archive.repo(), &repo_root, &spec_path) {
+        return Ok(committed);
+    }
     let metadata = std::fs::metadata(&spec_path)?;
     let modified = metadata.modified()?;
     Ok(DateTime::<Utc>::from(modified))
@@ -441,10 +505,63 @@ fn hash_skill_spec(spec: &SkillSpec) -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+fn git_last_modified_time(
+    repo: &Repository,
+    repo_root: &Path,
+    file_path: &Path,
+) -> Result<Option<DateTime<Utc>>> {
+    let rel = match file_path.strip_prefix(repo_root) {
+        Ok(path) => path.to_path_buf(),
+        Err(_) => return Ok(None),
+    };
+
+    let mut revwalk = match repo.revwalk() {
+        Ok(walk) => walk,
+        Err(_) => return Ok(None),
+    };
+    if revwalk.push_head().is_err() {
+        return Ok(None);
+    }
+    revwalk.set_sorting(git2::Sort::TIME).map_err(MsError::Git)?;
+
+    for oid in revwalk {
+        let oid = oid.map_err(MsError::Git)?;
+        let commit = repo.find_commit(oid).map_err(MsError::Git)?;
+        let tree = commit.tree().map_err(MsError::Git)?;
+        let entry = match tree.get_path(&rel) {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+
+        if let Ok(parent) = commit.parent(0) {
+            if let Ok(parent_tree) = parent.tree() {
+                if let Ok(parent_entry) = parent_tree.get_path(&rel) {
+                    if parent_entry.id() == entry.id() {
+                        continue;
+                    }
+                }
+            }
+        }
+
+        let seconds = commit.time().seconds();
+        let Some(dt) = DateTime::from_timestamp(seconds, 0) else {
+            continue;
+        };
+        return Ok(Some(dt));
+    }
+
+    Ok(None)
+}
+
 fn open_git_remote(remote: &RemoteConfig, ms_root: &Path) -> Result<GitArchive> {
+    validate_remote_name(&remote.name)?;
     let cache_root = ms_root.join("sync").join("remotes").join(&remote.name);
     let auth = resolve_auth(remote)?;
     if !cache_root.exists() {
+        if let Some(parent) = cache_root.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|err| MsError::Config(format!("create git cache dir: {err}")))?;
+        }
         clone_remote(remote, &cache_root, &auth)?;
     }
 
@@ -457,7 +574,7 @@ fn open_git_remote(remote: &RemoteConfig, ms_root: &Path) -> Result<GitArchive> 
 }
 
 fn clone_remote(remote: &RemoteConfig, path: &Path, auth: &ResolvedAuth) -> Result<()> {
-    let mut callbacks = build_callbacks(auth)?;
+    let callbacks = build_callbacks(auth)?;
     let mut fetch = git2::FetchOptions::new();
     fetch.remote_callbacks(callbacks);
 
@@ -529,9 +646,10 @@ fn sync_git_repo(
     Ok(())
 }
 
-fn fetch_git_repo(
+fn push_git_repo(
     repo: &Repository,
     remote_url: &str,
+    branch_override: Option<&str>,
     auth: &ResolvedAuth,
 ) -> Result<()> {
     let callbacks = build_callbacks(auth)?;
@@ -540,13 +658,15 @@ fn fetch_git_repo(
         .or_else(|_| repo.remote_anonymous(remote_url))
         .map_err(MsError::Git)?;
 
-    let mut fetch = git2::FetchOptions::new();
-    fetch.remote_callbacks(callbacks);
+    let branch = resolve_branch_name(repo, branch_override)?;
+    let refspec = format!("refs/heads/{0}:refs/heads/{0}", branch);
+
+    let mut push_options = git2::PushOptions::new();
+    push_options.remote_callbacks(callbacks);
 
     remote
-        .fetch(&["refs/heads/*:refs/remotes/origin/*"], Some(&mut fetch), None)
+        .push(&[refspec], Some(&mut push_options))
         .map_err(MsError::Git)?;
-
     Ok(())
 }
 

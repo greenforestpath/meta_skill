@@ -3,8 +3,10 @@
 //! Handles execution of individual test steps defined in test YAML files.
 
 use std::collections::HashMap;
+use std::io::{Read, Write};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use crate::app::AppContext;
 use crate::error::{MsError, Result};
@@ -144,6 +146,7 @@ fn execute_run(
 ) -> Result<()> {
     let cmd = ctx.expand(&step.cmd);
     let cwd = step.cwd.as_ref().map(|c| ctx.expand(c));
+    let stdin = step.stdin.as_ref().map(|s| ctx.expand(s));
 
     if verbose {
         println!("[STEP] run: {}", cmd);
@@ -171,16 +174,85 @@ fn execute_run(
         command.env(key, ctx.expand(value));
     }
 
-    let _timeout = step.timeout.unwrap_or(std::time::Duration::from_secs(30));
+    let timeout = step.timeout.unwrap_or(Duration::from_secs(30));
 
-    // Execute with timeout
-    let output = command
-        .output()
+    if stdin.is_some() {
+        command.stdin(Stdio::piped());
+    }
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    let mut child = command
+        .spawn()
         .map_err(|err| MsError::Config(format!("failed to execute command '{}': {err}", cmd)))?;
 
-    ctx.last_stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    ctx.last_stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    ctx.last_exit_code = output.status.code();
+    if let Some(input) = stdin {
+        if let Some(mut child_stdin) = child.stdin.take() {
+            child_stdin.write_all(input.as_bytes()).map_err(|err| {
+                MsError::Config(format!("failed to write stdin for '{}': {err}", cmd))
+            })?;
+        }
+    }
+
+    let stdout = child.stdout.take().ok_or_else(|| {
+        MsError::Config(format!("failed to capture stdout for '{}'", cmd))
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| {
+        MsError::Config(format!("failed to capture stderr for '{}'", cmd))
+    })?;
+
+    let stdout_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let mut reader = stdout;
+        reader.read_to_end(&mut buf).map(|_| buf)
+    });
+    let stderr_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let mut reader = stderr;
+        reader.read_to_end(&mut buf).map(|_| buf)
+    });
+
+    let start = Instant::now();
+    let mut timed_out = false;
+    let exit_status;
+
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                exit_status = Some(status);
+                break;
+            }
+            Ok(None) => {
+                if start.elapsed() > timeout {
+                    timed_out = true;
+                    let _ = child.kill();
+                    exit_status = Some(child.wait().map_err(|err| {
+                        MsError::Config(format!("failed to wait for '{}': {err}", cmd))
+                    })?);
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(err) => {
+                return Err(MsError::Config(format!(
+                    "failed to wait for command '{}': {err}",
+                    cmd
+                )));
+            }
+        }
+    }
+
+    let stdout_bytes = stdout_handle
+        .join()
+        .map_err(|_| MsError::Config(format!("stdout capture panicked for '{cmd}'")))?
+        .map_err(|err| MsError::Config(format!("read stdout for '{cmd}': {err}")))?;
+    let stderr_bytes = stderr_handle
+        .join()
+        .map_err(|_| MsError::Config(format!("stderr capture panicked for '{cmd}'")))?
+        .map_err(|err| MsError::Config(format!("read stderr for '{cmd}': {err}")))?;
+
+    ctx.last_stdout = String::from_utf8_lossy(&stdout_bytes).to_string();
+    ctx.last_stderr = String::from_utf8_lossy(&stderr_bytes).to_string();
+    ctx.last_exit_code = exit_status.and_then(|status| status.code());
 
     if verbose {
         if !ctx.last_stdout.is_empty() {
@@ -190,6 +262,13 @@ fn execute_run(
             println!("[STEP]   stderr: {}", ctx.last_stderr.trim());
         }
         println!("[STEP]   exit: {:?}", ctx.last_exit_code);
+    }
+
+    if timed_out {
+        return Err(MsError::ValidationFailed(format!(
+            "command timed out after {:?}: {}",
+            timeout, cmd
+        )));
     }
 
     Ok(())
