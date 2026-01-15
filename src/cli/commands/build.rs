@@ -2623,6 +2623,37 @@ mod tests {
     }
 
     #[test]
+    fn test_build_completion_markdown_partial_data_no_coverage() {
+        // Test that partial data (success with no test counts or coverage) works correctly
+        let completion = BuildCompletion::success(5.5);
+        let md = completion.to_markdown();
+        assert!(md.contains("Build Succeeded"));
+        assert!(md.contains("**Duration:** 5.5s"));
+        // Should NOT contain test or coverage info when not provided
+        assert!(!md.contains("Tests:"));
+        assert!(!md.contains("Coverage:"));
+        assert!(!md.contains("Error Summary"));
+    }
+
+    #[test]
+    fn test_build_completion_markdown_partial_tests_no_coverage() {
+        // Test with test counts but no coverage
+        let completion = BuildCompletion {
+            duration_secs: 8.0,
+            success: true,
+            tests_passed: Some(5),
+            tests_failed: Some(0),
+            tests_skipped: Some(1),
+            coverage_percent: None, // No coverage available
+            error_summary: None,
+        };
+        let md = completion.to_markdown();
+        assert!(md.contains("Build Succeeded"));
+        assert!(md.contains("5 passed, 0 failed, 1 skipped"));
+        assert!(!md.contains("Coverage:"));
+    }
+
+    #[test]
     fn test_build_phase_serialization() {
         // Test all phases serialize and deserialize correctly
         let phases = [
