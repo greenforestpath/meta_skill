@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use chrono::{DateTime, Utc};
-use git2::{Repository, build::CheckoutBuilder};
+use git2::{build::CheckoutBuilder, Cred, RemoteCallbacks, Repository};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -13,7 +13,7 @@ use crate::error::{MsError, Result};
 use crate::storage::{Database, GitArchive, TxManager};
 
 use super::SyncConfig;
-use super::config::{ConflictStrategy, RemoteConfig, RemoteType};
+use super::config::{ConflictStrategy, RemoteAuth, RemoteConfig, RemoteType};
 use super::machine::MachineIdentity;
 use super::state::{SkillSyncState, SkillSyncStatus, SyncState};
 
@@ -438,34 +438,60 @@ fn hash_skill_spec(spec: &SkillSpec) -> Result<String> {
 
 fn open_git_remote(remote: &RemoteConfig, ms_root: &Path) -> Result<GitArchive> {
     let cache_root = ms_root.join("sync").join("remotes").join(&remote.name);
+    let auth = resolve_auth(remote)?;
     if !cache_root.exists() {
-        Repository::clone(&remote.url, &cache_root).map_err(MsError::Git)?;
+        clone_remote(remote, &cache_root, &auth)?;
     }
 
     let repo = Repository::open(&cache_root).map_err(MsError::Git)?;
-    sync_git_repo(&repo, &remote.url)?;
+    ensure_origin_url(&repo, &remote.url)?;
+    sync_git_repo(&repo, &remote.url, remote.branch.as_deref(), &auth)?;
 
     let archive_root = resolve_archive_root(&cache_root)?;
     GitArchive::open(archive_root)
 }
 
-fn sync_git_repo(repo: &Repository, remote_url: &str) -> Result<()> {
+fn clone_remote(remote: &RemoteConfig, path: &Path, auth: &ResolvedAuth) -> Result<()> {
+    let mut callbacks = build_callbacks(auth)?;
+    let mut fetch = git2::FetchOptions::new();
+    fetch.remote_callbacks(callbacks);
+
+    let mut builder = git2::build::RepoBuilder::new();
+    builder.fetch_options(fetch);
+    if let Some(branch) = remote.branch.as_deref() {
+        builder.branch(branch);
+    }
+    builder.clone(&remote.url, path).map_err(MsError::Git)?;
+    Ok(())
+}
+
+fn sync_git_repo(
+    repo: &Repository,
+    remote_url: &str,
+    auth: Option<&RemoteAuth>,
+) -> Result<()> {
+    let callbacks = build_callbacks(auth)?;
     let mut remote = repo
         .find_remote("origin")
         .or_else(|_| repo.remote_anonymous(remote_url))
         .map_err(MsError::Git)?;
+
+    let mut fetch = git2::FetchOptions::new();
+    fetch.remote_callbacks(callbacks);
+
     remote
-        .fetch(&["refs/heads/*:refs/remotes/origin/*"], None, None)
+        .fetch(&["refs/heads/*:refs/remotes/origin/*"], Some(&mut fetch), None)
         .map_err(MsError::Git)?;
 
-    let head = repo.head().map_err(MsError::Git)?;
-    let branch = head.shorthand().unwrap_or("main");
+    let branch = resolve_branch_name(repo, None)?;
     let remote_ref = format!("refs/remotes/origin/{}", branch);
-    let Ok(remote_ref) = repo.find_reference(&remote_ref) else {
-        return Ok(());
-    };
+    let remote_ref = repo
+        .find_reference(&remote_ref)
+        .map_err(|_| MsError::Config(format!("remote branch not found: {branch}")))?;
     let Some(target) = remote_ref.target() else {
-        return Ok(());
+        return Err(MsError::Config(format!(
+            "remote branch has no target: {branch}"
+        )));
     };
 
     let analysis = repo.merge_analysis(&[&repo
@@ -495,4 +521,126 @@ fn sync_git_repo(repo: &Repository, remote_url: &str) -> Result<()> {
     repo.checkout_head(Some(CheckoutBuilder::new().force()))
         .map_err(MsError::Git)?;
     Ok(())
+}
+
+fn fetch_git_repo(
+    repo: &Repository,
+    remote_url: &str,
+    auth: Option<&RemoteAuth>,
+) -> Result<()> {
+    let callbacks = build_callbacks(auth)?;
+    let mut remote = repo
+        .find_remote("origin")
+        .or_else(|_| repo.remote_anonymous(remote_url))
+        .map_err(MsError::Git)?;
+
+    let mut fetch = git2::FetchOptions::new();
+    fetch.remote_callbacks(callbacks);
+
+    remote
+        .fetch(&["refs/heads/*:refs/remotes/origin/*"], Some(&mut fetch), None)
+        .map_err(MsError::Git)?;
+
+    Ok(())
+}
+
+fn ensure_origin_url(repo: &Repository, url: &str) -> Result<()> {
+    match repo.find_remote("origin") {
+        Ok(remote) => {
+            if remote.url() != Some(url) {
+                repo.remote_set_url("origin", url).map_err(MsError::Git)?;
+            }
+        }
+        Err(_) => {
+            repo.remote("origin", url).map_err(MsError::Git)?;
+        }
+    }
+    Ok(())
+}
+
+fn resolve_branch_name(repo: &Repository, branch_override: Option<&str>) -> Result<String> {
+    if let Some(branch) = branch_override {
+        return Ok(branch.to_string());
+    }
+    let head = repo.head().map_err(MsError::Git)?;
+    Ok(head.shorthand().unwrap_or("main").to_string())
+}
+
+#[derive(Debug, Clone)]
+enum ResolvedAuth {
+    Default,
+    Token { token: String, username: Option<String> },
+    SshKey {
+        key_path: PathBuf,
+        public_key: Option<PathBuf>,
+        passphrase: Option<String>,
+        username: Option<String>,
+    },
+}
+
+fn resolve_auth(remote: &RemoteConfig) -> Result<ResolvedAuth> {
+    match remote.auth.as_ref() {
+        None => Ok(ResolvedAuth::Default),
+        Some(RemoteAuth::Token { token_env, username }) => {
+            let token = std::env::var(token_env).map_err(|_| {
+                MsError::Config(format!("missing token env var: {token_env}"))
+            })?;
+            Ok(ResolvedAuth::Token {
+                token,
+                username: username.clone(),
+            })
+        }
+        Some(RemoteAuth::SshKey {
+            key_path,
+            public_key,
+            passphrase_env,
+        }) => {
+            let passphrase = match passphrase_env {
+                Some(env) => Some(
+                    std::env::var(env)
+                        .map_err(|_| MsError::Config(format!("missing passphrase env var: {env}")))?,
+                ),
+                None => None,
+            };
+            Ok(ResolvedAuth::SshKey {
+                key_path: key_path.clone(),
+                public_key: public_key.clone(),
+                passphrase,
+                username: None,
+            })
+        }
+    }
+}
+
+fn build_callbacks(auth: &ResolvedAuth) -> Result<RemoteCallbacks<'static>> {
+    let auth = auth.clone();
+    let mut callbacks = RemoteCallbacks::new();
+    callbacks.credentials(move |_url, username_from_url, _allowed| match &auth {
+        ResolvedAuth::Default => Cred::default(),
+        ResolvedAuth::Token { token, username } => {
+            let user = username
+                .as_deref()
+                .or(username_from_url)
+                .unwrap_or("x-access-token");
+            Cred::userpass_plaintext(user, token)
+        }
+        ResolvedAuth::SshKey {
+            key_path,
+            public_key,
+            passphrase,
+            username,
+        } => {
+            let user = username
+                .as_deref()
+                .or(username_from_url)
+                .unwrap_or("git");
+            Cred::ssh_key(
+                user,
+                public_key.as_deref(),
+                key_path.as_path(),
+                passphrase.as_deref(),
+            )
+        }
+    });
+    Ok(callbacks)
 }

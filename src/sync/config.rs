@@ -27,6 +27,23 @@ pub enum RemoteType {
     Git,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case", tag = "kind")]
+pub enum RemoteAuth {
+    SshKey {
+        key_path: PathBuf,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        public_key: Option<PathBuf>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        passphrase_env: Option<String>,
+    },
+    Token {
+        token_env: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        username: Option<String>,
+    },
+}
+
 impl RemoteType {
     pub fn from_str(value: &str) -> Result<Self> {
         match value {
@@ -130,6 +147,10 @@ pub struct RemoteConfig {
     #[serde(rename = "type")]
     pub remote_type: RemoteType,
     pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<RemoteAuth>,
     #[serde(default = "default_remote_enabled")]
     pub enabled: bool,
     #[serde(default)]
@@ -152,6 +173,8 @@ impl RemoteConfig {
             name: name.into(),
             remote_type,
             url: url.into(),
+            branch: None,
+            auth: None,
             enabled: true,
             direction: SyncDirection::default(),
             auto_sync: false,
@@ -268,6 +291,8 @@ mod tests {
             name: "origin".to_string(),
             remote_type: RemoteType::FileSystem,
             url: "/tmp/skills".to_string(),
+            branch: None,
+            auth: None,
             enabled: true,
             direction: SyncDirection::PullOnly,
             auto_sync: false,
