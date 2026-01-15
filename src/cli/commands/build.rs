@@ -1814,3 +1814,450 @@ fn format_uncertainty_reason(reason: &crate::cass::UncertaintyReason) -> String 
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // =========================================================================
+    // BuildPhase Tests
+    // =========================================================================
+
+    #[test]
+    fn test_build_phase_transitions() {
+        // Test the phase transition chain
+        assert_eq!(BuildPhase::SearchSessions.next(), Some(BuildPhase::QualityFilter));
+        assert_eq!(BuildPhase::QualityFilter.next(), Some(BuildPhase::ExtractPatterns));
+        assert_eq!(BuildPhase::ExtractPatterns.next(), Some(BuildPhase::FilterPatterns));
+        assert_eq!(BuildPhase::FilterPatterns.next(), Some(BuildPhase::Synthesize));
+        assert_eq!(BuildPhase::Synthesize.next(), Some(BuildPhase::Complete));
+
+        // Terminal states have no next phase
+        assert_eq!(BuildPhase::Complete.next(), None);
+        assert_eq!(BuildPhase::Failed.next(), None);
+    }
+
+    #[test]
+    fn test_build_phase_weights_sum_to_one() {
+        let phases = [
+            BuildPhase::SearchSessions,
+            BuildPhase::QualityFilter,
+            BuildPhase::ExtractPatterns,
+            BuildPhase::FilterPatterns,
+            BuildPhase::Synthesize,
+        ];
+
+        let total_weight: f64 = phases.iter().map(|p| p.weight()).sum();
+        assert!((total_weight - 1.0).abs() < 0.001, "Phase weights should sum to 1.0");
+    }
+
+    #[test]
+    fn test_build_phase_cumulative_weights() {
+        // Verify cumulative weights are correct
+        assert_eq!(BuildPhase::SearchSessions.cumulative_weight(), 0.0);
+        assert!((BuildPhase::QualityFilter.cumulative_weight() - 0.15).abs() < 0.001);
+        assert!((BuildPhase::ExtractPatterns.cumulative_weight() - 0.30).abs() < 0.001);
+        assert!((BuildPhase::FilterPatterns.cumulative_weight() - 0.60).abs() < 0.001);
+        assert!((BuildPhase::Synthesize.cumulative_weight() - 0.75).abs() < 0.001);
+        assert!((BuildPhase::Complete.cumulative_weight() - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_build_phase_display() {
+        assert_eq!(format!("{}", BuildPhase::SearchSessions), "search_sessions");
+        assert_eq!(format!("{}", BuildPhase::QualityFilter), "quality_filter");
+        assert_eq!(format!("{}", BuildPhase::ExtractPatterns), "extract_patterns");
+        assert_eq!(format!("{}", BuildPhase::FilterPatterns), "filter_patterns");
+        assert_eq!(format!("{}", BuildPhase::Synthesize), "synthesize");
+        assert_eq!(format!("{}", BuildPhase::Complete), "complete");
+        assert_eq!(format!("{}", BuildPhase::Failed), "failed");
+    }
+
+    // =========================================================================
+    // QualityGates Tests
+    // =========================================================================
+
+    #[test]
+    fn test_quality_gates_defaults() {
+        let gates = QualityGates::default();
+        assert!((gates.min_session_quality - 0.6).abs() < 0.001);
+        assert!((gates.min_pattern_confidence - 0.8).abs() < 0.001);
+        assert_eq!(gates.min_sessions, 3);
+        assert_eq!(gates.min_patterns, 5);
+    }
+
+    // =========================================================================
+    // BuildSession Tests
+    // =========================================================================
+
+    #[test]
+    fn test_build_session_new() {
+        let session = BuildSession::new("test query", QualityGates::default());
+
+        assert!(session.session_id.starts_with("build-"));
+        assert_eq!(session.phase, BuildPhase::SearchSessions);
+        assert_eq!(session.phase_progress, 0.0);
+        assert!(session.state.qualified_session_ids.is_empty());
+        assert_eq!(session.state.patterns_extracted, 0);
+        assert_eq!(session.state.patterns_filtered, 0);
+    }
+
+    #[test]
+    fn test_build_session_overall_progress() {
+        let mut session = BuildSession::new("test", QualityGates::default());
+
+        // Initial progress is 0
+        assert_eq!(session.overall_progress(), 0.0);
+
+        // At 50% of first phase (SearchSessions, weight 0.15)
+        session.phase_progress = 0.5;
+        let expected = 0.0 + (0.15 * 0.5); // 0.075
+        assert!((session.overall_progress() - expected).abs() < 0.001);
+
+        // Advance to next phase
+        session.advance_phase();
+        assert_eq!(session.phase, BuildPhase::QualityFilter);
+        assert_eq!(session.phase_progress, 0.0);
+
+        // At start of QualityFilter, cumulative is 0.15
+        assert!((session.overall_progress() - 0.15).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_build_session_advance_phase() {
+        let mut session = BuildSession::new("test", QualityGates::default());
+        session.phase_progress = 0.8; // Some progress in current phase
+
+        session.advance_phase();
+
+        assert_eq!(session.phase, BuildPhase::QualityFilter);
+        assert_eq!(session.phase_progress, 0.0); // Reset on advance
+    }
+
+    #[test]
+    fn test_build_session_fail() {
+        let mut session = BuildSession::new("test", QualityGates::default());
+        session.phase = BuildPhase::ExtractPatterns;
+
+        session.fail();
+
+        assert_eq!(session.phase, BuildPhase::Failed);
+    }
+
+    #[test]
+    fn test_build_session_timeout() {
+        let session = BuildSession::new("test", QualityGates::default());
+
+        // No duration set, never times out
+        assert!(!session.is_timed_out());
+
+        // With duration set
+        let session_with_timeout = session.with_max_duration(Duration::from_millis(1));
+        // Sleep briefly to ensure timeout
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(session_with_timeout.is_timed_out());
+    }
+
+    #[test]
+    fn test_build_session_quality_gates() {
+        let mut session = BuildSession::new("test", QualityGates::default());
+
+        // Initially fails quality gates (not enough sessions or patterns)
+        assert!(session.check_quality_gates().is_err());
+
+        // Add enough sessions
+        session.state.qualified_session_ids = vec![
+            "s1".to_string(),
+            "s2".to_string(),
+            "s3".to_string(),
+        ];
+        // Still fails (not enough patterns)
+        assert!(session.check_quality_gates().is_err());
+
+        // Add enough patterns
+        session.state.patterns_filtered = 5;
+        assert!(session.check_quality_gates().is_ok());
+    }
+
+    #[test]
+    fn test_build_session_remaining_time() {
+        let session = BuildSession::new("test", QualityGates::default());
+
+        // No duration set
+        assert!(session.remaining_time().is_none());
+
+        // With duration
+        let session_with_duration = session.with_max_duration(Duration::from_secs(60));
+        let remaining = session_with_duration.remaining_time().unwrap();
+        assert!(remaining <= Duration::from_secs(60));
+    }
+
+    // =========================================================================
+    // parse_duration Tests
+    // =========================================================================
+
+    #[test]
+    fn test_parse_duration_hours() {
+        let dur = parse_duration("4h").unwrap();
+        assert_eq!(dur, Duration::from_secs(4 * 3600));
+    }
+
+    #[test]
+    fn test_parse_duration_minutes() {
+        let dur = parse_duration("30m").unwrap();
+        assert_eq!(dur, Duration::from_secs(30 * 60));
+    }
+
+    #[test]
+    fn test_parse_duration_seconds() {
+        let dur = parse_duration("45s").unwrap();
+        assert_eq!(dur, Duration::from_secs(45));
+    }
+
+    #[test]
+    fn test_parse_duration_combined() {
+        let dur = parse_duration("2h30m").unwrap();
+        assert_eq!(dur, Duration::from_secs(2 * 3600 + 30 * 60));
+
+        let dur = parse_duration("1h15m30s").unwrap();
+        assert_eq!(dur, Duration::from_secs(3600 + 15 * 60 + 30));
+    }
+
+    #[test]
+    fn test_parse_duration_bare_number_defaults_to_minutes() {
+        let dur = parse_duration("30").unwrap();
+        assert_eq!(dur, Duration::from_secs(30 * 60));
+    }
+
+    #[test]
+    fn test_parse_duration_empty_fails() {
+        assert!(parse_duration("").is_err());
+    }
+
+    #[test]
+    fn test_parse_duration_zero_fails() {
+        assert!(parse_duration("0h").is_err());
+        assert!(parse_duration("0m").is_err());
+    }
+
+    #[test]
+    fn test_parse_duration_invalid_unit_fails() {
+        assert!(parse_duration("5d").is_err()); // Days not supported
+        assert!(parse_duration("5x").is_err());
+    }
+
+    #[test]
+    fn test_parse_duration_case_insensitive() {
+        let dur_lower = parse_duration("2h30m").unwrap();
+        let dur_upper = parse_duration("2H30M").unwrap();
+        assert_eq!(dur_lower, dur_upper);
+    }
+
+    // =========================================================================
+    // Checkpoint Integration Tests (Crash + Resume Simulation)
+    // =========================================================================
+
+    #[test]
+    fn test_build_session_checkpoint_save_and_load() {
+        use crate::core::recovery::Checkpoint;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let ms_root = temp_dir.path();
+
+        // Create a build session and advance through phases
+        let mut session = BuildSession::new("test-checkpoint", QualityGates::default());
+        session.state.qualified_session_ids = vec!["sess-1".to_string(), "sess-2".to_string()];
+        session.state.patterns_extracted = 42;
+        session.state.patterns_filtered = 35;
+        session.advance_phase(); // -> QualityFilter
+        session.phase_progress = 0.75;
+
+        // Save checkpoint
+        session.save_checkpoint(ms_root).unwrap();
+
+        // Verify checkpoint exists
+        let checkpoint_path = ms_root.join("checkpoints").join(format!("{}.json", session.session_id));
+        assert!(checkpoint_path.exists(), "Checkpoint file should be created");
+
+        // Load checkpoint
+        let loaded = Checkpoint::load(ms_root, &session.session_id)
+            .unwrap()
+            .expect("Checkpoint should exist");
+
+        // Verify loaded checkpoint content
+        assert_eq!(loaded.operation_type, "build");
+        assert_eq!(loaded.phase, "quality_filter");
+        assert!(loaded.progress > 0.0);
+
+        // Verify state data
+        assert_eq!(loaded.get_state("qualified_sessions"), Some("sess-1,sess-2"));
+        assert_eq!(loaded.get_state("patterns_extracted"), Some("42"));
+        assert_eq!(loaded.get_state("patterns_filtered"), Some("35"));
+    }
+
+    #[test]
+    fn test_build_session_simulate_crash_and_resume() {
+        use crate::core::recovery::Checkpoint;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let ms_root = temp_dir.path();
+
+        // Simulate a build session that crashes mid-way
+        let session_id = {
+            let mut session = BuildSession::new("crash-test", QualityGates::default());
+            session.state.qualified_session_ids = vec![
+                "session-a".to_string(),
+                "session-b".to_string(),
+                "session-c".to_string(),
+            ];
+            session.state.patterns_extracted = 100;
+            session.advance_phase(); // SearchSessions -> QualityFilter
+            session.advance_phase(); // QualityFilter -> ExtractPatterns
+            session.phase_progress = 0.5;
+
+            // Save checkpoint before "crash"
+            session.save_checkpoint(ms_root).unwrap();
+
+            session.session_id.clone()
+        };
+        // Session is dropped here (simulating crash)
+
+        // Resume: Load checkpoint and verify state can be recovered
+        let loaded = Checkpoint::load(ms_root, &session_id)
+            .unwrap()
+            .expect("Checkpoint should exist after crash");
+
+        // Verify we can recover the essential state
+        assert_eq!(loaded.phase, "extract_patterns");
+        assert!(loaded.progress >= 0.30, "Should be past first two phases");
+
+        let qualified_sessions = loaded.get_state("qualified_sessions").unwrap();
+        let session_ids: Vec<&str> = qualified_sessions.split(',').collect();
+        assert_eq!(session_ids.len(), 3);
+        assert!(session_ids.contains(&"session-a"));
+        assert!(session_ids.contains(&"session-b"));
+        assert!(session_ids.contains(&"session-c"));
+
+        assert_eq!(loaded.get_state("patterns_extracted"), Some("100"));
+    }
+
+    #[test]
+    fn test_build_session_checkpoint_interval_tracking() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let ms_root = temp_dir.path();
+
+        let mut session = BuildSession::new("interval-test", QualityGates::default())
+            .with_checkpoint_interval(Duration::from_millis(10));
+
+        // Initially should not need checkpoint
+        assert!(!session.should_checkpoint());
+
+        // Wait for interval to elapse
+        std::thread::sleep(Duration::from_millis(15));
+        assert!(session.should_checkpoint());
+
+        // Save checkpoint
+        session.save_checkpoint(ms_root).unwrap();
+
+        // After saving, should not need checkpoint again immediately
+        assert!(!session.should_checkpoint());
+
+        // Wait again
+        std::thread::sleep(Duration::from_millis(15));
+        assert!(session.should_checkpoint());
+    }
+
+    #[test]
+    fn test_build_state_serialization() {
+        let state = BuildState {
+            qualified_session_ids: vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            patterns_extracted: 150,
+            patterns_filtered: 120,
+        };
+
+        let json = serde_json::to_string(&state).unwrap();
+        let restored: BuildState = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored.qualified_session_ids, state.qualified_session_ids);
+        assert_eq!(restored.patterns_extracted, state.patterns_extracted);
+        assert_eq!(restored.patterns_filtered, state.patterns_filtered);
+    }
+
+    #[test]
+    fn test_build_phase_serialization() {
+        // Test all phases serialize and deserialize correctly
+        let phases = [
+            BuildPhase::SearchSessions,
+            BuildPhase::QualityFilter,
+            BuildPhase::ExtractPatterns,
+            BuildPhase::FilterPatterns,
+            BuildPhase::Synthesize,
+            BuildPhase::Complete,
+            BuildPhase::Failed,
+        ];
+
+        for phase in phases {
+            let json = serde_json::to_string(&phase).unwrap();
+            let restored: BuildPhase = serde_json::from_str(&json).unwrap();
+            assert_eq!(restored, phase, "Phase {:?} should roundtrip", phase);
+        }
+    }
+
+    #[test]
+    fn test_build_session_progress_at_each_phase() {
+        let mut session = BuildSession::new("progress-test", QualityGates::default());
+
+        // Test progress calculation through full pipeline
+        let expected_cumulative: &[(BuildPhase, f64)] = &[
+            (BuildPhase::SearchSessions, 0.0),
+            (BuildPhase::QualityFilter, 0.15),
+            (BuildPhase::ExtractPatterns, 0.30),
+            (BuildPhase::FilterPatterns, 0.60),
+            (BuildPhase::Synthesize, 0.75),
+            (BuildPhase::Complete, 1.0),
+        ];
+
+        for (expected_phase, expected_progress) in expected_cumulative {
+            assert_eq!(session.phase, *expected_phase);
+            session.phase_progress = 0.0;
+            let progress = session.overall_progress();
+            assert!(
+                (progress - expected_progress).abs() < 0.01,
+                "At {:?}, expected progress {}, got {}",
+                expected_phase,
+                expected_progress,
+                progress
+            );
+
+            if session.phase != BuildPhase::Complete {
+                session.advance_phase();
+            }
+        }
+    }
+
+    #[test]
+    fn test_build_session_does_not_advance_past_complete() {
+        let mut session = BuildSession::new("test", QualityGates::default());
+
+        // Advance to complete
+        while session.phase != BuildPhase::Complete {
+            session.advance_phase();
+        }
+
+        // Try to advance past complete
+        session.advance_phase();
+        assert_eq!(session.phase, BuildPhase::Complete);
+        session.advance_phase();
+        assert_eq!(session.phase, BuildPhase::Complete);
+    }
+
+    #[test]
+    fn test_build_session_does_not_advance_past_failed() {
+        let mut session = BuildSession::new("test", QualityGates::default());
+        session.fail();
+
+        // Try to advance past failed
+        session.advance_phase();
+        assert_eq!(session.phase, BuildPhase::Failed);
+    }
+}
+
