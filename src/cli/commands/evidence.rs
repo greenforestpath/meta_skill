@@ -9,6 +9,7 @@ use colored::Colorize;
 use crate::app::AppContext;
 use crate::core::{EvidenceLevel, EvidenceRef};
 use crate::error::{MsError, Result};
+use crate::utils::format::truncate_string;
 
 #[derive(Args, Debug)]
 pub struct EvidenceArgs {
@@ -230,11 +231,7 @@ fn show_evidence_index_human(
 
             if show_excerpts {
                 if let Some(ref excerpt) = eref.excerpt {
-                    let truncated = if excerpt.len() > 80 {
-                        format!("{}...", &excerpt[..77])
-                    } else {
-                        excerpt.clone()
-                    };
+                    let truncated = truncate_string(excerpt, 80);
                     println!("      \"{}\"", truncated.dimmed());
                 }
             }

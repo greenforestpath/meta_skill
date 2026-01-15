@@ -481,6 +481,8 @@ fn merge_adjacent_segments(segments: Vec<SessionSegment>) -> Vec<SessionSegment>
     let mut current = segments[0].clone();
 
     for seg in segments.into_iter().skip(1) {
+        // Check if segments are adjacent: same phase and new segment starts where current ends
+        #[allow(clippy::suspicious_operation_groupings)]
         if seg.phase == current.phase && seg.start_idx == current.end_idx {
             // Merge: extend current segment
             current.end_idx = seg.end_idx;

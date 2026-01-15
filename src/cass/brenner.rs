@@ -609,7 +609,7 @@ impl BrennerWizard {
             .filter(|m| {
                 matches!(
                     m.decision,
-                    Some(MoveDecision::Accept) | Some(MoveDecision::NeedsEvidence) | None
+                    Some(MoveDecision::Accept | MoveDecision::NeedsEvidence) | None
                 )
             })
             .collect();

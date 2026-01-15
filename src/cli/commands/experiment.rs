@@ -1049,12 +1049,13 @@ fn two_proportion_test(
 
 fn normal_cdf(z: f64) -> f64 {
     // Abramowitz-Stegun approximation for standard normal CDF.
-    let t = 1.0 / (1.0 + 0.2316419 * z);
-    let d = 0.3989423 * (-0.5 * z * z).exp();
+    // Constants use standard mathematical notation with separators.
+    let t = 1.0 / (1.0 + 0.231_641_9 * z);
+    let d = 0.398_942_3 * (-0.5 * z * z).exp();
     let prob = d
         * t
-        * (0.3193815
-            + t * (-0.3565638 + t * (1.781478 + t * (-1.821256 + t * 1.330274))));
+        * (0.319_381_5
+            + t * (-0.356_563_8 + t * (1.781_478 + t * (-1.821_256 + t * 1.330_274))));
     1.0 - prob
 }
 

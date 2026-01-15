@@ -904,8 +904,8 @@ checksum = "sha256:abc123"
         ssh_data.extend_from_slice(&(pub_blob.len() as u32).to_be_bytes());
         ssh_data.extend_from_slice(&pub_blob);
 
-        // Private section
-        let check = 0x12345678u32;
+        // Private section (SSH format requires check bytes)
+        let check = 0x1234_5678_u32;
         let mut priv_section = Vec::new();
         priv_section.extend_from_slice(&check.to_be_bytes());
         priv_section.extend_from_slice(&check.to_be_bytes());

@@ -49,6 +49,7 @@ fn slice_section(
     slices: &mut Vec<SkillSlice>,
     counters: &mut HashMap<&'static str, usize>,
 ) {
+    let mut first = true;
     for block in &section.blocks {
         if block.content.trim().is_empty() {
             continue;
@@ -59,9 +60,9 @@ fn slice_section(
         // We do NOT prepend the header here; the renderer (disclosure) handles that.
         let content = block.content.trim_end().to_string();
         let id = slice_id(block, slice_type, counters);
-        
-        // Calculate token estimate conservatively: includes header cost.
-        let header_cost = if !section.title.trim().is_empty() {
+
+        // Calculate token estimate conservatively: includes header cost for the first slice.
+        let header_cost = if first && !section.title.trim().is_empty() {
             estimate_tokens(&format!("## {}\n\n", section.title.trim()))
         } else {
             0
@@ -85,6 +86,8 @@ fn slice_section(
             section_title: Some(section.title.clone()),
             content,
         });
+
+        first = false;
     }
 }
 

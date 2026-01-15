@@ -888,7 +888,8 @@ fn apply_bundle_update(
         });
     }
 
-    for (_skill_name, target, entries, expected_hashes, report) in pending {
+    for (skill_name, target, entries, expected_hashes, report) in pending {
+        let skill_backup_root = backup_root.join(&skill_name);
         if let Some(report) = report {
             if report.needs_attention() && args.force {
                 for file in report.files.iter() {
@@ -898,7 +899,7 @@ fn apply_bundle_update(
                     ) {
                         let path = target.join(&file.path);
                         if path.exists() {
-                            let _ = backup_file(&path, &backup_root);
+                            let _ = backup_file(&path, &skill_backup_root);
                         }
                     }
                 }
