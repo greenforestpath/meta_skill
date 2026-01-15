@@ -18,7 +18,7 @@
 //! ```
 
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -181,9 +181,10 @@ impl<'a> DeduplicationEngine<'a> {
             let (structural_score, structural_details) =
                 self.compute_structural_similarity(skill, candidate);
 
-            // Compute weighted overall score
-            let similarity = self.config.semantic_weight * semantic_score
-                + self.config.structural_weight * structural_score;
+            // Compute weighted overall score (clamped to valid range)
+            let similarity = (self.config.semantic_weight * semantic_score
+                + self.config.structural_weight * structural_score)
+                .clamp(0.0, 1.0);
 
             // Only include if above threshold
             if similarity >= self.config.similarity_threshold {
@@ -251,7 +252,9 @@ impl<'a> DeduplicationEngine<'a> {
                     cosine_similarity(&embeddings[i].1, &embeddings[j].1);
 
                 // Quick filter - if semantic is too low, skip structural
-                if semantic_score < self.config.similarity_threshold - 0.2 {
+                // Use max(0.0, ...) to handle edge case of very low thresholds
+                let semantic_filter = (self.config.similarity_threshold - 0.2).max(0.0);
+                if semantic_score < semantic_filter {
                     continue;
                 }
 
@@ -259,9 +262,10 @@ impl<'a> DeduplicationEngine<'a> {
                 let (structural_score, structural_details) =
                     self.compute_structural_similarity(skill_a, skill_b);
 
-                // Compute weighted overall score
-                let similarity = self.config.semantic_weight * semantic_score
-                    + self.config.structural_weight * structural_score;
+                // Compute weighted overall score (clamped to valid range)
+                let similarity = (self.config.semantic_weight * semantic_score
+                    + self.config.structural_weight * structural_score)
+                    .clamp(0.0, 1.0);
 
                 if similarity >= self.config.similarity_threshold {
                     seen.insert(key);
@@ -519,7 +523,7 @@ pub struct DeduplicationSummary {
     /// Number of duplicate pairs found
     pub duplicate_pairs: usize,
     /// Breakdown by recommendation type
-    pub by_recommendation: std::collections::HashMap<String, usize>,
+    pub by_recommendation: HashMap<String, usize>,
     /// Top duplicate pairs by similarity (limited)
     pub top_duplicates: Vec<DuplicatePair>,
 }
@@ -528,8 +532,7 @@ impl DeduplicationSummary {
     /// Create summary from scan results
     pub fn from_pairs(total_skills: usize, pairs: Vec<DuplicatePair>, top_limit: usize) -> Self {
         let duplicate_pairs = pairs.len();
-        let mut by_recommendation: std::collections::HashMap<String, usize> =
-            std::collections::HashMap::new();
+        let mut by_recommendation: HashMap<String, usize> = HashMap::new();
 
         for pair in &pairs {
             let key = match pair.recommendation {
@@ -569,7 +572,7 @@ pub struct StyleProfile {
     /// Comment style preferences
     pub comment_style: CommentStyle,
     /// Language-specific preferences
-    pub language_prefs: std::collections::HashMap<String, LanguagePrefs>,
+    pub language_prefs: HashMap<String, LanguagePrefs>,
 }
 
 /// A code pattern preference
@@ -671,9 +674,13 @@ impl Personalizer {
         }
     }
 
-    /// Check if a skill would benefit from personalization
+    /// Check if personalization is available based on the current style profile.
+    ///
+    /// Returns true if the style profile has patterns or tech preferences that
+    /// could be applied. Future versions will also analyze skill content.
     pub fn should_personalize(&self, _skill: &SkillRecord) -> bool {
-        // TODO: Analyze skill content to determine if personalization would help
+        // Currently only checks if we have style preferences to apply.
+        // TODO: Also analyze skill content to determine if it would benefit
         !self.style.patterns.is_empty() || !self.style.tech_preferences.is_empty()
     }
 }
@@ -818,7 +825,7 @@ mod tests {
             },
             tech_preferences: vec!["tokio".to_string(), "serde".to_string()],
             comment_style: CommentStyle::default(),
-            language_prefs: std::collections::HashMap::new(),
+            language_prefs: HashMap::new(),
         };
 
         let json = serde_json::to_string(&profile).unwrap();
