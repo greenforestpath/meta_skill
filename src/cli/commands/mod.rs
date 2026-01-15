@@ -20,25 +20,36 @@ pub mod build;
 pub mod bundle;
 pub mod cm;
 pub mod config;
+pub mod conflicts;
 pub mod diff;
 pub mod doctor;
 pub mod edit;
 pub mod evidence;
+pub mod experiment;
+pub mod feedback;
 pub mod fmt;
+pub mod graph;
 pub mod index;
 pub mod init;
+pub mod install;
 pub mod list;
 pub mod load;
+pub mod machine;
 pub mod mcp;
+pub mod migrate;
+pub mod outcome;
 pub mod pre_commit;
 pub mod prune;
 pub mod quality;
+pub mod remote;
 pub mod requirements;
 pub mod search;
 pub mod security;
 pub mod safety;
+pub mod shell;
 pub mod show;
 pub mod suggest;
+pub mod sync;
 pub mod test;
 pub mod update;
 pub mod validate;
@@ -51,6 +62,7 @@ pub fn run(ctx: &AppContext, command: &Commands) -> Result<()> {
         Commands::Index(args) => index::run(ctx, args),
         Commands::Search(args) => search::run(ctx, args),
         Commands::Load(args) => load::run(ctx, args),
+        Commands::Install(args) => install::run(ctx, args),
         Commands::Suggest(args) => suggest::run(ctx, args),
         Commands::Show(args) => show::run(ctx, args),
         Commands::List(args) => list::run(ctx, args),
@@ -59,8 +71,17 @@ pub fn run(ctx: &AppContext, command: &Commands) -> Result<()> {
         Commands::Diff(args) => diff::run(ctx, args),
         Commands::Alias(args) => alias::run(ctx, args),
         Commands::Requirements(args) => requirements::run(ctx, args),
+        Commands::Feedback(args) => feedback::run(ctx, args),
+        Commands::Outcome(args) => outcome::run(ctx, args),
+        Commands::Experiment(args) => experiment::run(ctx, args),
         Commands::Build(args) => build::run(ctx, args),
         Commands::Bundle(args) => bundle::run(ctx, args),
+        Commands::Sync(args) => sync::run(ctx, args),
+        Commands::Remote(args) => remote::run(ctx, args),
+        Commands::Machine(args) => machine::run(ctx, args),
+        Commands::Graph(args) => graph::run(ctx, args),
+        Commands::Conflicts(args) => conflicts::run(ctx, args),
+        Commands::Migrate(args) => migrate::run(ctx, args),
         Commands::Cm(args) => cm::run(ctx, args),
         Commands::Update(args) => update::run(ctx, args),
         Commands::Bandit(args) => bandit::run(ctx, args),
@@ -69,6 +90,7 @@ pub fn run(ctx: &AppContext, command: &Commands) -> Result<()> {
         Commands::Prune(args) => prune::run(ctx, args),
         Commands::Config(args) => config::run(ctx, args),
         Commands::Security(args) => security::run(ctx, args),
+        Commands::Shell(args) => shell::run(ctx, args),
         Commands::Safety(args) => safety::run(ctx, args),
         Commands::Validate(args) => validate::run(ctx, args),
         Commands::Test(args) => test::run(ctx, args),

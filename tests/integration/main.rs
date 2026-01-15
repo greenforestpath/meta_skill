@@ -4,3 +4,5 @@ mod db_state_tests;
 mod fixture_tests;
 mod security_tests;
 mod workflow_tests;
+mod migration_tests;
+mod more_cli_tests;

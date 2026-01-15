@@ -12,6 +12,7 @@ pub mod safety;
 pub mod skill;
 pub mod slicing;
 pub mod spec_lens;
+pub mod spec_migration;
 pub mod validation;
 
 pub use dependencies::{
@@ -35,3 +36,4 @@ pub use recovery::{
     RecoveryReport, RetryConfig,
 };
 pub use slicing::{SkillSliceIndex, SkillSlicer};
+pub use spec_migration::migrate_spec;

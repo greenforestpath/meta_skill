@@ -95,6 +95,21 @@ pub enum Commands {
     /// Manage skill bundles
     Bundle(commands::bundle::BundleArgs),
 
+    /// Synchronize skills across machines
+    Sync(commands::sync::SyncArgs),
+
+    /// Manage sync remotes
+    Remote(commands::remote::RemoteArgs),
+
+    /// Show or update machine identity
+    Machine(commands::machine::MachineArgs),
+
+    /// Skill graph analysis (bv integration)
+    Graph(commands::graph::GraphArgs),
+
+    /// Manage sync conflicts
+    Conflicts(commands::conflicts::ConflictsArgs),
+
     /// Migrate skills to latest spec format
     Migrate(commands::migrate::MigrateArgs),
 

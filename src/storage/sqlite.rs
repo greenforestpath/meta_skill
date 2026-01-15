@@ -93,6 +93,37 @@ pub struct EvidenceRecord {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct QuarantineReview {
+    pub id: String,
+    pub quarantine_id: String,
+    pub action: String,
+    pub reason: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SkillFeedbackRecord {
+    pub id: String,
+    pub skill_id: String,
+    pub feedback_type: String,
+    pub rating: Option<i64>,
+    pub comment: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ExperimentRecord {
+    pub id: String,
+    pub skill_id: String,
+    pub scope: String,
+    pub scope_id: Option<String>,
+    pub variants_json: String,
+    pub allocation_json: String,
+    pub status: String,
+    pub started_at: String,
+}
+
 impl Database {
     /// Open database at the given path
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
@@ -666,13 +697,29 @@ impl Database {
                     "prepare" => super::tx::TxPhase::Prepare,
                     "pending" => super::tx::TxPhase::Pending,
                     "committed" => super::tx::TxPhase::Committed,
-                    _ => super::tx::TxPhase::Complete,
+                    "complete" => super::tx::TxPhase::Complete,
+                    unknown => {
+                        return Err(rusqlite::Error::FromSqlConversionFailure(
+                            3,
+                            rusqlite::types::Type::Text,
+                            Box::new(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!("unknown transaction phase: {}", unknown),
+                            )),
+                        ));
+                    }
                 };
 
                 let created_str: String = row.get(5)?;
                 let created_at = chrono::DateTime::parse_from_rfc3339(&created_str)
                     .map(|dt| dt.with_timezone(&chrono::Utc))
-                    .unwrap_or_else(|_| chrono::Utc::now());
+                    .map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            5,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })?;
 
                 Ok(super::tx::TxRecord {
                     id: row.get(0)?,
@@ -831,7 +878,7 @@ impl Database {
         Ok(())
     }
 
-    /// Get all evidence for a skill, reconstructing the SkillEvidenceIndex.
+    /// Get all evidence for a skill, reconstructuting the SkillEvidenceIndex.
     pub fn get_evidence(&self, skill_id: &str) -> Result<crate::core::SkillEvidenceIndex> {
         let mut stmt = self.conn.prepare(
             "SELECT rule_id, evidence_json, coverage_json
@@ -946,6 +993,154 @@ impl Database {
         Ok(count)
     }
 
+    pub fn record_skill_outcome(&self, skill_id: &str, success: bool) -> Result<()> {
+        let id = Uuid::new_v4().to_string();
+        let created_at = chrono::Utc::now().to_rfc3339();
+        // We use skill_usage_events for outcomes for now
+        self.conn.execute(
+            "INSERT INTO skill_usage_events (id, skill_id, session_id, loaded_at, disclosure_level, discovery_method, outcome, feedback)
+             VALUES (?, ?, 'manual', ?, 'full', 'manual', ?, 'null')",
+            params![id, skill_id, created_at, if success { "success" } else { "failure" }],
+        )?;
+        Ok(())
+    }
+
+    pub fn record_skill_feedback(
+        &self,
+        skill_id: &str,
+        feedback_type: &str,
+        rating: Option<i64>,
+        comment: Option<&str>,
+    ) -> Result<SkillFeedbackRecord> {
+        let id = Uuid::new_v4().to_string();
+        let created_at = chrono::Utc::now().to_rfc3339();
+        
+        self.conn.execute(
+            "INSERT INTO skill_feedback (id, skill_id, feedback_type, rating, comment, created_at)
+             VALUES (?, ?, ?, ?, ?, ?)",
+            params![id, skill_id, feedback_type, rating, comment, created_at],
+        )?;
+
+        Ok(SkillFeedbackRecord {
+            id,
+            skill_id: skill_id.to_string(),
+            feedback_type: feedback_type.to_string(),
+            rating,
+            comment: comment.map(|s| s.to_string()),
+            created_at,
+        })
+    }
+
+    pub fn list_skill_feedback(
+        &self,
+        skill_id: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<SkillFeedbackRecord>> {
+        let mut sql = "SELECT id, skill_id, feedback_type, rating, comment, created_at 
+                       FROM skill_feedback".to_string();
+        let mut args = Vec::new();
+        
+        if let Some(sid) = skill_id {
+            sql.push_str(" WHERE skill_id = ?");
+            args.push(sid.to_string()); // Ownership work-around
+        }
+        
+        sql.push_str(" ORDER BY created_at DESC LIMIT ? OFFSET ?");
+        
+        // Use a simpler query flow to avoid borrowing issues
+        let mut stmt = self.conn.prepare(&sql)?;
+        
+        let mut rows = if let Some(sid) = skill_id {
+            stmt.query(params![sid, limit as i64, offset as i64])?
+        } else {
+            stmt.query(params![limit as i64, offset as i64])?
+        };
+
+        let mut records = Vec::new();
+        while let Some(row) = rows.next()? {
+            records.push(SkillFeedbackRecord {
+                id: row.get(0)?,
+                skill_id: row.get(1)?,
+                feedback_type: row.get(2)?,
+                rating: row.get(3)?,
+                comment: row.get(4)?,
+                created_at: row.get(5)?,
+            });
+        }
+        Ok(records)
+    }
+
+    pub fn create_skill_experiment(
+        &self,
+        skill_id: &str,
+        scope: &str,
+        scope_id: Option<&str>,
+        variants_json: &str,
+        allocation_json: &str,
+        status: &str,
+    ) -> Result<ExperimentRecord> {
+        let id = Uuid::new_v4().to_string();
+        let started_at = chrono::Utc::now().to_rfc3339();
+
+        self.conn.execute(
+            "INSERT INTO skill_experiments (
+                id, skill_id, scope, scope_id, variants_json, allocation_json, status, started_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            params![id, skill_id, scope, scope_id, variants_json, allocation_json, status, started_at],
+        )?;
+
+        Ok(ExperimentRecord {
+            id,
+            skill_id: skill_id.to_string(),
+            scope: scope.to_string(),
+            scope_id: scope_id.map(|s| s.to_string()),
+            variants_json: variants_json.to_string(),
+            allocation_json: allocation_json.to_string(),
+            status: status.to_string(),
+            started_at,
+        })
+    }
+
+    pub fn list_skill_experiments(
+        &self,
+        skill_id: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<ExperimentRecord>> {
+        let mut sql = "SELECT id, skill_id, scope, scope_id, variants_json, allocation_json, status, started_at 
+                       FROM skill_experiments".to_string();
+        
+        if let Some(_) = skill_id {
+            sql.push_str(" WHERE skill_id = ?");
+        }
+        
+        sql.push_str(" ORDER BY started_at DESC LIMIT ? OFFSET ?");
+        
+        let mut stmt = self.conn.prepare(&sql)?;
+        
+        let mut rows = if let Some(sid) = skill_id {
+            stmt.query(params![sid, limit as i64, offset as i64])?
+        } else {
+            stmt.query(params![limit as i64, offset as i64])?
+        };
+
+        let mut records = Vec::new();
+        while let Some(row) = rows.next()? {
+            records.push(ExperimentRecord {
+                id: row.get(0)?,
+                skill_id: row.get(1)?,
+                scope: row.get(2)?,
+                scope_id: row.get(3)?,
+                variants_json: row.get(4)?,
+                allocation_json: row.get(5)?,
+                status: row.get(6)?,
+                started_at: row.get(7)?,
+            });
+        }
+        Ok(records)
+    }
+
     fn configure_pragmas(conn: &Connection) -> Result<()> {
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
@@ -1056,15 +1251,6 @@ fn quarantine_from_row(row: &Row<'_>) -> std::result::Result<QuarantineRecord, r
         created_at: row.get(7)?,
         replay_command: row.get(8)?,
     })
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct QuarantineReview {
-    pub id: String,
-    pub quarantine_id: String,
-    pub action: String,
-    pub reason: Option<String>,
-    pub created_at: String,
 }
 
 fn session_quality_from_row(row: &Row<'_>) -> Result<SessionQualityRecord> {
