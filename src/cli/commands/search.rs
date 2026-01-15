@@ -11,7 +11,6 @@ use crate::error::{MsError, Result};
 use crate::search::{
     RrfConfig, SearchFilters, SearchLayer, VectorIndex, build_embedder, fuse_simple,
 };
-use crate::storage::sqlite::SkillRecord;
 
 #[derive(Args, Debug)]
 pub struct SearchArgs {
@@ -117,12 +116,10 @@ fn search_hybrid(ctx: &AppContext, args: &SearchArgs, filters: &SearchFilters) -
 
     // Load embeddings from database
     let mut vector_index = VectorIndex::new(embedder.dims());
-    let all_skills = load_all_skills(ctx)?;
+    let all_embeddings = ctx.db.get_all_embeddings()?;
 
-    for skill in &all_skills {
-        if let Ok(Some(emb)) = ctx.db.get_embedding(&skill.id) {
-            let _ = vector_index.insert(&skill.id, emb.embedding);
-        }
+    for (id, embedding) in all_embeddings {
+        let _ = vector_index.insert(id, embedding);
     }
 
     // Semantic search
@@ -201,12 +198,10 @@ fn search_semantic(ctx: &AppContext, args: &SearchArgs, filters: &SearchFilters)
 
     // Load embeddings
     let mut vector_index = VectorIndex::new(embedder.dims());
-    let all_skills = load_all_skills(ctx)?;
+    let all_embeddings = ctx.db.get_all_embeddings()?;
 
-    for skill in &all_skills {
-        if let Ok(Some(emb)) = ctx.db.get_embedding(&skill.id) {
-            let _ = vector_index.insert(&skill.id, emb.embedding);
-        }
+    for (id, embedding) in all_embeddings {
+        let _ = vector_index.insert(id, embedding);
     }
 
     let search_results = vector_index.search(&query_embedding, args.limit * 2);
@@ -353,27 +348,6 @@ fn parse_tags_from_metadata(metadata_json: &str) -> Vec<String> {
         }
     }
     Vec::new()
-}
-
-fn load_all_skills(ctx: &AppContext) -> Result<Vec<SkillRecord>> {
-    let mut all = Vec::new();
-    let mut offset = 0;
-    let limit = 1000;
-
-    loop {
-        let batch = ctx.db.list_skills(limit, offset)?;
-        let batch_len = batch.len();
-        if batch_len == 0 {
-            break;
-        }
-        all.extend(batch);
-        offset += batch_len;
-        if batch_len < limit {
-            break;
-        }
-    }
-
-    Ok(all)
 }
 
 fn find_snippet(body: &str, query: &str) -> Option<String> {

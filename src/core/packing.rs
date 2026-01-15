@@ -181,7 +181,6 @@ impl ConstrainedPacker {
                 .filter(|slice| slice.coverage_group.as_deref() == Some(quota.group.as_str()))
                 .filter(|slice| !selected_ids.contains(&slice.id))
                 .filter(|slice| !is_excluded(slice, &excluded_groups))
-                .filter(|slice| deps_satisfied(slice, &selected_ids))
                 .collect();
             let ranked = rank_by_density(
                 &group_slices,
@@ -194,6 +193,9 @@ impl ConstrainedPacker {
                     break;
                 }
                 if slice.token_estimate > remaining {
+                    continue;
+                }
+                if !deps_satisfied(slice, &selected_ids) {
                     continue;
                 }
                 if !can_add_slice(slice, &excluded_groups, &group_counts, max_per_group) {
@@ -211,7 +213,6 @@ impl ConstrainedPacker {
             .iter()
             .filter(|slice| !selected_ids.contains(&slice.id))
             .filter(|slice| !is_excluded(slice, &excluded_groups))
-            .filter(|slice| deps_satisfied(slice, &selected_ids))
             .collect();
         let ranked = rank_by_density(
             &candidates,
@@ -221,6 +222,9 @@ impl ConstrainedPacker {
         );
         for slice in ranked {
             if slice.token_estimate > remaining {
+                continue;
+            }
+            if !deps_satisfied(slice, &selected_ids) {
                 continue;
             }
             if !can_add_slice(slice, &excluded_groups, &group_counts, max_per_group) {

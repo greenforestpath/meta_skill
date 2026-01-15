@@ -500,6 +500,44 @@ impl Database {
         Ok(None)
     }
 
+    /// Efficiently load all embeddings for the vector index.
+    /// Returns pairs of (skill_id, embedding_vector).
+    pub fn get_all_embeddings(&self) -> Result<Vec<(String, Vec<f32>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT skill_id, embedding, dims FROM skill_embeddings"
+        )?;
+        
+        let rows = stmt.query_map([], |row| {
+            let skill_id: String = row.get(0)?;
+            let blob: Vec<u8> = row.get(1)?;
+            let dims: i64 = row.get(2)?;
+            let dims_usize = if dims <= 0 { 0 } else { dims as usize };
+            
+            // We have to decode inside the closure or return the blob to decode outside.
+            // Decoding here is cleaner but might hold the lock longer.
+            // Given we are reading everything, holding the lock is expected.
+            let embedding = match decode_embedding_f16(&blob, dims_usize) {
+                Ok(vec) => vec,
+                Err(e) => {
+                    // Map error to sqlite failure to propagate
+                    return Err(rusqlite::Error::FromSqlConversionFailure(
+                        1, 
+                        rusqlite::types::Type::Blob, 
+                        Box::new(e)
+                    ));
+                }
+            };
+            
+            Ok((skill_id, embedding))
+        })?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    }
+
     pub fn insert_quarantine_record(&self, record: &QuarantineRecord) -> Result<()> {
         let classification_json =
             serde_json::to_string(&record.acip_classification).map_err(|err| {

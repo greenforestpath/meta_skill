@@ -181,8 +181,8 @@ impl VectorIndex {
 fn tokenize(text: &str) -> Vec<String> {
     let lowered = text.to_lowercase();
     lowered
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|token| token.len() > 2)
+        .split(|c: char| !(c.is_alphanumeric() || c == '+' || c == '#'))
+        .filter(|token| token.len() >= 2)
         .map(|token| token.to_string())
         .collect()
 }
@@ -257,7 +257,8 @@ mod tests {
     #[test]
     fn test_embedding_empty_input() {
         let embedder = HashEmbedder::new(32);
-        let embedding = embedder.embed("a an of in");
+        // Use 1-char tokens which are filtered out by tokenizer (len >= 2)
+        let embedding = embedder.embed("a b c d");
         let norm = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
         assert_eq!(norm, 0.0);
     }

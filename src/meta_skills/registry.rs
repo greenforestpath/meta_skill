@@ -23,9 +23,49 @@ impl MetaSkillRegistry {
     pub fn insert(&mut self, meta_skill: MetaSkill) -> Result<()> {
         meta_skill.validate()?;
         let id = meta_skill.id.clone();
-        self.meta_skills.insert(id, meta_skill);
-        self.rebuild_indexes();
+
+        // Remove old index entries if updating
+        if let Some(old) = self.meta_skills.insert(id.clone(), meta_skill.clone()) {
+            self.remove_from_indexes(&old);
+        }
+
+        // Add new index entries
+        self.add_to_indexes(&meta_skill);
         Ok(())
+    }
+
+    fn add_to_indexes(&mut self, meta_skill: &MetaSkill) {
+        for tag in &meta_skill.metadata.tags {
+            self.tag_index
+                .entry(tag.clone())
+                .or_default()
+                .push(meta_skill.id.clone());
+        }
+
+        for stack in &meta_skill.metadata.tech_stacks {
+            self.tech_stack_index
+                .entry(stack.clone())
+                .or_default()
+                .push(meta_skill.id.clone());
+        }
+    }
+
+    fn remove_from_indexes(&mut self, meta_skill: &MetaSkill) {
+        for tag in &meta_skill.metadata.tags {
+            if let Some(list) = self.tag_index.get_mut(tag) {
+                if let Some(pos) = list.iter().position(|id| id == &meta_skill.id) {
+                    list.swap_remove(pos);
+                }
+            }
+        }
+
+        for stack in &meta_skill.metadata.tech_stacks {
+            if let Some(list) = self.tech_stack_index.get_mut(stack) {
+                if let Some(pos) = list.iter().position(|id| id == &meta_skill.id) {
+                    list.swap_remove(pos);
+                }
+            }
+        }
     }
 
     pub fn get(&self, id: &str) -> Option<&MetaSkill> {
@@ -93,27 +133,6 @@ impl MetaSkillRegistry {
             }
         }
         Ok(count)
-    }
-
-    fn rebuild_indexes(&mut self) {
-        self.tag_index.clear();
-        self.tech_stack_index.clear();
-
-        for meta_skill in self.meta_skills.values() {
-            for tag in &meta_skill.metadata.tags {
-                self.tag_index
-                    .entry(tag.clone())
-                    .or_default()
-                    .push(meta_skill.id.clone());
-            }
-
-            for stack in &meta_skill.metadata.tech_stacks {
-                self.tech_stack_index
-                    .entry(stack.clone())
-                    .or_default()
-                    .push(meta_skill.id.clone());
-            }
-        }
     }
 
     pub fn stats(&self) -> MetaSkillRegistryStats {
