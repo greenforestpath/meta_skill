@@ -466,7 +466,7 @@ fn run_load(ctx: &AppContext, args: &ExperimentLoadArgs) -> Result<()> {
         variant_id: Some(selection.variant.id.clone()),
     };
 
-    let load_result = load_skill(ctx, &load_args)?;
+    let load_result = load_skill(ctx, &load_args, &load_args.skill)?;
     let event = record_assignment_event(
         ctx,
         &record.id,
