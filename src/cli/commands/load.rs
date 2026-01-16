@@ -1,6 +1,7 @@
 //! ms load - Load a skill with progressive disclosure
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
 
 use clap::{Args, ValueEnum};
 use colored::Colorize;
@@ -17,6 +18,7 @@ use crate::core::pack_contracts::{PackContractPreset, custom_contracts_path, fin
 use crate::core::skill::{PackContract, SkillAssets, SkillMetadata};
 use crate::core::spec_lens::parse_markdown;
 use crate::error::{MsError, Result};
+use crate::meta_skills::{ConditionContext, MetaSkillManager, MetaSkillRegistry};
 use crate::storage::sqlite::SkillRecord;
 
 /// Dependency loading strategy
@@ -151,6 +153,16 @@ pub struct LoadResult {
 }
 
 pub fn run(ctx: &AppContext, args: &LoadArgs) -> Result<()> {
+    // First try to load as meta-skill
+    if let Some(meta_result) = try_load_meta_skill(ctx, args)? {
+        return if ctx.robot_mode {
+            output_robot_meta(ctx, &meta_result, args)
+        } else {
+            output_human_meta(ctx, &meta_result, args)
+        };
+    }
+
+    // Fall back to regular skill loading
     let result = load_skill(ctx, args)?;
 
     if ctx.robot_mode {
@@ -248,6 +260,154 @@ fn resolve_skill(ctx: &AppContext, skill_ref: &str) -> Result<SkillRecord> {
         "skill not found: {}",
         skill_ref
     )))
+}
+
+// ==================== Meta-Skill Integration ====================
+
+/// Result of loading a meta-skill
+#[derive(Debug)]
+pub struct MetaSkillLoadResultWrapper {
+    pub meta_skill_id: String,
+    pub meta_skill_name: String,
+    pub tokens_used: usize,
+    pub slices_loaded: usize,
+    pub slices_skipped: usize,
+    pub packed_content: String,
+}
+
+/// Try to load as a meta-skill. Returns None if not found as a meta-skill.
+fn try_load_meta_skill(ctx: &AppContext, args: &LoadArgs) -> Result<Option<MetaSkillLoadResultWrapper>> {
+    let mut registry = MetaSkillRegistry::new();
+    let meta_skill_paths = get_meta_skill_paths();
+
+    // Load registry, but don't fail if no meta-skills exist
+    if registry.load_from_paths(&meta_skill_paths).unwrap_or(0) == 0 {
+        return Ok(None);
+    }
+
+    // Try to find meta-skill by ID
+    let meta_skill = match registry.get(&args.skill) {
+        Some(ms) => ms.clone(),
+        None => return Ok(None),
+    };
+
+    // Found a meta-skill, load it
+    let manager = MetaSkillManager::new(ctx);
+    let working_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let tech_stacks = detect_tech_stacks(&working_dir);
+
+    let condition_ctx = ConditionContext {
+        working_dir: &working_dir,
+        tech_stacks: &tech_stacks,
+        loaded_slices: &HashSet::new(),
+    };
+
+    // Use pack budget if specified, otherwise use meta-skill's recommended tokens
+    let budget = args.pack.unwrap_or(meta_skill.recommended_context_tokens);
+
+    let result = manager.load(&meta_skill, budget, &condition_ctx)?;
+
+    Ok(Some(MetaSkillLoadResultWrapper {
+        meta_skill_id: result.meta_skill_id,
+        meta_skill_name: meta_skill.name.clone(),
+        tokens_used: result.tokens_used,
+        slices_loaded: result.slices.len(),
+        slices_skipped: result.skipped.len(),
+        packed_content: result.packed_content,
+    }))
+}
+
+/// Get meta-skill directories
+fn get_meta_skill_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+
+    // Project meta-skills directory
+    let working_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let project_meta = working_dir.join(".ms").join("meta-skills");
+    if project_meta.exists() {
+        paths.push(project_meta);
+    }
+
+    // Global meta-skills directory
+    if let Some(home) = dirs::home_dir() {
+        let global_meta = home.join(".ms").join("meta-skills");
+        if global_meta.exists() {
+            paths.push(global_meta);
+        }
+    }
+
+    paths
+}
+
+/// Detect tech stacks from common config files
+fn detect_tech_stacks(working_dir: &std::path::Path) -> Vec<String> {
+    let mut stacks = Vec::new();
+
+    let indicators = [
+        ("Cargo.toml", "rust"),
+        ("package.json", "javascript"),
+        ("tsconfig.json", "typescript"),
+        ("go.mod", "go"),
+        ("requirements.txt", "python"),
+        ("pyproject.toml", "python"),
+        ("Gemfile", "ruby"),
+        ("pom.xml", "java"),
+        ("build.gradle", "java"),
+        ("composer.json", "php"),
+    ];
+
+    for (file, stack) in indicators {
+        if working_dir.join(file).exists() {
+            stacks.push(stack.to_string());
+        }
+    }
+
+    stacks
+}
+
+fn output_human_meta(_ctx: &AppContext, result: &MetaSkillLoadResultWrapper, _args: &LoadArgs) -> Result<()> {
+    println!(
+        "{} (meta-skill: {})",
+        format!("# {}", result.meta_skill_name).bold(),
+        result.meta_skill_id.cyan()
+    );
+    println!();
+
+    // Stats
+    println!(
+        "{} {} tokens | {} slices loaded | {} skipped",
+        "─".repeat(40).dimmed(),
+        result.tokens_used,
+        result.slices_loaded,
+        result.slices_skipped
+    );
+    println!();
+
+    // Content
+    println!("{}", result.packed_content);
+
+    Ok(())
+}
+
+fn output_robot_meta(_ctx: &AppContext, result: &MetaSkillLoadResultWrapper, args: &LoadArgs) -> Result<()> {
+    let output = serde_json::json!({
+        "status": "ok",
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "version": env!("CARGO_PKG_VERSION"),
+        "type": "meta_skill",
+        "data": {
+            "meta_skill_id": result.meta_skill_id,
+            "name": result.meta_skill_name,
+            "tokens_used": result.tokens_used,
+            "budget": args.pack,
+            "slices_loaded": result.slices_loaded,
+            "slices_skipped": result.slices_skipped,
+            "content": result.packed_content,
+        },
+        "warnings": []
+    });
+    println!("{}", serde_json::to_string_pretty(&output)?);
+    Ok(())
 }
 
 fn determine_disclosure_plan(args: &LoadArgs, contract: Option<PackContract>) -> DisclosurePlan {
