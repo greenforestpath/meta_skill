@@ -343,11 +343,22 @@ impl SyncEngine {
             let mut remote_modified = existing
                 .map(|entry| entry.remote_modified.clone())
                 .unwrap_or_default();
+
+            // Only update the base hash if we are fully synchronized.
+            // Otherwise, we must preserve the last known common ancestor to correctly
+            // detect future conflicts/directions.
+            if final_status == SkillSyncStatus::Synced {
+                if let Some(snap) = remote_snap {
+                    remote_hashes.insert(remote.name.clone(), snap.hash.clone());
+                } else {
+                    remote_hashes.remove(&remote.name);
+                }
+            }
+
+            // Always update modification times for info/display
             if let Some(snap) = remote_snap {
-                remote_hashes.insert(remote.name.clone(), snap.hash.clone());
                 remote_modified.insert(remote.name.clone(), snap.modified);
             } else {
-                remote_hashes.remove(&remote.name);
                 remote_modified.remove(&remote.name);
             }
 
