@@ -2,10 +2,38 @@
 
 use crate::error::Result;
 
-/// Get current branch name
+/// Get current branch name from the current working directory
 pub fn current_branch() -> Result<Option<String>> {
-    // TODO: Implement
-    Ok(None)
+    current_branch_in(std::env::current_dir().ok())
+}
+
+/// Get current branch name from a specific directory
+pub fn current_branch_in(path: Option<impl AsRef<std::path::Path>>) -> Result<Option<String>> {
+    let mut cmd = std::process::Command::new("git");
+    cmd.args(["rev-parse", "--abbrev-ref", "HEAD"]);
+
+    if let Some(p) = path {
+        cmd.current_dir(p);
+    }
+
+    let output = match cmd.output() {
+        Ok(out) => out,
+        Err(_) => return Ok(None), // git not available
+    };
+
+    if !output.status.success() {
+        return Ok(None); // not in a git repo
+    }
+
+    let branch = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .to_string();
+
+    if branch.is_empty() || branch == "HEAD" {
+        Ok(None) // detached HEAD state
+    } else {
+        Ok(Some(branch))
+    }
 }
 
 /// Check if directory is a git repository
@@ -23,10 +51,18 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn current_branch_returns_none_stub() {
-        // Note: This is a stub that returns None
+    fn current_branch_in_git_repo_returns_some() {
+        // Running tests from within the meta_skill repo, should have a branch
         let result = current_branch().unwrap();
-        assert!(result.is_none());
+        // In a git repo, we expect Some(branch_name)
+        assert!(result.is_some(), "Should detect branch in git repo");
+    }
+
+    #[test]
+    fn current_branch_in_non_git_returns_none() {
+        let temp = TempDir::new().unwrap();
+        let result = current_branch_in(Some(temp.path())).unwrap();
+        assert!(result.is_none(), "Non-git directory should return None");
     }
 
     // =========================================================================

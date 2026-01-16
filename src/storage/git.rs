@@ -63,9 +63,20 @@ impl GitArchive {
     /// Returns None if skill_id contains path traversal sequences.
     pub fn skill_path(&self, skill_id: &str) -> Option<PathBuf> {
         // Prevent path traversal attacks
+        if skill_id.trim().is_empty() {
+            return None;
+        }
+        if skill_id == "." || skill_id == ".." {
+            return None;
+        }
         if skill_id.contains("..") || skill_id.contains('/') || skill_id.contains('\\') {
             return None;
         }
+        // Stricter check: must be safe filename characters only
+        if !skill_id.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.') {
+            return None;
+        }
+        
         Some(self.root.join("skills/by-id").join(skill_id))
     }
 
@@ -567,5 +578,16 @@ mod tests {
 
         // Test that skill_exists returns false for path traversal
         assert!(!archive.skill_exists("../etc/passwd"));
+    }
+
+    #[test]
+    fn test_dot_skill_id_should_fail() {
+        let dir = tempdir().unwrap();
+        let archive = GitArchive::open(dir.path()).unwrap();
+
+        // Currently this might pass if the bug exists (we want it to return None or Err)
+        // If it returns Some, it means we can write to the parent directory
+        let path = archive.skill_path(".");
+        assert!(path.is_none(), "Should reject '.' as skill ID");
     }
 }

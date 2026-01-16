@@ -544,10 +544,87 @@ pub enum SimplePatternType {
 // Mining Functions
 // =============================================================================
 
-/// Extract patterns from a session transcript
-pub fn extract_patterns(_session_path: &str) -> Result<Vec<Pattern>> {
-    // TODO: Implement pattern extraction
-    Ok(vec![])
+/// Extract patterns from a session transcript file
+///
+/// Parses the session file (JSON or JSONL format) and extracts patterns.
+pub fn extract_patterns(session_path: &str) -> Result<Vec<Pattern>> {
+    use std::path::Path;
+    use crate::error::MsError;
+
+    let path = Path::new(session_path);
+    if !path.exists() {
+        return Err(MsError::SkillNotFound(format!(
+            "Session file not found: {session_path}"
+        )));
+    }
+
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| MsError::MiningFailed(format!("Failed to read session: {e}")))?;
+
+    // Try to parse as a full Session object first
+    let session: super::client::Session = serde_json::from_str(&content).map_err(|e| {
+        MsError::MiningFailed(format!(
+            "Failed to parse session file as JSON: {e}. File: {session_path}"
+        ))
+    })?;
+
+    // Extract patterns using the full extraction pipeline
+    let extracted = extract_from_session(&session)?;
+
+    // Convert ExtractedPattern to simple Pattern format
+    let patterns = extracted
+        .into_iter()
+        .map(|ep| Pattern {
+            id: ep.id,
+            pattern_type: pattern_type_to_simple(&ep.pattern_type),
+            content: pattern_content(&ep.pattern_type),
+            confidence: ep.confidence,
+        })
+        .collect();
+
+    Ok(patterns)
+}
+
+/// Convert a full PatternType to the simple SimplePatternType
+fn pattern_type_to_simple(pt: &PatternType) -> SimplePatternType {
+    match pt {
+        PatternType::CommandPattern { .. } => SimplePatternType::CommandRecipe,
+        PatternType::CodePattern { .. } => SimplePatternType::PromptMacro, // Code is like a prompt/template
+        PatternType::WorkflowPattern { .. } => SimplePatternType::Checklist,
+        PatternType::DecisionPattern { .. } => SimplePatternType::DiagnosticTree,
+        PatternType::ErrorPattern { .. } => SimplePatternType::Pitfall, // Errors are pitfalls to avoid
+        PatternType::RefactorPattern { .. } => SimplePatternType::RefactorPlaybook,
+        PatternType::ConfigPattern { .. } => SimplePatternType::Invariant, // Config as invariant to maintain
+        PatternType::ToolPattern { .. } => SimplePatternType::CommandRecipe, // Tool patterns are commands
+    }
+}
+
+/// Extract the main content string from a PatternType
+fn pattern_content(pt: &PatternType) -> String {
+    match pt {
+        PatternType::CommandPattern { commands, .. } => commands.join(" && "),
+        PatternType::CodePattern { code, .. } => code.clone(),
+        PatternType::WorkflowPattern { steps, .. } => {
+            steps.iter().map(|s| s.action.clone()).collect::<Vec<_>>().join(" -> ")
+        }
+        PatternType::DecisionPattern { condition, branches, .. } => {
+            let branch_strs: Vec<_> = branches.iter().map(|b| b.action.clone()).collect();
+            format!("{}: {}", condition, branch_strs.join(" | "))
+        }
+        PatternType::ErrorPattern { error_type, resolution_steps, .. } => {
+            format!("{}: {}", error_type, resolution_steps.join(", "))
+        }
+        PatternType::RefactorPattern { before_pattern, after_pattern, .. } => {
+            format!("{} -> {}", before_pattern, after_pattern)
+        }
+        PatternType::ConfigPattern { config_type, settings, .. } => {
+            let keys: Vec<_> = settings.iter().map(|s| s.key.clone()).collect();
+            format!("{}: {}", config_type, keys.join(", "))
+        }
+        PatternType::ToolPattern { tool_name, common_args, .. } => {
+            format!("{} {}", tool_name, common_args.join(" "))
+        }
+    }
 }
 
 /// Extract patterns from a parsed session
