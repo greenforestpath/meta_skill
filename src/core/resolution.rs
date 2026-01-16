@@ -1,11 +1,12 @@
-//! Skill inheritance resolution
+//! Skill inheritance and composition resolution
 //!
-//! Implements single-inheritance resolution for skills using the `extends` field.
-//! Handles cycle detection, section merging, and inheritance chain tracking.
+//! Implements single-inheritance resolution for skills using the `extends` field,
+//! and composition via the `includes` field. Handles cycle detection, section
+//! merging, and inheritance/composition chain tracking.
 
 use std::collections::{HashMap, HashSet};
 
-use crate::core::skill::{BlockType, SkillBlock, SkillSection, SkillSpec};
+use crate::core::skill::{BlockType, IncludePosition, IncludeTarget, SkillBlock, SkillInclude, SkillSection, SkillSpec};
 use crate::error::{MsError, Result};
 
 /// Maximum inheritance depth before warning
@@ -17,13 +18,15 @@ pub trait SkillRepository: Send + Sync {
     fn get(&self, skill_id: &str) -> Result<Option<SkillSpec>>;
 }
 
-/// A resolved skill with inheritance applied
+/// A resolved skill with inheritance and composition applied
 #[derive(Debug, Clone)]
 pub struct ResolvedSkillSpec {
     /// The final resolved spec
     pub spec: SkillSpec,
     /// Chain of skill IDs from root to this skill (oldest first)
     pub inheritance_chain: Vec<String>,
+    /// Skill IDs that were included (composed) into this skill
+    pub included_from: Vec<String>,
     /// Warnings encountered during resolution
     pub warnings: Vec<ResolutionWarning>,
 }
@@ -41,6 +44,17 @@ pub enum ResolutionWarning {
         section_id: String,
         parent_id: String,
     },
+    /// Many skills are being included into the same target section
+    ManyIncludes {
+        target: IncludeTarget,
+        count: usize,
+        sources: Vec<String>,
+    },
+    /// An included skill was not found
+    IncludedSkillNotFound {
+        skill_id: String,
+        included_by: String,
+    },
 }
 
 /// Result of cycle detection
@@ -52,7 +66,8 @@ pub enum CycleDetectionResult {
     CycleFound(Vec<String>),
 }
 
-/// Detect if there's a cycle in the inheritance chain starting from a skill
+/// Detect if there's a cycle in the inheritance chain starting from a skill.
+/// Only checks the `extends` chain (single inheritance).
 pub fn detect_inheritance_cycle<R: SkillRepository + ?Sized>(
     skill_id: &str,
     repository: &R,
@@ -84,7 +99,61 @@ pub fn detect_inheritance_cycle<R: SkillRepository + ?Sized>(
     }
 }
 
-/// Resolve a skill's inheritance, applying parent sections
+/// Detect if there's a cycle involving both extends and includes.
+/// This performs a full DFS to detect cycles in the dependency graph.
+pub fn detect_full_cycle<R: SkillRepository + ?Sized>(
+    skill_id: &str,
+    repository: &R,
+) -> Result<CycleDetectionResult> {
+    fn visit<R: SkillRepository + ?Sized>(
+        id: &str,
+        repo: &R,
+        visited: &mut HashSet<String>,
+        path: &mut Vec<String>,
+    ) -> Result<Option<Vec<String>>> {
+        // Check for cycle
+        if visited.contains(id) {
+            if let Some(start) = path.iter().position(|p| p == id) {
+                let mut cycle = path[start..].to_vec();
+                cycle.push(id.to_string());
+                return Ok(Some(cycle));
+            }
+            // Already visited but not in current path - no cycle through this node
+            return Ok(None);
+        }
+
+        visited.insert(id.to_string());
+        path.push(id.to_string());
+
+        // Get the skill
+        if let Some(skill) = repo.get(id)? {
+            // Check extends
+            if let Some(parent) = &skill.extends {
+                if let Some(cycle) = visit(parent, repo, visited, path)? {
+                    return Ok(Some(cycle));
+                }
+            }
+
+            // Check includes
+            for include in &skill.includes {
+                if let Some(cycle) = visit(&include.skill, repo, visited, path)? {
+                    return Ok(Some(cycle));
+                }
+            }
+        }
+
+        path.pop();
+        Ok(None)
+    }
+
+    match visit(skill_id, repository, &mut HashSet::new(), &mut Vec::new())? {
+        Some(cycle) => Ok(CycleDetectionResult::CycleFound(cycle)),
+        None => Ok(CycleDetectionResult::NoCycle),
+    }
+}
+
+/// Resolve a skill's inheritance, applying parent sections.
+/// Does NOT resolve includes - use `resolve_full` for complete resolution.
 pub fn resolve_extends<R: SkillRepository + ?Sized>(
     skill: &SkillSpec,
     repository: &R,
@@ -96,6 +165,7 @@ pub fn resolve_extends<R: SkillRepository + ?Sized>(
         return Ok(ResolvedSkillSpec {
             spec: skill.clone(),
             inheritance_chain: vec![skill.metadata.id.clone()],
+            included_from: Vec::new(),
             warnings,
         });
     };
@@ -141,6 +211,7 @@ pub fn resolve_extends<R: SkillRepository + ?Sized>(
     Ok(ResolvedSkillSpec {
         spec: merged_spec,
         inheritance_chain,
+        included_from: resolved_parent.included_from,
         warnings,
     })
 }
@@ -191,6 +262,9 @@ fn merge_skills(parent: &SkillSpec, child: &SkillSpec, warnings: &mut Vec<Resolu
     result.replace_examples = false;
     result.replace_pitfalls = false;
     result.replace_checklist = false;
+
+    // Preserve includes from child (these will be resolved later)
+    result.includes = child.includes.clone();
 
     // Merge sections based on replace_* flags
     merge_sections(&mut result.sections, &child.sections, child, warnings);
@@ -292,6 +366,186 @@ fn merge_blocks(
     // Add any remaining block types not in our order list
     for (_, blocks) in blocks_by_type {
         parent_blocks.extend(blocks);
+    }
+}
+
+// =============================================================================
+// INCLUDES RESOLUTION
+// =============================================================================
+
+/// Resolve a skill fully, applying both inheritance and includes.
+///
+/// Resolution order:
+/// 1. Resolve inheritance chain (extends)
+/// 2. Apply includes from other skills
+/// 3. Clear includes from the resolved spec
+pub fn resolve_full<R: SkillRepository + ?Sized>(
+    skill: &SkillSpec,
+    repository: &R,
+) -> Result<ResolvedSkillSpec> {
+    // First resolve inheritance
+    let mut resolved = resolve_extends(skill, repository)?;
+
+    // Check for cycles involving includes
+    match detect_full_cycle(&skill.metadata.id, repository)? {
+        CycleDetectionResult::NoCycle => {}
+        CycleDetectionResult::CycleFound(cycle) => {
+            return Err(MsError::CyclicInheritance {
+                skill_id: skill.metadata.id.clone(),
+                cycle,
+            });
+        }
+    }
+
+    // Apply includes
+    resolve_includes(&mut resolved, repository)?;
+
+    // Check for conflicts
+    check_include_conflicts(skill, &mut resolved.warnings);
+
+    // Clear includes from resolved spec (they're now applied)
+    resolved.spec.includes = Vec::new();
+
+    Ok(resolved)
+}
+
+/// Apply includes to a resolved skill spec.
+fn resolve_includes<R: SkillRepository + ?Sized>(
+    resolved: &mut ResolvedSkillSpec,
+    repository: &R,
+) -> Result<()> {
+    // Process includes in order
+    for include in &resolved.spec.includes.clone() {
+        // Get the included skill
+        let included_skill = match repository.get(&include.skill)? {
+            Some(skill) => skill,
+            None => {
+                resolved.warnings.push(ResolutionWarning::IncludedSkillNotFound {
+                    skill_id: include.skill.clone(),
+                    included_by: resolved.spec.metadata.id.clone(),
+                });
+                continue;
+            }
+        };
+
+        // Resolve the included skill first (recursively)
+        let resolved_included = resolve_full(&included_skill, repository)?;
+
+        // Apply the include
+        apply_include(&mut resolved.spec, &resolved_included.spec, include);
+
+        // Track included skill
+        resolved.included_from.push(include.skill.clone());
+
+        // Collect warnings from included skill resolution
+        resolved.warnings.extend(resolved_included.warnings);
+    }
+
+    Ok(())
+}
+
+/// Apply a single include to the target spec.
+fn apply_include(target: &mut SkillSpec, source: &SkillSpec, include: &SkillInclude) {
+    let target_block_type = include.into.to_block_type();
+
+    // Extract blocks from source that match the target type
+    let mut source_blocks: Vec<SkillBlock> = Vec::new();
+    for section in &source.sections {
+        // Filter by sections if specified
+        if let Some(section_filter) = &include.sections {
+            if !section_filter.iter().any(|s| s == &section.id || s == &section.title) {
+                continue;
+            }
+        }
+
+        for block in &section.blocks {
+            // For Context target, include Text blocks
+            // For other targets, match the specific block type
+            let matches = match include.into {
+                IncludeTarget::Context => block.block_type == BlockType::Text,
+                _ => block.block_type == target_block_type,
+            };
+
+            if matches {
+                let mut block = block.clone();
+                // Apply prefix if specified
+                if let Some(prefix) = &include.prefix {
+                    block.content = format!("{}{}", prefix, block.content);
+                }
+                source_blocks.push(block);
+            }
+        }
+    }
+
+    if source_blocks.is_empty() {
+        return;
+    }
+
+    // Find or create the target section
+    let section_id = match include.into {
+        IncludeTarget::Rules => "rules",
+        IncludeTarget::Examples => "examples",
+        IncludeTarget::Pitfalls => "pitfalls",
+        IncludeTarget::Checklist => "checklist",
+        IncludeTarget::Context => "context",
+    };
+
+    let target_section = target
+        .sections
+        .iter_mut()
+        .find(|s| s.id == section_id);
+
+    if let Some(section) = target_section {
+        // Apply blocks based on position
+        match include.position {
+            IncludePosition::Prepend => {
+                let mut new_blocks = source_blocks;
+                new_blocks.extend(section.blocks.drain(..));
+                section.blocks = new_blocks;
+            }
+            IncludePosition::Append => {
+                section.blocks.extend(source_blocks);
+            }
+        }
+    } else {
+        // Create new section
+        let title = match include.into {
+            IncludeTarget::Rules => "Rules",
+            IncludeTarget::Examples => "Examples",
+            IncludeTarget::Pitfalls => "Pitfalls",
+            IncludeTarget::Checklist => "Checklist",
+            IncludeTarget::Context => "Context",
+        };
+        target.sections.push(SkillSection {
+            id: section_id.to_string(),
+            title: title.to_string(),
+            blocks: source_blocks,
+        });
+    }
+}
+
+/// Check for potential conflicts with includes and add warnings.
+fn check_include_conflicts(skill: &SkillSpec, warnings: &mut Vec<ResolutionWarning>) {
+    // Group includes by target
+    let mut by_target: HashMap<IncludeTarget, Vec<&str>> = HashMap::new();
+
+    for include in &skill.includes {
+        by_target
+            .entry(include.into.clone())
+            .or_default()
+            .push(&include.skill);
+    }
+
+    // Warn if many skills include into the same target
+    const MANY_INCLUDES_THRESHOLD: usize = 3;
+    for (target, sources) in by_target {
+        if sources.len() > MANY_INCLUDES_THRESHOLD {
+            warnings.push(ResolutionWarning::ManyIncludes {
+                target,
+                count: sources.len(),
+                sources: sources.iter().map(|s| s.to_string()).collect(),
+            });
+        }
     }
 }
 
@@ -612,5 +866,381 @@ mod tests {
         let child = make_skill_with_parent("child", "Child", "parent");
         assert!(child.has_parent());
         assert_eq!(child.parent_id(), Some("parent"));
+    }
+
+    // =========================================================================
+    // INCLUDES TESTS
+    // =========================================================================
+
+    fn make_skill_with_rules(id: &str, name: &str, rules: Vec<&str>) -> SkillSpec {
+        let mut spec = SkillSpec::new(id, name);
+        spec.sections.push(SkillSection {
+            id: "rules".to_string(),
+            title: "Rules".to_string(),
+            blocks: rules
+                .into_iter()
+                .enumerate()
+                .map(|(i, content)| SkillBlock {
+                    id: format!("rule-{}", i + 1),
+                    block_type: BlockType::Rule,
+                    content: content.to_string(),
+                })
+                .collect(),
+        });
+        spec
+    }
+
+    #[test]
+    fn test_simple_include() {
+        let mut repo = TestRepository::new();
+
+        // Create a skill to include
+        let error_skill = make_skill_with_rules(
+            "error-handling",
+            "Error Handling",
+            vec!["Always handle errors", "Log errors with context"],
+        );
+        repo.add(error_skill);
+
+        // Create a skill that includes it
+        let mut main_skill = SkillSpec::new("main", "Main Skill");
+        main_skill.includes.push(SkillInclude {
+            skill: "error-handling".to_string(),
+            into: IncludeTarget::Rules,
+            prefix: None,
+            sections: None,
+            position: IncludePosition::Append,
+        });
+        main_skill.sections.push(SkillSection {
+            id: "rules".to_string(),
+            title: "Rules".to_string(),
+            blocks: vec![SkillBlock {
+                id: "main-rule-1".to_string(),
+                block_type: BlockType::Rule,
+                content: "Main rule".to_string(),
+            }],
+        });
+
+        let resolved = resolve_full(&main_skill, &repo).unwrap();
+
+        // Should have main rule + 2 included rules
+        let rules_section = resolved.spec.sections.iter().find(|s| s.id == "rules").unwrap();
+        assert_eq!(rules_section.blocks.len(), 3);
+        assert_eq!(rules_section.blocks[0].content, "Main rule");
+        assert_eq!(rules_section.blocks[1].content, "Always handle errors");
+        assert_eq!(rules_section.blocks[2].content, "Log errors with context");
+
+        // Should track included skills
+        assert_eq!(resolved.included_from, vec!["error-handling"]);
+    }
+
+    #[test]
+    fn test_include_with_prepend() {
+        let mut repo = TestRepository::new();
+
+        let error_skill = make_skill_with_rules("error-handling", "Error Handling", vec!["Error rule"]);
+        repo.add(error_skill);
+
+        let mut main_skill = make_skill_with_rules("main", "Main", vec!["Main rule"]);
+        main_skill.includes.push(SkillInclude {
+            skill: "error-handling".to_string(),
+            into: IncludeTarget::Rules,
+            prefix: None,
+            sections: None,
+            position: IncludePosition::Prepend,
+        });
+
+        let resolved = resolve_full(&main_skill, &repo).unwrap();
+
+        let rules_section = resolved.spec.sections.iter().find(|s| s.id == "rules").unwrap();
+        // Error rule should come first (prepended)
+        assert_eq!(rules_section.blocks[0].content, "Error rule");
+        assert_eq!(rules_section.blocks[1].content, "Main rule");
+    }
+
+    #[test]
+    fn test_include_with_prefix() {
+        let mut repo = TestRepository::new();
+
+        let error_skill = make_skill_with_rules("error-handling", "Error Handling", vec!["Handle errors"]);
+        repo.add(error_skill);
+
+        let mut main_skill = SkillSpec::new("main", "Main");
+        main_skill.includes.push(SkillInclude {
+            skill: "error-handling".to_string(),
+            into: IncludeTarget::Rules,
+            prefix: Some("[Error] ".to_string()),
+            sections: None,
+            position: IncludePosition::Append,
+        });
+
+        let resolved = resolve_full(&main_skill, &repo).unwrap();
+
+        let rules_section = resolved.spec.sections.iter().find(|s| s.id == "rules").unwrap();
+        assert_eq!(rules_section.blocks[0].content, "[Error] Handle errors");
+    }
+
+    #[test]
+    fn test_multiple_includes() {
+        let mut repo = TestRepository::new();
+
+        let error_skill = make_skill_with_rules("error-handling", "Errors", vec!["Error rule"]);
+        let testing_skill = make_skill_with_rules("testing", "Testing", vec!["Test rule"]);
+        repo.add(error_skill);
+        repo.add(testing_skill);
+
+        let mut main_skill = SkillSpec::new("main", "Main");
+        main_skill.includes.push(SkillInclude {
+            skill: "error-handling".to_string(),
+            into: IncludeTarget::Rules,
+            prefix: None,
+            sections: None,
+            position: IncludePosition::Append,
+        });
+        main_skill.includes.push(SkillInclude {
+            skill: "testing".to_string(),
+            into: IncludeTarget::Rules,
+            prefix: None,
+            sections: None,
+            position: IncludePosition::Append,
+        });
+
+        let resolved = resolve_full(&main_skill, &repo).unwrap();
+
+        let rules_section = resolved.spec.sections.iter().find(|s| s.id == "rules").unwrap();
+        assert_eq!(rules_section.blocks.len(), 2);
+        assert_eq!(resolved.included_from, vec!["error-handling", "testing"]);
+    }
+
+    #[test]
+    fn test_include_creates_section_if_missing() {
+        let mut repo = TestRepository::new();
+
+        let error_skill = make_skill_with_rules("error-handling", "Errors", vec!["Error rule"]);
+        repo.add(error_skill);
+
+        // Main skill has no rules section
+        let mut main_skill = SkillSpec::new("main", "Main");
+        main_skill.includes.push(SkillInclude {
+            skill: "error-handling".to_string(),
+            into: IncludeTarget::Rules,
+            prefix: None,
+            sections: None,
+            position: IncludePosition::Append,
+        });
+
+        let resolved = resolve_full(&main_skill, &repo).unwrap();
+
+        // Should have created a rules section
+        let rules_section = resolved.spec.sections.iter().find(|s| s.id == "rules");
+        assert!(rules_section.is_some());
+        assert_eq!(rules_section.unwrap().blocks.len(), 1);
+    }
+
+    #[test]
+    fn test_include_missing_skill_warning() {
+        let repo = TestRepository::new();
+
+        let mut main_skill = SkillSpec::new("main", "Main");
+        main_skill.includes.push(SkillInclude {
+            skill: "nonexistent".to_string(),
+            into: IncludeTarget::Rules,
+            prefix: None,
+            sections: None,
+            position: IncludePosition::Append,
+        });
+
+        let resolved = resolve_full(&main_skill, &repo).unwrap();
+
+        // Should have a warning about missing skill
+        let has_warning = resolved.warnings.iter().any(|w| {
+            matches!(w, ResolutionWarning::IncludedSkillNotFound { skill_id, .. } if skill_id == "nonexistent")
+        });
+        assert!(has_warning);
+    }
+
+    #[test]
+    fn test_include_with_inheritance() {
+        let mut repo = TestRepository::new();
+
+        // Parent skill
+        let parent = make_skill_with_rules("parent", "Parent", vec!["Parent rule"]);
+        repo.add(parent);
+
+        // Skill to include
+        let error_skill = make_skill_with_rules("errors", "Errors", vec!["Error rule"]);
+        repo.add(error_skill);
+
+        // Child extends parent and includes errors
+        let mut child = make_skill_with_parent("child", "Child", "parent");
+        child.includes.push(SkillInclude {
+            skill: "errors".to_string(),
+            into: IncludeTarget::Rules,
+            prefix: None,
+            sections: None,
+            position: IncludePosition::Append,
+        });
+
+        let resolved = resolve_full(&child, &repo).unwrap();
+
+        // Should have parent rule + error rule
+        let rules_section = resolved.spec.sections.iter().find(|s| s.id == "rules").unwrap();
+        assert_eq!(rules_section.blocks.len(), 2);
+        assert_eq!(resolved.inheritance_chain, vec!["parent", "child"]);
+        assert_eq!(resolved.included_from, vec!["errors"]);
+    }
+
+    #[test]
+    fn test_include_cycle_detection() {
+        let mut repo = TestRepository::new();
+
+        // A includes B, B includes A
+        let mut skill_a = SkillSpec::new("a", "A");
+        skill_a.includes.push(SkillInclude {
+            skill: "b".to_string(),
+            into: IncludeTarget::Rules,
+            prefix: None,
+            sections: None,
+            position: IncludePosition::Append,
+        });
+
+        let mut skill_b = SkillSpec::new("b", "B");
+        skill_b.includes.push(SkillInclude {
+            skill: "a".to_string(),
+            into: IncludeTarget::Rules,
+            prefix: None,
+            sections: None,
+            position: IncludePosition::Append,
+        });
+
+        repo.add(skill_a.clone());
+        repo.add(skill_b);
+
+        let result = detect_full_cycle("a", &repo).unwrap();
+        assert!(matches!(result, CycleDetectionResult::CycleFound(_)));
+
+        let err = resolve_full(&skill_a, &repo).unwrap_err();
+        assert!(matches!(err, MsError::CyclicInheritance { .. }));
+    }
+
+    #[test]
+    fn test_many_includes_warning() {
+        let mut repo = TestRepository::new();
+
+        // Create 5 skills to include
+        for i in 1..=5 {
+            let skill = make_skill_with_rules(&format!("skill-{}", i), &format!("Skill {}", i), vec!["Rule"]);
+            repo.add(skill);
+        }
+
+        let mut main_skill = SkillSpec::new("main", "Main");
+        for i in 1..=5 {
+            main_skill.includes.push(SkillInclude {
+                skill: format!("skill-{}", i),
+                into: IncludeTarget::Rules,
+                prefix: None,
+                sections: None,
+                position: IncludePosition::Append,
+            });
+        }
+
+        let resolved = resolve_full(&main_skill, &repo).unwrap();
+
+        // Should have warning about many includes to same target
+        let has_warning = resolved.warnings.iter().any(|w| {
+            matches!(w, ResolutionWarning::ManyIncludes { count, .. } if *count == 5)
+        });
+        assert!(has_warning);
+    }
+
+    #[test]
+    fn test_includes_cleared_after_resolution() {
+        let mut repo = TestRepository::new();
+
+        let error_skill = make_skill_with_rules("errors", "Errors", vec!["Error rule"]);
+        repo.add(error_skill);
+
+        let mut main_skill = SkillSpec::new("main", "Main");
+        main_skill.includes.push(SkillInclude {
+            skill: "errors".to_string(),
+            into: IncludeTarget::Rules,
+            prefix: None,
+            sections: None,
+            position: IncludePosition::Append,
+        });
+
+        let resolved = resolve_full(&main_skill, &repo).unwrap();
+
+        // Includes should be cleared from resolved spec
+        assert!(resolved.spec.includes.is_empty());
+    }
+
+    #[test]
+    fn test_include_into_different_targets() {
+        let mut repo = TestRepository::new();
+
+        // Create a skill with both rules and pitfalls
+        let mut source_skill = SkillSpec::new("source", "Source");
+        source_skill.sections.push(SkillSection {
+            id: "rules".to_string(),
+            title: "Rules".to_string(),
+            blocks: vec![SkillBlock {
+                id: "rule-1".to_string(),
+                block_type: BlockType::Rule,
+                content: "Source rule".to_string(),
+            }],
+        });
+        source_skill.sections.push(SkillSection {
+            id: "pitfalls".to_string(),
+            title: "Pitfalls".to_string(),
+            blocks: vec![SkillBlock {
+                id: "pitfall-1".to_string(),
+                block_type: BlockType::Pitfall,
+                content: "Source pitfall".to_string(),
+            }],
+        });
+        repo.add(source_skill);
+
+        // Include rules and pitfalls separately
+        let mut main_skill = SkillSpec::new("main", "Main");
+        main_skill.includes.push(SkillInclude {
+            skill: "source".to_string(),
+            into: IncludeTarget::Rules,
+            prefix: None,
+            sections: None,
+            position: IncludePosition::Append,
+        });
+        main_skill.includes.push(SkillInclude {
+            skill: "source".to_string(),
+            into: IncludeTarget::Pitfalls,
+            prefix: None,
+            sections: None,
+            position: IncludePosition::Append,
+        });
+
+        let resolved = resolve_full(&main_skill, &repo).unwrap();
+
+        // Should have both sections
+        let rules = resolved.spec.sections.iter().find(|s| s.id == "rules").unwrap();
+        let pitfalls = resolved.spec.sections.iter().find(|s| s.id == "pitfalls").unwrap();
+
+        assert_eq!(rules.blocks.len(), 1);
+        assert_eq!(pitfalls.blocks.len(), 1);
+    }
+
+    #[test]
+    fn test_has_includes() {
+        let standalone = make_skill("standalone", "Standalone");
+        assert!(!standalone.has_includes());
+
+        let mut with_includes = SkillSpec::new("with-includes", "With Includes");
+        with_includes.includes.push(SkillInclude {
+            skill: "other".to_string(),
+            into: IncludeTarget::Rules,
+            prefix: None,
+            sections: None,
+            position: IncludePosition::Append,
+        });
+        assert!(with_includes.has_includes());
     }
 }

@@ -71,6 +71,86 @@ pub struct SkillSpec {
     /// If true, replace parent's checklist instead of appending.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub replace_checklist: bool,
+
+    // === COMPOSITION FIELDS ===
+
+    /// Other skills to include/compose into this skill.
+    /// Includes are applied after inheritance resolution.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub includes: Vec<SkillInclude>,
+}
+
+// =============================================================================
+// SKILL COMPOSITION (INCLUDES)
+// =============================================================================
+
+/// Specification for including content from another skill.
+///
+/// Unlike inheritance (`extends`), includes allow composing content from
+/// multiple skills by merging specific sections or block types into target
+/// sections.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillInclude {
+    /// ID of the skill to include content from.
+    pub skill: String,
+
+    /// Target section/block type to merge included content into.
+    pub into: IncludeTarget,
+
+    /// Optional prefix to add to included items for clarity.
+    /// E.g., "Error: " to prefix all rules from an error handling skill.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+
+    /// Specific sections to include from the source skill.
+    /// If empty, includes all matching sections.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sections: Option<Vec<String>>,
+
+    /// Position to insert included content: prepend or append (default).
+    #[serde(default)]
+    pub position: IncludePosition,
+}
+
+/// Target for included content - which section/block type to merge into.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum IncludeTarget {
+    /// Merge into rules section/blocks
+    Rules,
+    /// Merge into examples section/blocks
+    Examples,
+    /// Merge into pitfalls section/blocks
+    Pitfalls,
+    /// Merge into checklist section/blocks
+    Checklist,
+    /// Merge into context/overview section
+    Context,
+}
+
+impl IncludeTarget {
+    /// Get the corresponding BlockType for this target.
+    #[must_use]
+    pub const fn to_block_type(&self) -> BlockType {
+        match self {
+            Self::Rules => BlockType::Rule,
+            Self::Examples => BlockType::Code,
+            Self::Pitfalls => BlockType::Pitfall,
+            Self::Checklist => BlockType::Checklist,
+            Self::Context => BlockType::Text,
+        }
+    }
+}
+
+/// Position for inserting included content.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IncludePosition {
+    /// Insert before existing content
+    Prepend,
+    /// Insert after existing content (default)
+    #[default]
+    Append,
 }
 
 impl Default for SkillSpec {
@@ -84,6 +164,7 @@ impl Default for SkillSpec {
             replace_examples: false,
             replace_pitfalls: false,
             replace_checklist: false,
+            includes: Vec::new(),
         }
     }
 }
@@ -186,15 +267,24 @@ impl SkillSpec {
             replace_examples: false,
             replace_pitfalls: false,
             replace_checklist: false,
+            includes: Vec::new(),
         }
     }
 
+    /// Check if this skill includes other skills
+    #[must_use]
+    pub fn has_includes(&self) -> bool {
+        !self.includes.is_empty()
+    }
+
     /// Check if this skill extends another skill
-    pub fn has_parent(&self) -> bool {
+    #[must_use] 
+    pub const fn has_parent(&self) -> bool {
         self.extends.is_some()
     }
 
     /// Get the parent skill ID if this skill extends another
+    #[must_use] 
     pub fn parent_id(&self) -> Option<&str> {
         self.extends.as_deref()
     }
@@ -236,12 +326,13 @@ pub enum SkillLayer {
 }
 
 impl SkillLayer {
-    pub fn as_str(&self) -> &'static str {
+    #[must_use] 
+    pub const fn as_str(&self) -> &'static str {
         match self {
-            SkillLayer::Base => "base",
-            SkillLayer::Org => "org",
-            SkillLayer::Project => "project",
-            SkillLayer::User => "user",
+            Self::Base => "base",
+            Self::Org => "org",
+            Self::Project => "project",
+            Self::User => "user",
         }
     }
 }
@@ -308,7 +399,7 @@ pub struct TestFile {
 /// Trigger condition for skill suggestion
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillTrigger {
-    /// Trigger type: "command", "file_pattern", "keyword", "context"
+    /// Trigger type: "command", "`file_pattern`", "keyword", "context"
     pub trigger_type: String,
     /// Pattern to match
     pub pattern: String,
@@ -378,7 +469,7 @@ pub enum NetworkRequirement {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ContextTags {
     /// Project types this skill is relevant for (e.g., "rust", "node", "python").
-    /// Should match ProjectType identifiers from the detector module.
+    /// Should match `ProjectType` identifiers from the detector module.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub project_types: Vec<String>,
 
@@ -399,6 +490,7 @@ pub struct ContextTags {
 
 impl ContextTags {
     /// Check if this context has any relevance criteria defined.
+    #[must_use] 
     pub fn is_empty(&self) -> bool {
         self.project_types.is_empty()
             && self.file_patterns.is_empty()
@@ -407,6 +499,7 @@ impl ContextTags {
     }
 
     /// Check if a project type matches this context.
+    #[must_use] 
     pub fn matches_project_type(&self, project_type: &str) -> bool {
         if self.project_types.is_empty() {
             return false;
@@ -418,6 +511,7 @@ impl ContextTags {
     }
 
     /// Check if a filename matches any file pattern.
+    #[must_use] 
     pub fn matches_file(&self, filename: &str) -> bool {
         for pattern in &self.file_patterns {
             if pattern_matches(pattern, filename) {
@@ -428,6 +522,7 @@ impl ContextTags {
     }
 
     /// Check if a tool name matches.
+    #[must_use] 
     pub fn matches_tool(&self, tool: &str) -> bool {
         if self.tools.is_empty() {
             return false;
@@ -455,7 +550,7 @@ pub struct ContextSignal {
     pub weight: f32,
 }
 
-fn default_signal_weight() -> f32 {
+const fn default_signal_weight() -> f32 {
     0.5
 }
 
@@ -470,6 +565,7 @@ impl ContextSignal {
     }
 
     /// Compile the pattern to a regex (returns None if invalid).
+    #[must_use] 
     pub fn compile_pattern(&self) -> Option<regex::Regex> {
         regex::Regex::new(&self.pattern).ok()
     }
@@ -628,7 +724,7 @@ pub enum VersionOp {
 // =============================================================================
 
 /// Rule-level evidence index for provenance and auditing.
-/// Uses BTreeMap for deterministic serialization (consistent JSON output).
+/// Uses `BTreeMap` for deterministic serialization (consistent JSON output).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SkillEvidenceIndex {
     /// Map of rule ID to evidence references
@@ -700,7 +796,7 @@ pub struct SkillPack {
 /// Pack contracts define minimal guidance guarantees for specific tasks
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PackContract {
-    /// Contract ID (e.g., "DebugContract")
+    /// Contract ID (e.g., "`DebugContract`")
     pub id: String,
     /// Description of what this contract guarantees
     pub description: String,
@@ -725,8 +821,8 @@ pub struct PackContract {
 // =============================================================================
 
 /// Mapping from compiled markdown back to spec blocks.
-/// Note: Named SpecLensMapping to avoid collision with the SpecLens
-/// converter type in spec_lens.rs.
+/// Note: Named `SpecLensMapping` to avoid collision with the `SpecLens`
+/// converter type in `spec_lens.rs`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpecLensMapping {
     /// Format version
