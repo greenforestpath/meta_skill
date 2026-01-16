@@ -593,6 +593,7 @@ fn merge_metadata(skill: &SkillRecord, parsed_meta: &SkillMetadata) -> SkillMeta
         platforms: parsed_meta.platforms.clone(),
         author: skill.author.clone().or_else(|| parsed_meta.author.clone()),
         license: parsed_meta.license.clone(),
+        context: parsed_meta.context.clone(),
     }
 }
 

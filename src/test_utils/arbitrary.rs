@@ -75,6 +75,7 @@ fn arb_skill_metadata() -> impl Strategy<Value = SkillMetadata> {
                 platforms,
                 author,
                 license,
+                context: Default::default(),
             },
         )
 }

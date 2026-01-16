@@ -82,6 +82,9 @@ pub struct SkillMetadata {
     /// License
     #[serde(default)]
     pub license: Option<String>,
+    /// Context tags for auto-loading relevance matching.
+    #[serde(default, skip_serializing_if = "ContextTags::is_empty")]
+    pub context: ContextTags,
 }
 
 /// A section in a skill
@@ -308,6 +311,166 @@ pub enum NetworkRequirement {
     OfflineOk,
     Required,
     PreferOffline,
+}
+
+// =============================================================================
+// CONTEXT TAGS (AUTO-LOADING)
+// =============================================================================
+
+/// Context metadata for skill auto-loading and relevance matching.
+///
+/// Skills can declare what contexts they're relevant for, enabling
+/// automatic suggestion when the user is working in a matching context.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ContextTags {
+    /// Project types this skill is relevant for (e.g., "rust", "node", "python").
+    /// Should match ProjectType identifiers from the detector module.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub project_types: Vec<String>,
+
+    /// File glob patterns that indicate relevance (e.g., "*.rs", "Cargo.toml").
+    /// When files matching these patterns are open or modified, boost the skill.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub file_patterns: Vec<String>,
+
+    /// Tool/binary names that indicate relevance (e.g., "cargo", "rustc", "npm").
+    /// When these tools are detected in the environment, boost the skill.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<String>,
+
+    /// Advanced signal patterns for fine-grained relevance matching.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub signals: Vec<ContextSignal>,
+}
+
+impl ContextTags {
+    /// Check if this context has any relevance criteria defined.
+    pub fn is_empty(&self) -> bool {
+        self.project_types.is_empty()
+            && self.file_patterns.is_empty()
+            && self.tools.is_empty()
+            && self.signals.is_empty()
+    }
+
+    /// Check if a project type matches this context.
+    pub fn matches_project_type(&self, project_type: &str) -> bool {
+        if self.project_types.is_empty() {
+            return false;
+        }
+        let pt_lower = project_type.to_lowercase();
+        self.project_types
+            .iter()
+            .any(|t| t.to_lowercase() == pt_lower)
+    }
+
+    /// Check if a filename matches any file pattern.
+    pub fn matches_file(&self, filename: &str) -> bool {
+        for pattern in &self.file_patterns {
+            if pattern_matches(pattern, filename) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Check if a tool name matches.
+    pub fn matches_tool(&self, tool: &str) -> bool {
+        if self.tools.is_empty() {
+            return false;
+        }
+        let tool_lower = tool.to_lowercase();
+        self.tools.iter().any(|t| t.to_lowercase() == tool_lower)
+    }
+}
+
+/// A contextual signal pattern for relevance matching.
+///
+/// Signals are advanced patterns that look for specific code constructs
+/// or content patterns to determine skill relevance.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextSignal {
+    /// Human-readable name for this signal.
+    pub name: String,
+
+    /// Regex pattern to match against file content.
+    pub pattern: String,
+
+    /// Weight/contribution of this signal (0.0-1.0).
+    /// Higher weights mean stronger relevance indication.
+    #[serde(default = "default_signal_weight")]
+    pub weight: f32,
+}
+
+fn default_signal_weight() -> f32 {
+    0.5
+}
+
+impl ContextSignal {
+    /// Create a new context signal.
+    pub fn new(name: impl Into<String>, pattern: impl Into<String>, weight: f32) -> Self {
+        Self {
+            name: name.into(),
+            pattern: pattern.into(),
+            weight: weight.clamp(0.0, 1.0),
+        }
+    }
+
+    /// Compile the pattern to a regex (returns None if invalid).
+    pub fn compile_pattern(&self) -> Option<regex::Regex> {
+        regex::Regex::new(&self.pattern).ok()
+    }
+}
+
+/// Simple glob pattern matching for file patterns.
+fn pattern_matches(pattern: &str, filename: &str) -> bool {
+    // Handle exact matches
+    if pattern == filename {
+        return true;
+    }
+
+    // Handle ** glob (match any directory structure) - check this FIRST
+    // because ** patterns also contain single *
+    if pattern.contains("**") {
+        let parts: Vec<&str> = pattern.split("**").collect();
+        if parts.len() == 2 {
+            let prefix = parts[0];
+            let suffix = parts[1];
+
+            // Check prefix (empty prefix means match from start)
+            let prefix_ok = prefix.is_empty() || filename.starts_with(prefix);
+            if !prefix_ok {
+                return false;
+            }
+
+            // Handle suffix patterns like "/*.rs" or "*.rs"
+            let suffix = suffix.strip_prefix('/').unwrap_or(suffix);
+            if suffix.is_empty() {
+                return true;
+            }
+
+            // If suffix starts with *, check extension match
+            if let Some(ext) = suffix.strip_prefix('*') {
+                return filename.ends_with(ext);
+            }
+
+            // Otherwise check exact suffix match
+            return filename.ends_with(suffix);
+        }
+    }
+
+    // Handle simple wildcards at start (e.g., "*.rs")
+    if let Some(suffix) = pattern.strip_prefix('*') {
+        // Skip leading / if present (e.g., "/*.rs" should match ".rs")
+        let suffix = suffix.strip_prefix('/').unwrap_or(suffix);
+        return filename.ends_with(suffix);
+    }
+
+    // Handle simple wildcards at end (e.g., "Cargo*")
+    if let Some(prefix) = pattern.strip_suffix('*') {
+        return filename.starts_with(prefix);
+    }
+
+    false
 }
 
 // =============================================================================
@@ -582,5 +745,167 @@ mod tests {
             let parsed: VersionOp = serde_json::from_str(&json).unwrap();
             assert_eq!(op, parsed);
         }
+    }
+
+    // Context tags tests
+
+    #[test]
+    fn test_context_tags_empty() {
+        let ctx = ContextTags::default();
+        assert!(ctx.is_empty());
+    }
+
+    #[test]
+    fn test_context_tags_not_empty() {
+        let ctx = ContextTags {
+            project_types: vec!["rust".to_string()],
+            ..Default::default()
+        };
+        assert!(!ctx.is_empty());
+    }
+
+    #[test]
+    fn test_context_tags_matches_project_type() {
+        let ctx = ContextTags {
+            project_types: vec!["rust".to_string(), "python".to_string()],
+            ..Default::default()
+        };
+        assert!(ctx.matches_project_type("rust"));
+        assert!(ctx.matches_project_type("RUST")); // Case insensitive
+        assert!(ctx.matches_project_type("Python"));
+        assert!(!ctx.matches_project_type("node"));
+    }
+
+    #[test]
+    fn test_context_tags_matches_file() {
+        let ctx = ContextTags {
+            file_patterns: vec!["*.rs".to_string(), "Cargo.toml".to_string()],
+            ..Default::default()
+        };
+        assert!(ctx.matches_file("main.rs"));
+        assert!(ctx.matches_file("lib.rs"));
+        assert!(ctx.matches_file("Cargo.toml"));
+        assert!(!ctx.matches_file("package.json"));
+    }
+
+    #[test]
+    fn test_context_tags_matches_tool() {
+        let ctx = ContextTags {
+            tools: vec!["cargo".to_string(), "rustc".to_string()],
+            ..Default::default()
+        };
+        assert!(ctx.matches_tool("cargo"));
+        assert!(ctx.matches_tool("CARGO")); // Case insensitive
+        assert!(ctx.matches_tool("rustc"));
+        assert!(!ctx.matches_tool("npm"));
+    }
+
+    #[test]
+    fn test_context_signal_new() {
+        let signal = ContextSignal::new("error_handling", "use.*thiserror", 0.8);
+        assert_eq!(signal.name, "error_handling");
+        assert_eq!(signal.pattern, "use.*thiserror");
+        assert!((signal.weight - 0.8).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_context_signal_weight_clamped() {
+        let signal = ContextSignal::new("test", "pattern", 1.5);
+        assert!((signal.weight - 1.0).abs() < 0.001);
+
+        let signal = ContextSignal::new("test", "pattern", -0.5);
+        assert!(signal.weight.abs() < 0.001);
+    }
+
+    #[test]
+    fn test_context_signal_compile_pattern() {
+        let signal = ContextSignal::new("test", r"Result<.*,.*>", 0.5);
+        let regex = signal.compile_pattern();
+        assert!(regex.is_some());
+        let regex = regex.unwrap();
+        assert!(regex.is_match("fn foo() -> Result<i32, Error>"));
+    }
+
+    #[test]
+    fn test_context_signal_invalid_pattern() {
+        let signal = ContextSignal::new("test", "[invalid", 0.5);
+        let regex = signal.compile_pattern();
+        assert!(regex.is_none());
+    }
+
+    #[test]
+    fn test_context_tags_serialization() {
+        let ctx = ContextTags {
+            project_types: vec!["rust".to_string()],
+            file_patterns: vec!["*.rs".to_string()],
+            tools: vec!["cargo".to_string()],
+            signals: vec![ContextSignal::new("test", "pattern", 0.5)],
+        };
+        let json = serde_json::to_string(&ctx).unwrap();
+        let parsed: ContextTags = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.project_types, ctx.project_types);
+        assert_eq!(parsed.file_patterns, ctx.file_patterns);
+        assert_eq!(parsed.tools, ctx.tools);
+        assert_eq!(parsed.signals.len(), 1);
+    }
+
+    #[test]
+    fn test_skill_metadata_with_context() {
+        let yaml = r#"
+id: rust-errors
+name: Rust Error Handling
+version: "1.0.0"
+context:
+  project_types:
+    - rust
+  file_patterns:
+    - "*.rs"
+  tools:
+    - cargo
+  signals:
+    - name: thiserror_usage
+      pattern: "use.*thiserror"
+      weight: 0.8
+"#;
+        let metadata: SkillMetadata = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(metadata.id, "rust-errors");
+        assert!(!metadata.context.is_empty());
+        assert!(metadata.context.matches_project_type("rust"));
+        assert!(metadata.context.matches_file("main.rs"));
+        assert!(metadata.context.matches_tool("cargo"));
+        assert_eq!(metadata.context.signals.len(), 1);
+    }
+
+    #[test]
+    fn test_skill_metadata_empty_context_not_serialized() {
+        let metadata = SkillMetadata {
+            id: "test".to_string(),
+            name: "Test".to_string(),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&metadata).unwrap();
+        // Empty context should not be in the JSON
+        assert!(!json.contains("context"));
+    }
+
+    #[test]
+    fn test_pattern_matches_glob() {
+        // Prefix glob
+        assert!(pattern_matches("*.rs", "main.rs"));
+        assert!(pattern_matches("*.rs", "lib.rs"));
+        assert!(!pattern_matches("*.rs", "package.json"));
+
+        // Suffix glob
+        assert!(pattern_matches("Cargo*", "Cargo.toml"));
+        assert!(pattern_matches("Cargo*", "Cargo.lock"));
+        assert!(!pattern_matches("Cargo*", "package.json"));
+
+        // Double star glob
+        assert!(pattern_matches("**/*.rs", "src/main.rs"));
+        assert!(pattern_matches("src/**", "src/lib.rs"));
+
+        // Exact match
+        assert!(pattern_matches("Cargo.toml", "Cargo.toml"));
+        assert!(!pattern_matches("Cargo.toml", "cargo.toml"));
     }
 }
