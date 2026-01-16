@@ -5,7 +5,7 @@
 
 use std::collections::HashSet;
 
-use crate::core::skill::{ContextSignal, ContextTags, SkillMetadata};
+use crate::core::skill::{ContextTags, SkillMetadata};
 
 use super::detector::{DetectedProject, ProjectType};
 
@@ -360,6 +360,7 @@ impl RelevanceScorer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::skill::ContextSignal;
     use std::path::PathBuf;
 
     fn sample_rust_skill() -> SkillMetadata {

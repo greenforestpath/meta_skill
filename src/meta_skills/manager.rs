@@ -1,10 +1,10 @@
 //! MetaSkill manager - resolves slices, evaluates conditions, and packs content.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::app::AppContext;
-use crate::core::skill::SkillSlice;
+use crate::core::skill::{SkillSlice, SkillSpec};
 use crate::core::slicing::SkillSlicer;
 use crate::core::spec_lens::parse_markdown;
 use crate::error::{MsError, Result};
@@ -127,10 +127,16 @@ impl<'a> MetaSkillManager<'a> {
         let mut resolved_slices = Vec::new();
         let mut skipped = Vec::new();
         let mut loaded_slice_keys: HashSet<(String, String)> = HashSet::new();
+        let mut parsed_skills_cache: HashMap<String, SkillSpec> = HashMap::new();
 
         // First pass: resolve all slice references
         for slice_ref in &meta_skill.slices {
-            let resolution = self.resolve_slice_ref(slice_ref, condition_ctx, &loaded_slice_keys);
+            let resolution = self.resolve_slice_ref(
+                slice_ref,
+                condition_ctx,
+                &loaded_slice_keys,
+                &mut parsed_skills_cache,
+            );
 
             match resolution {
                 SliceResolution::Resolved(slices) => {
@@ -189,6 +195,7 @@ impl<'a> MetaSkillManager<'a> {
         slice_ref: &MetaSkillSliceRef,
         condition_ctx: &ConditionContext,
         loaded_slices: &HashSet<(String, String)>,
+        parsed_skills_cache: &mut HashMap<String, SkillSpec>,
     ) -> SliceResolution {
         // Check conditions first
         if !slice_ref.conditions.is_empty() {
@@ -208,31 +215,38 @@ impl<'a> MetaSkillManager<'a> {
             }
         }
 
-        // Look up the skill
-        let skill_record = match self.lookup_skill(&slice_ref.skill_id) {
-            Some(record) => record,
-            None => {
-                return SliceResolution::Skipped(SkippedSlice {
-                    skill_id: slice_ref.skill_id.clone(),
-                    slice_id: None,
-                    reason: SkipReason::SkillNotFound,
-                });
-            }
-        };
+        // Ensure skill is in cache
+        if !parsed_skills_cache.contains_key(&slice_ref.skill_id) {
+            // Look up the skill
+            let skill_record = match self.lookup_skill(&slice_ref.skill_id) {
+                Some(record) => record,
+                None => {
+                    return SliceResolution::Skipped(SkippedSlice {
+                        skill_id: slice_ref.skill_id.clone(),
+                        slice_id: None,
+                        reason: SkipReason::SkillNotFound,
+                    });
+                }
+            };
 
-        // Parse and slice the skill
-        let spec = match parse_markdown(&skill_record.body) {
-            Ok(s) => s,
-            Err(e) => {
-                return SliceResolution::Skipped(SkippedSlice {
-                    skill_id: slice_ref.skill_id.clone(),
-                    slice_id: None,
-                    reason: SkipReason::ResolutionError(e.to_string()),
-                });
-            }
-        };
+            // Parse and slice the skill
+            let spec = match parse_markdown(&skill_record.body) {
+                Ok(s) => s,
+                Err(e) => {
+                    return SliceResolution::Skipped(SkippedSlice {
+                        skill_id: slice_ref.skill_id.clone(),
+                        slice_id: None,
+                        reason: SkipReason::ResolutionError(e.to_string()),
+                    });
+                }
+            };
+            parsed_skills_cache.insert(slice_ref.skill_id.clone(), spec);
+        }
 
-        let slice_index = SkillSlicer::slice(&spec);
+        // Get spec from cache
+        let spec = &parsed_skills_cache[&slice_ref.skill_id];
+
+        let slice_index = SkillSlicer::slice(spec);
         let all_slices = slice_index.slices;
 
         // Filter to requested slices or use level-based selection
