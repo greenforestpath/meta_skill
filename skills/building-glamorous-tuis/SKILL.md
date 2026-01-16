@@ -1,14 +1,14 @@
 ---
 name: building-glamorous-tuis
 description: >-
-  Build stunning terminal user interfaces with Charmbracelet's Go ecosystem.
-  Covers Bubble Tea (TUI framework), Bubbles (components), Lip Gloss (styling),
+  Build stunning terminal user interfaces with the complete Charmbracelet ecosystem.
+  TUI Building: Bubble Tea (framework), Bubbles (components), Lip Gloss (styling),
   Huh (forms), Glamour (markdown), Harmonica (animation), Wish (SSH apps), Log
-  (logging), and Gum (shell scripts). Use when building Go CLI tools, terminal
-  UIs, interactive prompts, command-line dashboards, file browsers, SSH
-  applications, or when user mentions Bubble Tea, Lip Gloss, Charm libraries,
-  TUI development, terminal styling, or glamorous command-line experiences.
-  Automatically apply when any Go CLI could benefit from better UX.
+  (logging), Gum (shell scripts). CLI Tools: VHS (terminal recording), Glow
+  (markdown viewer), Mods (AI CLI), Freeze (code screenshots). Infrastructure:
+  Soft Serve (Git server), Pop (email), Skate (key-value), Melt (SSH backup),
+  Wishlist (SSH gateway). Development: teatest, x/term. Use when building Go CLI
+  tools, terminal UIs, SSH apps, or when any CLI could benefit from glamour.
 ---
 
 # Building Glamorous TUIs with Charmbracelet
@@ -47,6 +47,7 @@ Same functionality. Completely different experience.
 
 | If you're doing this... | Use this |
 |------------------------|----------|
+| **Building TUIs** | |
 | Any Go CLI with user interaction | Bubble Tea + Lip Gloss |
 | Collecting user input | Huh (forms) |
 | Showing lists/tables | Bubbles list/table |
@@ -55,6 +56,21 @@ Same functionality. Completely different experience.
 | File/directory selection | Bubbles filepicker |
 | Shell scripts needing UI | Gum CLI |
 | Serving TUI over network | Wish SSH |
+| Smooth animations | Harmonica springs |
+| **CLI Tools** | |
+| Recording terminal demos/GIFs | VHS |
+| Viewing markdown in terminal | Glow (CLI) or Glamour (library) |
+| AI assistance in terminal | Mods |
+| Code screenshots for docs | Freeze |
+| **Infrastructure** | |
+| Self-hosted Git server | Soft Serve |
+| Sending emails from scripts | Pop |
+| Storing secrets/config | Skate |
+| Backing up SSH keys | Melt |
+| Multi-app SSH gateway | Wishlist |
+| **Development** | |
+| Testing TUI apps | x/exp/teatest |
+| Terminal capability detection | x/term |
 
 ---
 
@@ -709,21 +725,562 @@ gum confirm "Commit?" && git commit -m "$TYPE($SCOPE): $MSG"
 
 ---
 
+## Charm CLI Tools
+
+Standalone tools that enhance your terminal workflow.
+
+### VHS: Terminal Recording & GIFs
+
+Record terminal sessions as GIFs/videos for documentation:
+
+```bash
+# Install
+brew install vhs
+
+# Create a tape file
+cat > demo.tape << 'EOF'
+# VHS Tape - demo.tape
+Output demo.gif
+Set FontSize 14
+Set Width 1200
+Set Height 600
+Set Theme "Catppuccin Mocha"
+
+Type "echo 'Hello, World!'"
+Sleep 500ms
+Enter
+Sleep 1s
+
+Type "ls -la"
+Enter
+Sleep 2s
+EOF
+
+# Record
+vhs demo.tape
+```
+
+**Key Commands:**
+```tape
+# Typing
+Type "command"           # Type text
+Type@100ms "slow"        # Type with delay between chars
+
+# Actions
+Enter                    # Press enter
+Space                    # Press space
+Backspace 5              # Delete 5 chars
+Ctrl+C                   # Key combo
+Tab                      # Tab key
+
+# Timing
+Sleep 1s                 # Wait 1 second
+Sleep 500ms              # Wait 500ms
+
+# Settings
+Set FontSize 16
+Set Width 1200
+Set Height 600
+Set Theme "Dracula"      # GitHub Dark, Catppuccin Mocha, etc.
+Set TypingSpeed 50ms
+Set Padding 20
+
+# Output
+Output demo.gif          # GIF output
+Output demo.mp4          # Video output
+Output demo.webm         # WebM output
+```
+
+**Pro tip:** Put `demo.tape` in your repo root, add to CI for auto-generated README GIFs.
+
+### Glow: Terminal Markdown Viewer
+
+Beautiful markdown rendering in the terminal:
+
+```bash
+# Install
+brew install glow
+
+# View a file
+glow README.md
+
+# View with pager (scrollable)
+glow -p README.md
+
+# Fetch and render URL
+glow https://raw.githubusercontent.com/charmbracelet/glow/main/README.md
+
+# Stash markdown for offline reading
+glow stash README.md
+glow stash list
+glow stash show 1
+
+# Set style
+glow -s dark README.md    # dark, light, auto, notty, or custom JSON
+```
+
+**In Go (use Glamour library):**
+```go
+import "github.com/charmbracelet/glamour"
+
+out, _ := glamour.Render("# Hello\n\nWorld!", "dark")
+fmt.Print(out)
+
+// Or with custom renderer
+r, _ := glamour.NewTermRenderer(
+    glamour.WithAutoStyle(),
+    glamour.WithWordWrap(80),
+)
+out, _ := r.Render(markdown)
+```
+
+### Mods: AI on the Command Line
+
+Pipe anything to AI, get answers:
+
+```bash
+# Install
+brew install mods
+
+# Basic usage
+echo "Explain this error" | mods
+cat error.log | mods "what's wrong?"
+
+# Code review
+git diff | mods "review this code for bugs"
+
+# Generate code
+mods "write a bash script to backup my dotfiles" > backup.sh
+
+# With specific model
+mods --model gpt-4 "complex question"
+
+# Conversation mode
+mods --continue "follow up question"
+
+# Format output
+mods --format "explain kubernetes" | glow  # Pipe to glow!
+
+# Use with files
+mods "summarize" < long-document.txt
+cat *.go | mods "find potential bugs in this Go code"
+```
+
+**Configuration (~/.config/mods/mods.yml):**
+```yaml
+default-model: gpt-4
+apis:
+  openai:
+    api-key-env: OPENAI_API_KEY
+  anthropic:
+    api-key-env: ANTHROPIC_API_KEY
+```
+
+**Power combo:** `git diff | mods "write commit message" | git commit -F -`
+
+### Freeze: Code Screenshots
+
+Generate beautiful code images for docs/social:
+
+```bash
+# Install
+brew install freeze
+
+# Basic usage
+freeze main.go -o code.png
+
+# With options
+freeze main.go \
+  --theme "catppuccin-mocha" \
+  --font "JetBrains Mono" \
+  --shadow \
+  --padding 20 \
+  --line-numbers \
+  --window \
+  -o beautiful-code.png
+
+# From stdin
+cat snippet.py | freeze --language python -o snippet.png
+
+# Specific lines
+freeze main.go --lines 10,20 -o function.png
+
+# Configuration file
+freeze --config freeze.json main.go
+```
+
+**freeze.json:**
+```json
+{
+  "theme": "catppuccin-mocha",
+  "font": { "family": "JetBrains Mono", "size": 14 },
+  "shadow": { "blur": 20, "x": 0, "y": 10 },
+  "padding": [20, 40, 20, 20],
+  "line_numbers": true,
+  "window": true
+}
+```
+
+---
+
+## Charm Infrastructure
+
+Self-hosted services and utilities for your workflow.
+
+### Soft Serve: Self-Hosted Git Server
+
+A delicious Git server with TUI and SSH access:
+
+```bash
+# Install
+brew install soft-serve
+
+# Start server
+soft serve
+
+# Access via SSH (after setup)
+ssh localhost -p 23231
+
+# Clone repos
+git clone ssh://localhost:23231/myrepo
+```
+
+**Server configuration (~/.config/soft-serve/config.yaml):**
+```yaml
+name: "My Soft Serve"
+host: 0.0.0.0
+port: 23231
+initial_admin_keys:
+  - "ssh-ed25519 AAAA... you@example.com"
+```
+
+**SSH TUI commands:**
+```bash
+ssh git.example.com          # Browse repos in TUI
+ssh git.example.com repo create myrepo
+ssh git.example.com repo delete myrepo
+ssh git.example.com repo list
+ssh git.example.com user list
+```
+
+### Pop: Send Emails from Terminal
+
+Beautiful email sending:
+
+```bash
+# Install
+brew install pop
+
+# Send email
+pop send \
+  --from "me@example.com" \
+  --to "you@example.com" \
+  --subject "Hello" \
+  --body "Message body"
+
+# With attachment
+pop send \
+  --to "team@example.com" \
+  --subject "Report" \
+  --attach report.pdf \
+  --body "See attached"
+
+# From stdin (pipe markdown!)
+cat update.md | pop send \
+  --to "team@example.com" \
+  --subject "Weekly Update"
+
+# Interactive compose
+pop
+```
+
+**Configuration (~/.config/pop/config.yaml):**
+```yaml
+from: me@example.com
+smtp:
+  host: smtp.gmail.com
+  port: 587
+  username: me@example.com
+  password_env: SMTP_PASSWORD
+```
+
+### Skate: Personal Key-Value Store
+
+Simple, encrypted key-value storage:
+
+```bash
+# Install
+brew install skate
+
+# Set values
+skate set api_key "sk-1234567890"
+skate set config.theme "dark"
+skate set todo.1 "Buy milk"
+
+# Get values
+skate get api_key
+skate get config.theme
+
+# List all
+skate list
+skate list config.  # List with prefix
+
+# Delete
+skate delete todo.1
+
+# Sync across machines (via Charm Cloud)
+skate sync
+```
+
+**Use in scripts:**
+```bash
+# Store secrets for scripts
+API_KEY=$(skate get api_key)
+curl -H "Authorization: Bearer $API_KEY" https://api.example.com
+
+# Configuration management
+THEME=$(skate get config.theme || echo "light")
+```
+
+**In Go:**
+```go
+import "github.com/charmbracelet/skate"
+
+db, _ := skate.Open("myapp")
+defer db.Close()
+
+db.Set("key", []byte("value"))
+value, _ := db.Get("key")
+```
+
+### Melt: SSH Key Backup
+
+Backup and restore SSH keys securely:
+
+```bash
+# Install
+brew install melt
+
+# Backup keys (encrypts with passphrase)
+melt backup
+
+# Creates: ~/.melt/backup.melt (encrypted)
+
+# Restore on new machine
+melt restore
+
+# Backup to specific file
+melt backup -o my-keys.melt
+
+# Restore from specific file
+melt restore -i my-keys.melt
+```
+
+**Workflow for new machine:**
+```bash
+# On old machine
+melt backup -o keys.melt
+# Transfer keys.melt securely to new machine
+
+# On new machine
+brew install melt
+melt restore -i keys.melt
+# Enter passphrase, keys restored!
+```
+
+### Wishlist: SSH App Directory
+
+Serve multiple SSH apps on one port:
+
+```bash
+# Install
+go install github.com/charmbracelet/wishlist@latest
+
+# Configuration (~/.config/wishlist/config.yaml)
+```
+
+```yaml
+# wishlist.yaml
+listen: 0.0.0.0:22
+endpoints:
+  - name: git
+    address: localhost:23231
+  - name: chat
+    address: localhost:2222
+  - name: todos
+    address: localhost:2223
+```
+
+```bash
+# Run
+wishlist serve
+
+# Users connect and get a menu
+ssh myserver.com
+# Shows: [git] [chat] [todos] - pick one!
+```
+
+**Building Wishlist apps:**
+```go
+// Each app is a Wish (SSH) server
+// Wishlist proxies to them based on user selection
+```
+
+---
+
+## Testing & Terminal Utilities
+
+Tools for testing and terminal detection.
+
+### teatest: TUI Testing Framework
+
+Headless testing for Bubble Tea apps:
+
+```go
+import (
+    "testing"
+    "time"
+    tea "github.com/charmbracelet/bubbletea"
+    "github.com/charmbracelet/x/exp/teatest"
+)
+
+func TestApp(t *testing.T) {
+    m := NewModel()
+    tm := teatest.NewTestModel(t, m)
+
+    // Send key presses
+    tm.Send(tea.KeyMsg{Type: tea.KeyDown})
+    tm.Send(tea.KeyMsg{Type: tea.KeyEnter})
+
+    // Type text
+    tm.Type("hello world")
+
+    // Wait for condition
+    teatest.WaitFor(t, tm, func(bts []byte) bool {
+        return strings.Contains(string(bts), "Expected output")
+    }, teatest.WithDuration(time.Second))
+
+    // Get final output
+    out := tm.FinalOutput(t)
+    if !strings.Contains(string(out), "success") {
+        t.Fatal("expected success message")
+    }
+
+    // Quit
+    tm.Send(tea.KeyMsg{Type: tea.KeyCtrlC})
+    tm.WaitFinished(t, teatest.WithFinalTimeout(time.Second))
+}
+```
+
+**Golden file testing:**
+```go
+func TestGolden(t *testing.T) {
+    m := NewModel()
+    tm := teatest.NewTestModel(t, m)
+
+    tm.Send(tea.KeyMsg{Type: tea.KeyEnter})
+
+    out := tm.FinalOutput(t)
+
+    // Compare against saved "golden" output
+    teatest.RequireEqualOutput(t, out)
+    // First run: creates testdata/TestGolden.golden
+    // Subsequent: compares against it
+}
+
+// Update golden files: go test -update
+```
+
+### x/term: Terminal Detection
+
+Detect terminal capabilities:
+
+```go
+import "github.com/charmbracelet/x/term"
+
+// Check if running in terminal
+if term.IsTerminal(os.Stdin.Fd()) {
+    runTUI()
+} else {
+    runPlainMode()
+}
+
+// Get terminal size
+width, height, _ := term.GetSize(os.Stdout.Fd())
+
+// Check color support
+if term.HasDarkBackground() {
+    useTheme("dark")
+} else {
+    useTheme("light")
+}
+
+// Environment detection
+if os.Getenv("NO_COLOR") != "" || os.Getenv("TERM") == "dumb" {
+    disableColors()
+}
+```
+
+**Common patterns:**
+```go
+func main() {
+    // Full detection
+    isTTY := term.IsTerminal(os.Stdin.Fd())
+    isPiped := !term.IsTerminal(os.Stdout.Fd())
+    noColor := os.Getenv("NO_COLOR") != ""
+
+    switch {
+    case !isTTY:
+        // stdin is piped, read from it
+        runFilter()
+    case isPiped:
+        // stdout is piped, output plain text
+        runPlainOutput()
+    case noColor:
+        // User requested no color
+        runNoColor()
+    default:
+        // Full TUI mode
+        runTUI()
+    }
+}
+```
+
+---
+
 ## Quick Start Commands
 
 ```bash
-# Install everything
+# TUI Libraries (Go)
 go get github.com/charmbracelet/bubbletea@latest \
        github.com/charmbracelet/bubbles@latest \
        github.com/charmbracelet/lipgloss@latest \
        github.com/charmbracelet/huh@latest \
-       github.com/charmbracelet/glamour@latest
+       github.com/charmbracelet/glamour@latest \
+       github.com/charmbracelet/harmonica@latest \
+       github.com/charmbracelet/wish@latest \
+       github.com/charmbracelet/log@latest
 
-# Shell tools
-brew install gum glow vhs
+# Testing utilities
+go get github.com/charmbracelet/x/exp/teatest@latest \
+       github.com/charmbracelet/x/term@latest
 
-# Create demo GIF
-vhs demo.tape  # from .tape file
+# CLI Tools (Homebrew)
+brew install gum glow vhs freeze mods
+
+# Infrastructure
+brew install soft-serve pop skate melt
+
+# Or install all at once
+brew install charmbracelet/tap/gum \
+             charmbracelet/tap/glow \
+             charmbracelet/tap/vhs \
+             charmbracelet/tap/freeze \
+             charmbracelet/tap/mods \
+             charmbracelet/tap/soft-serve \
+             charmbracelet/tap/pop \
+             charmbracelet/tap/skate \
+             charmbracelet/tap/melt
 ```
 
 ---
