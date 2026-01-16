@@ -87,6 +87,32 @@ impl GitArchive {
             .unwrap_or(false)
     }
 
+    /// Check if a skill exists in the current HEAD commit.
+    /// This is used for 2PC recovery to verify if a commit actually happened.
+    pub fn skill_committed(&self, skill_id: &str) -> Result<bool> {
+        // Safe because skill_exists/skill_path checks for traversal, but we construct path manually here
+        // to match repo root relative path.
+        if skill_id.trim().is_empty() || skill_id == "." || skill_id == ".." || skill_id.contains('/') || skill_id.contains('\\') {
+             return Ok(false);
+        }
+        
+        let path = Path::new("skills/by-id").join(skill_id).join("skill.spec.json");
+        let head = match self.repo.head() {
+            Ok(h) => h,
+            Err(_) => return Ok(false), // No head = no commits
+        };
+        
+        let target = head.target().ok_or_else(|| MsError::Git(git2::Error::from_str("HEAD is not a commit")))?;
+        let commit = self.repo.find_commit(target)?;
+        let tree = commit.tree().map_err(MsError::Git)?;
+        
+        match tree.get_path(&path) {
+            Ok(_) => Ok(true),
+            Err(e) if e.code() == ErrorCode::NotFound => Ok(false),
+            Err(e) => Err(MsError::Git(e)),
+        }
+    }
+
     pub fn list_skill_ids(&self) -> Result<Vec<String>> {
         let base = self.root.join("skills/by-id");
         if !base.exists() {
@@ -589,5 +615,31 @@ mod tests {
         // If it returns Some, it means we can write to the parent directory
         let path = archive.skill_path(".");
         assert!(path.is_none(), "Should reject '.' as skill ID");
+    }
+
+    #[test]
+    fn test_skill_committed() {
+        let dir = tempdir().unwrap();
+        let archive = GitArchive::open(dir.path()).unwrap();
+
+        let spec = sample_spec("comm-skill");
+        
+        // Not committed yet
+        assert!(!archive.skill_committed("comm-skill").unwrap());
+
+        // Write and commit
+        archive.write_skill(&spec).unwrap();
+        
+        // Now committed
+        assert!(archive.skill_committed("comm-skill").unwrap());
+
+        // Create a file manually (uncommitted)
+        let uncomm_dir = dir.path().join("skills/by-id/uncomm-skill");
+        fs::create_dir_all(&uncomm_dir).unwrap();
+        fs::write(uncomm_dir.join("skill.spec.json"), "{}").unwrap();
+
+        // Should exist on disk but not committed
+        assert!(archive.skill_exists("uncomm-skill"));
+        assert!(!archive.skill_committed("uncomm-skill").unwrap());
     }
 }

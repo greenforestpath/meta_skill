@@ -712,16 +712,16 @@ impl TxManager {
             }
             TxPhase::Pending => {
                 // SQLite written but phase still pending - need to check Git state.
-                // If Git already has the skill (from a partial git_commit where
-                // write_skill succeeded but update_tx_phase failed), complete the tx.
-                // Otherwise, Git doesn't have it and we can safely roll back.
-                if self.git.skill_exists(&tx.entity_id) {
-                    info!("Completing pending tx with existing Git data: {}", tx.id);
+                // We must check if the COMMIT actually happened.
+                // Checking self.git.skill_exists() only checks the filesystem, which
+                // might have files even if commit failed.
+                if self.git.skill_committed(&tx.entity_id)? {
+                    info!("Completing pending tx with committed Git data: {}", tx.id);
                     let tx = self.db_mark_committed(tx)?;
                     self.cleanup_tx(&tx)?;
                     report.completed += 1;
                 } else {
-                    info!("Rolling back pending tx: {}", tx.id);
+                    info!("Rolling back pending tx (not committed): {}", tx.id);
                     self.rollback_tx(tx)?;
                     report.rolled_back += 1;
                 }
