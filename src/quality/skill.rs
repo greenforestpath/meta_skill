@@ -294,6 +294,7 @@ mod tests {
                     content: "Short".to_string(),
                 }],
             }],
+            ..Default::default()
         }
     }
 

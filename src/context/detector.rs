@@ -6,8 +6,10 @@
 
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
+
 /// Known project types that can be detected.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ProjectType {
     Rust,
     Node,
@@ -138,7 +140,7 @@ impl ProjectMarker {
 }
 
 /// Result of detecting a project type.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DetectedProject {
     /// The detected project type.
     pub project_type: ProjectType,

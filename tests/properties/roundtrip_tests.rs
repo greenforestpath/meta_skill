@@ -50,6 +50,11 @@ fn arb_skill_spec() -> impl Strategy<Value = SkillSpec> {
                     ..Default::default()
                 },
                 sections,
+                extends: None,
+                replace_rules: false,
+                replace_examples: false,
+                replace_pitfalls: false,
+                replace_checklist: false,
             },
         )
 }

@@ -914,6 +914,7 @@ mod tests {
                 title: "Introduction".to_string(),
                 blocks: vec![],
             }],
+            ..Default::default()
         }
     }
 

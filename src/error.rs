@@ -87,6 +87,18 @@ pub enum MsError {
 
     #[error("Assertion failed: {0}")]
     AssertionFailed(String),
+
+    #[error("Cyclic inheritance detected for skill '{skill_id}': {}", .cycle.join(" -> "))]
+    CyclicInheritance {
+        skill_id: String,
+        cycle: Vec<String>,
+    },
+
+    #[error("Parent skill not found: {parent_id} (required by {child_id})")]
+    ParentSkillNotFound {
+        parent_id: String,
+        child_id: String,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, MsError>;

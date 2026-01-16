@@ -8,6 +8,7 @@ pub mod pack_contracts;
 pub mod packing;
 pub mod recovery;
 pub mod requirements;
+pub mod resolution;
 pub mod safety;
 pub mod skill;
 pub mod slicing;
@@ -35,6 +36,10 @@ pub use recovery::{
 pub use skill::{
     BlockType, EvidenceCoverage, EvidenceLevel, EvidenceRef, Skill, SkillBlock, SkillEvidenceIndex,
     SkillLayer, SkillMetadata, SkillSection, SkillSpec,
+};
+pub use resolution::{
+    CycleDetectionResult, ResolvedSkillSpec, ResolutionWarning, SkillRepository,
+    detect_inheritance_cycle, get_inheritance_chain, resolve_extends, MAX_INHERITANCE_DEPTH,
 };
 pub use slicing::{SkillSliceIndex, SkillSlicer};
 pub use spec_migration::migrate_spec;

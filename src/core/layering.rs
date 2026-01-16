@@ -667,6 +667,7 @@ mod tests {
                 ..Default::default()
             },
             sections,
+            ..Default::default()
         }
     }
 

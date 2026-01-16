@@ -756,6 +756,7 @@ mod tests {
                     content: "```bash\n# comment\n$ echo skip\nls\n```".to_string(),
                 }],
             }],
+            ..Default::default()
         };
 
         let elements = extract_elements(&spec);

@@ -199,6 +199,7 @@ mod tests {
                     content: "Always sanitize input.".to_string(),
                 }],
             }],
+            ..Default::default()
         };
 
         let index = SkillSlicer::slice(&spec);
@@ -227,6 +228,7 @@ mod tests {
                     content: "Never run destructive commands.".to_string(),
                 }],
             }],
+            ..Default::default()
         };
 
         let index = SkillSlicer::slice(&spec);

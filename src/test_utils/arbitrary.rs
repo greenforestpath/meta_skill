@@ -90,6 +90,7 @@ pub fn arb_skill_spec() -> impl Strategy<Value = SkillSpec> {
             format_version: SkillSpec::FORMAT_VERSION.to_string(),
             metadata,
             sections,
+            ..Default::default()
         })
 }
 

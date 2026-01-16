@@ -490,6 +490,7 @@ mod tests {
                     content: "Hello".to_string(),
                 }],
             }],
+            ..Default::default()
         }
     }
 

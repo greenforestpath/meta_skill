@@ -82,6 +82,7 @@ mod tests {
                 title: "Intro".to_string(),
                 blocks: vec![],
             }],
+            ..Default::default()
         }
     }
 

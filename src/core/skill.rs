@@ -47,6 +47,45 @@ pub struct SkillSpec {
     pub metadata: SkillMetadata,
     /// Sections in the skill
     pub sections: Vec<SkillSection>,
+
+    // === INHERITANCE FIELDS ===
+
+    /// Parent skill to inherit from (single inheritance).
+    /// When set, this skill inherits all sections from the parent
+    /// unless explicitly overridden.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extends: Option<String>,
+
+    /// If true, replace parent's rules instead of appending.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub replace_rules: bool,
+
+    /// If true, replace parent's examples instead of appending.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub replace_examples: bool,
+
+    /// If true, replace parent's pitfalls instead of appending.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub replace_pitfalls: bool,
+
+    /// If true, replace parent's checklist instead of appending.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub replace_checklist: bool,
+}
+
+impl Default for SkillSpec {
+    fn default() -> Self {
+        Self {
+            format_version: Self::FORMAT_VERSION.to_string(),
+            metadata: SkillMetadata::default(),
+            sections: Vec::new(),
+            extends: None,
+            replace_rules: false,
+            replace_examples: false,
+            replace_pitfalls: false,
+            replace_checklist: false,
+        }
+    }
 }
 
 /// Skill metadata
@@ -110,7 +149,7 @@ pub struct SkillBlock {
 }
 
 /// Block type
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum BlockType {
     /// Plain text
@@ -142,7 +181,22 @@ impl SkillSpec {
                 ..Default::default()
             },
             sections: vec![],
+            extends: None,
+            replace_rules: false,
+            replace_examples: false,
+            replace_pitfalls: false,
+            replace_checklist: false,
         }
+    }
+
+    /// Check if this skill extends another skill
+    pub fn has_parent(&self) -> bool {
+        self.extends.is_some()
+    }
+
+    /// Get the parent skill ID if this skill extends another
+    pub fn parent_id(&self) -> Option<&str> {
+        self.extends.as_deref()
     }
 }
 

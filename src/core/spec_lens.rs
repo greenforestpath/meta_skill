@@ -201,6 +201,12 @@ pub fn parse_markdown(content: &str) -> Result<SkillSpec> {
         format_version: SkillSpec::FORMAT_VERSION.to_string(),
         metadata,
         sections,
+        // Inheritance fields - not parsed from markdown (use YAML frontmatter)
+        extends: None,
+        replace_rules: false,
+        replace_examples: false,
+        replace_pitfalls: false,
+        replace_checklist: false,
     })
 }
 
