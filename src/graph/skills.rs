@@ -32,7 +32,7 @@ pub fn skills_to_issues(skills: &[SkillRecord]) -> Result<Vec<Issue>> {
             .push(skill.id.clone());
         for cap in &meta.provides {
             providers
-                .entry(cap.clone())
+                .entry(cap.to_lowercase())
                 .or_default()
                 .push(skill.id.clone());
         }
@@ -44,7 +44,14 @@ pub fn skills_to_issues(skills: &[SkillRecord]) -> Result<Vec<Issue>> {
         let meta = meta_by_id.get(&skill.id).cloned().unwrap_or_default();
         let mut dep_ids = HashSet::new();
         for req in &meta.requires {
+            // Check direct ID match first, then capability match (case-insensitive)
             if let Some(ids) = providers.get(req) {
+                for id in ids {
+                    if id != &skill.id {
+                        dep_ids.insert(id.clone());
+                    }
+                }
+            } else if let Some(ids) = providers.get(&req.to_lowercase()) {
                 for id in ids {
                     if id != &skill.id {
                         dep_ids.insert(id.clone());
@@ -65,7 +72,7 @@ pub fn skills_to_issues(skills: &[SkillRecord]) -> Result<Vec<Issue>> {
             })
             .collect();
 
-        let mut labels = meta.tags.clone();
+        let mut labels: Vec<String> = meta.tags.iter().map(|t| t.to_lowercase()).collect();
         labels.push(format!("layer:{}", skill.source_layer));
         labels.sort();
         labels.dedup();
@@ -236,5 +243,49 @@ mod tests {
         assert!(issue.labels.contains(&"alpha".to_string()));
         assert!(issue.labels.contains(&"beta".to_string()));
         assert!(issue.labels.contains(&"layer:project".to_string()));
+    }
+
+    #[test]
+    fn test_skills_to_issues_dependencies_case_insensitive() {
+        // Skill A provides "Database" (mixed case)
+        let skill_a = record_with_meta(
+            "skill-a",
+            &serde_json::json!({
+                "provides": ["Database"],
+            }),
+        );
+        // Skill B requires "database" (lowercase)
+        let skill_b = record_with_meta(
+            "skill-b",
+            &serde_json::json!({
+                "requires": ["database"],
+            }),
+        );
+
+        let issues = skills_to_issues(&[skill_a, skill_b]).unwrap();
+        let issue_b = issues.iter().find(|i| i.id == "skill-b").unwrap();
+        
+        // Should find skill-a as a dependency despite case mismatch
+        assert_eq!(issue_b.dependencies.len(), 1, "Should resolve dependency case-insensitively");
+        assert_eq!(issue_b.dependencies[0].id, "skill-a");
+    }
+
+    #[test]
+    fn test_skills_to_issues_tags_normalization() {
+        let skill = record_with_meta(
+            "skill-tags",
+            &serde_json::json!({
+                "tags": ["Rust", "RUST", "rust"],
+            }),
+        );
+
+        let issues = skills_to_issues(&[skill]).unwrap();
+        let issue = &issues[0];
+
+        // Should be deduped to just "rust" (and "layer:project")
+        // "layer:project" is added automatically
+        let tags: Vec<_> = issue.labels.iter().filter(|l| !l.starts_with("layer:")).collect();
+        assert_eq!(tags.len(), 1, "Tags should be normalized and deduped");
+        assert_eq!(tags[0], "rust");
     }
 }

@@ -203,9 +203,17 @@ fn ensure_safe_id(id: &str) -> Result<()> {
             "skill id must not be empty".to_string(),
         ));
     }
-    if id.contains("..") || id.contains('/') || id.contains('\\') {
+    if id == "." || id == ".." {
         return Err(MsError::ValidationFailed(format!(
-            "skill id contains invalid characters: {}",
+            "skill id cannot be '.' or '..': {}",
+            id
+        )));
+    }
+    // Only allow alphanumeric, hyphen, underscore, and dot
+    // This prevents path separators (/, \), control characters, and other weirdness
+    if !id.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.') {
+        return Err(MsError::ValidationFailed(format!(
+            "skill id contains invalid characters (allowed: a-z, A-Z, 0-9, -, _, .): {}",
             id
         )));
     }
@@ -392,6 +400,15 @@ mod tests {
 
         // Empty
         assert!(ensure_safe_id("").is_err());
+
+        // Dot and DotDot strict checks
+        assert!(ensure_safe_id(".").is_err());
+        assert!(ensure_safe_id("..").is_err());
+
+        // Invalid characters
+        assert!(ensure_safe_id("foo bar").is_err()); // Space
+        assert!(ensure_safe_id("foo*bar").is_err()); // Special char
+        assert!(ensure_safe_id("foo\nbar").is_err()); // Control char
 
         // Valid IDs
         assert!(ensure_safe_id("my-skill").is_ok());

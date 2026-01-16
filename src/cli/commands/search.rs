@@ -352,42 +352,72 @@ fn parse_tags_from_metadata(metadata_json: &str) -> Vec<String> {
 
 fn find_snippet(body: &str, query: &str) -> Option<String> {
     let query_lower = query.to_lowercase();
-    let body_lower = body.to_lowercase();
+    let body_chars: Vec<char> = body.chars().collect();
+    let total_chars = body_chars.len();
 
-    // Find first occurrence of any query word
     for word in query_lower.split_whitespace() {
-        if let Some(byte_pos) = body_lower.find(word) {
-            // Convert byte position to char position for safe UTF-8 slicing
-            let char_pos = body_lower[..byte_pos].chars().count();
-            let body_chars: Vec<char> = body.chars().collect();
-            let total_chars = body_chars.len();
+        for (char_idx, (byte_idx, _)) in body.char_indices().enumerate() {
+            if is_match_at(body, byte_idx, word) {
+                let source_len = count_source_chars_consumed(body, byte_idx, word);
 
-            // Extract context around the match (in characters, not bytes)
-            let start_char = char_pos.saturating_sub(30);
-            let end_char = (char_pos + word.chars().count() + 50).min(total_chars);
+                let start_char = char_idx.saturating_sub(30);
+                let end_char = (char_idx + source_len + 50).min(total_chars);
 
-            // Find word boundaries (scan for whitespace)
-            let start_char = body_chars[..start_char]
-                .iter()
-                .rposition(|c| c.is_whitespace())
-                .map(|p| p + 1)
-                .unwrap_or(start_char);
-            let end_char = body_chars[end_char..]
-                .iter()
-                .position(|c| c.is_whitespace())
-                .map(|p| end_char + p)
-                .unwrap_or(end_char);
+                // Find word boundaries (scan for whitespace)
+                let start_char = body_chars[..start_char]
+                    .iter()
+                    .rposition(|c| c.is_whitespace())
+                    .map(|p| p + 1)
+                    .unwrap_or(start_char);
+                let end_char = body_chars[end_char..]
+                    .iter()
+                    .position(|c| c.is_whitespace())
+                    .map(|p| end_char + p)
+                    .unwrap_or(end_char);
 
-            let snippet: String = body_chars[start_char..end_char].iter().collect();
-            let snippet = snippet.trim();
-            if !snippet.is_empty() {
-                let prefix = if start_char > 0 { "..." } else { "" };
-                let suffix = if end_char < total_chars { "..." } else { "" };
-                return Some(format!("{}{}{}", prefix, snippet, suffix));
+                let snippet: String = body_chars[start_char..end_char].iter().collect();
+                let snippet = snippet.trim();
+                if !snippet.is_empty() {
+                    let prefix = if start_char > 0 { "..." } else { "" };
+                    let suffix = if end_char < total_chars { "..." } else { "" };
+                    return Some(format!("{}{}{}", prefix, snippet, suffix));
+                }
             }
         }
     }
     None
+}
+
+fn is_match_at(body: &str, start_byte: usize, word_lower: &str) -> bool {
+    let slice = &body[start_byte..];
+    let mut slice_chars = slice.chars().flat_map(|c| c.to_lowercase());
+    let mut word_chars = word_lower.chars();
+    
+    loop {
+        match (slice_chars.next(), word_chars.next()) {
+            (Some(sc), Some(wc)) => if sc != wc { return false; },
+            (None, Some(_)) => return false, // slice ended before word
+            (_, None) => return true, // word ended, match!
+        }
+    }
+}
+
+fn count_source_chars_consumed(body: &str, start_byte: usize, word_lower: &str) -> usize {
+     let slice = &body[start_byte..];
+     let mut slice_chars = slice.chars();
+     let mut consumed_count = 0;
+     let mut matched_lower_count = 0;
+     let target_count = word_lower.chars().count();
+     
+     while matched_lower_count < target_count {
+         if let Some(c) = slice_chars.next() {
+             consumed_count += 1;
+             matched_lower_count += c.to_lowercase().count();
+         } else {
+             break;
+         }
+     }
+     consumed_count
 }
 
 /// Truncate a string to a maximum number of characters (not bytes), safe for UTF-8
@@ -561,5 +591,31 @@ mod tests {
         let parsed = TestCli::parse_from(["test", "query", "-l", "5", "-t", "testing"]);
         assert_eq!(parsed.args.limit, 5);
         assert_eq!(parsed.args.tags, Some("testing".to_string()));
+    }
+
+    #[test]
+    fn test_find_snippet_unicode_expansion_bug() {
+        // "İ" (U+0130) lowercases to "i\u{307}" (U+0069 U+0307)
+        // Original: 1 char. Lower: 2 chars.
+        
+        // Create a string with enough expanding characters to offset the index
+        // beyond the length of the original string.
+        let mut body = String::new();
+        for _ in 0..50 {
+            body.push('İ');
+        }
+        body.push_str(" final");
+        
+        // body len: 50 + 6 = 56 chars.
+        // body_lower len: 100 + 6 = 106 chars.
+        
+        // "final" found at char index 101 in lower.
+        // But body only has 56 chars.
+        // This should panic if the bug exists.
+        
+        let snippet = find_snippet(&body, "final");
+        assert!(snippet.is_some());
+        let s = snippet.unwrap();
+        assert!(s.contains("final"), "Should contain 'final', found {:?}", s);
     }
 }

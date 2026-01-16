@@ -172,7 +172,11 @@ fn approval_matches(command: &str) -> bool {
         std::env::var("MS_APPROVE").ok(),
     ];
 
-    candidates.iter().flatten().any(|value| value == command)
+    let trimmed = command.trim();
+    candidates
+        .iter()
+        .flatten()
+        .any(|value| value == command || value == trimmed)
 }
 
 fn approval_hint(command: &str) -> String {

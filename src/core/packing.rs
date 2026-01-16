@@ -527,70 +527,71 @@ fn try_improve(
         mode,
         constraints.contract.as_ref(),
     );
-    let candidate = ranked.remove(0);
 
-    let mut removable: Vec<(f32, usize)> = selected
-        .iter()
-        .enumerate()
-        .filter(|(_, slice)| !mandatory_ids.contains(&slice.id))
-        .map(|(idx, slice)| (score_slice_with_contract(slice, mode, constraints.contract.as_ref()), idx))
-        .collect();
-    if removable.is_empty() {
-        return false;
-    }
-    removable.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
-
-    for (score, remove_idx) in removable {
-        // Extract fields before removal to satisfy borrow checker
-        let removed_id = selected[remove_idx].id.clone();
-        let removed_tokens = selected[remove_idx].token_estimate;
-        let removed_group = selected[remove_idx].coverage_group.clone();
-
-        // Only swap if we gain utility.
-        // Since we are doing a 1-for-1 swap, if we lose utility, we are strictly worse off
-        // unless this swap enables future swaps, but this local search is greedy.
-        let candidate_score = score_slice_with_contract(candidate, mode, constraints.contract.as_ref());
-        if candidate_score <= score {
-            continue;
-        }
-
-        if selected
+    for candidate in ranked {
+        let mut removable: Vec<(f32, usize)> = selected
             .iter()
-            .any(|slice| slice.requires.contains(&removed_id))
-        {
+            .enumerate()
+            .filter(|(_, slice)| !mandatory_ids.contains(&slice.id))
+            .map(|(idx, slice)| (score_slice_with_contract(slice, mode, constraints.contract.as_ref()), idx))
+            .collect();
+        if removable.is_empty() {
             continue;
         }
-        if candidate.requires.iter().any(|req| *req == removed_id) {
-            continue;
-        }
+        removable.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
 
-        let tokens_after = remaining_budget + removed_tokens;
-        if candidate.token_estimate > tokens_after {
-            continue;
-        }
+        for (score, remove_idx) in removable {
+            // Extract fields before removal to satisfy borrow checker
+            let removed_id = selected[remove_idx].id.clone();
+            let removed_tokens = selected[remove_idx].token_estimate;
+            let removed_group = selected[remove_idx].coverage_group.clone();
 
-        // Update group counts BEFORE can_add_slice check to account for the removal.
-        // This allows same-group swaps where the candidate replaces the removed slice.
-        let mut temp_group_counts = group_counts.clone();
-        if let Some(group) = &removed_group {
-            if let Some(count) = temp_group_counts.get_mut(group) {
-                *count = count.saturating_sub(1);
+            // Only swap if we gain utility.
+            // Since we are doing a 1-for-1 swap, if we lose utility, we are strictly worse off
+            // unless this swap enables future swaps, but this local search is greedy.
+            let candidate_score = score_slice_with_contract(candidate, mode, constraints.contract.as_ref());
+            if candidate_score <= score {
+                continue;
             }
+
+            if selected
+                .iter()
+                .any(|slice| slice.requires.contains(&removed_id))
+            {
+                continue;
+            }
+            if candidate.requires.iter().any(|req| *req == removed_id) {
+                continue;
+            }
+
+            let tokens_after = remaining_budget + removed_tokens;
+            if candidate.token_estimate > tokens_after {
+                continue;
+            }
+
+            // Update group counts BEFORE can_add_slice check to account for the removal.
+            // This allows same-group swaps where the candidate replaces the removed slice.
+            let mut temp_group_counts = group_counts.clone();
+            if let Some(group) = &removed_group {
+                if let Some(count) = temp_group_counts.get_mut(group) {
+                    *count = count.saturating_sub(1);
+                }
+            }
+
+            if !can_add_slice(candidate, excluded, &temp_group_counts, max_per_group) {
+                continue;
+            }
+
+            selected_ids.remove(&removed_id);
+            selected.remove(remove_idx);
+
+            group_counts = temp_group_counts;
+            selected.push(candidate.clone());
+            selected_ids.insert(candidate.id.clone());
+            add_group_count(&mut group_counts, candidate);
+
+            return true;
         }
-
-        if !can_add_slice(candidate, excluded, &temp_group_counts, max_per_group) {
-            continue;
-        }
-
-        selected_ids.remove(&removed_id);
-        selected.remove(remove_idx);
-
-        group_counts = temp_group_counts;
-        selected.push(candidate.clone());
-        selected_ids.insert(candidate.id.clone());
-        add_group_count(&mut group_counts, candidate);
-
-        return true;
     }
 
     false
@@ -817,5 +818,48 @@ mod tests {
         assert!(result.slices.iter().any(|s| s.id == "C"), "Optimization failed to swap B for C");
         assert!(!result.slices.iter().any(|s| s.id == "B"), "B should have been removed");
         assert!(result.slices.iter().any(|s| s.id == "A"), "A should remain");
+    }
+
+    #[test]
+    fn test_improvement_iterates_candidates() {
+        // Budget 12.
+        // A (2t, 6s). D=3.
+        // B (13t, 100s). D=7.6.
+        // C (12t, 30s). D=2.5.
+        
+        // Greedy:
+        // Ranked: B, A, C.
+        // 1. B (13t). > 12. Skip.
+        // 2. A (2t). <= 12. Sel [A]. Rem 10.
+        // 3. C (12t). > 10. Skip.
+        // Result [A]. Score 6.
+
+        // Improvement:
+        // Candidates: [B, C].
+        // Top: B.
+        // Removable: A (2t).
+        // Avail: 10 + 2 = 12.
+        // B needs 13. Fail.
+        // BUG: Stops here.
+        
+        // Expected: Check C.
+        // Swap A (2t) for C (12t)?
+        // Avail: 12.
+        // C needs 12. Fits.
+        // C score 30 > A score 6. Swap!
+
+        let slices = vec![
+            make_slice("A", SliceType::Rule, 2, 6.0, "g1"),
+            make_slice("B", SliceType::Rule, 13, 100.0, "g2"),
+            make_slice("C", SliceType::Rule, 12, 30.0, "g3"),
+        ];
+
+        let constraints = PackConstraints::new(12, 1);
+        let packer = ConstrainedPacker;
+
+        let result = packer.pack(&slices, &constraints, PackMode::Balanced).unwrap();
+
+        assert!(result.slices.iter().any(|s| s.id == "C"), "Should have swapped A for C");
+        assert!(!result.slices.iter().any(|s| s.id == "A"), "A should be removed");
     }
 }
