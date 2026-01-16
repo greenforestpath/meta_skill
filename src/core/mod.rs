@@ -9,6 +9,7 @@ pub mod packing;
 pub mod recovery;
 pub mod requirements;
 pub mod resolution;
+pub mod resolution_cache;
 pub mod safety;
 pub mod skill;
 pub mod slicing;
@@ -39,7 +40,12 @@ pub use skill::{
 };
 pub use resolution::{
     CycleDetectionResult, ResolvedSkillSpec, ResolutionWarning, SkillRepository,
-    detect_inheritance_cycle, get_inheritance_chain, resolve_extends, MAX_INHERITANCE_DEPTH,
+    detect_inheritance_cycle, get_inheritance_chain, resolve_extends, resolve_full,
+    MAX_INHERITANCE_DEPTH,
+};
+pub use resolution_cache::{
+    CacheKey, CacheStats, CachedResolvedSkill, DependencyGraph as ResolutionDependencyGraph,
+    ResolutionCache,
 };
 pub use slicing::{SkillSliceIndex, SkillSlicer};
 pub use spec_migration::migrate_spec;

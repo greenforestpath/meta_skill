@@ -13,9 +13,35 @@ use crate::error::{MsError, Result};
 pub const MAX_INHERITANCE_DEPTH: usize = 5;
 
 /// A trait for resolving skill references during inheritance resolution
-pub trait SkillRepository: Send + Sync {
+pub trait SkillRepository {
     /// Get a skill spec by ID
     fn get(&self, skill_id: &str) -> Result<Option<SkillSpec>>;
+}
+
+/// A `SkillRepository` backed by a Git archive.
+///
+/// Loads skills from the Git archive's `skill.spec.json` files.
+pub struct GitSkillRepository<'a> {
+    git: &'a crate::storage::GitArchive,
+}
+
+impl<'a> GitSkillRepository<'a> {
+    /// Create a new repository backed by a Git archive.
+    pub const fn new(git: &'a crate::storage::GitArchive) -> Self {
+        Self { git }
+    }
+}
+
+impl<'a> SkillRepository for GitSkillRepository<'a> {
+    fn get(&self, skill_id: &str) -> Result<Option<SkillSpec>> {
+        if !self.git.skill_exists(skill_id) {
+            return Ok(None);
+        }
+        match self.git.read_skill(skill_id) {
+            Ok(spec) => Ok(Some(spec)),
+            Err(e) => Err(e),
+        }
+    }
 }
 
 /// A resolved skill with inheritance and composition applied

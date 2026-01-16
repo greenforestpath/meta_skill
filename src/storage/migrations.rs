@@ -64,8 +64,8 @@ mod tests {
     }
 
     #[test]
-    fn schema_version_is_9() {
-        assert_eq!(SCHEMA_VERSION, 9);
+    fn schema_version_is_10() {
+        assert_eq!(SCHEMA_VERSION, 10);
     }
 
     // =========================================================================
