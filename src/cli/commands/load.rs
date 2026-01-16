@@ -172,9 +172,9 @@ pub fn run(ctx: &AppContext, args: &LoadArgs) -> Result<()> {
     }
 }
 
-pub(crate) fn load_skill(ctx: &AppContext, args: &LoadArgs) -> Result<LoadResult> {
+pub(crate) fn load_skill(ctx: &AppContext, args: &LoadArgs, skill_ref: &str) -> Result<LoadResult> {
     // Resolve skill by ID or alias
-    let skill = resolve_skill(ctx, &args.skill)?;
+    let skill = resolve_skill(ctx, skill_ref)?;
 
     if args.contract.is_some() && args.contract_id.is_some() {
         return Err(MsError::Config(
@@ -275,7 +275,7 @@ pub struct MetaSkillLoadResultWrapper {
 }
 
 /// Try to load as a meta-skill. Returns None if not found as a meta-skill.
-fn try_load_meta_skill(ctx: &AppContext, args: &LoadArgs) -> Result<Option<MetaSkillLoadResultWrapper>> {
+fn try_load_meta_skill(ctx: &AppContext, args: &LoadArgs, skill_ref: &str) -> Result<Option<MetaSkillLoadResultWrapper>> {
     let mut registry = MetaSkillRegistry::new();
     let meta_skill_paths = get_meta_skill_paths();
 
@@ -285,7 +285,7 @@ fn try_load_meta_skill(ctx: &AppContext, args: &LoadArgs) -> Result<Option<MetaS
     }
 
     // Try to find meta-skill by ID
-    let meta_skill = match registry.get(&args.skill) {
+    let meta_skill = match registry.get(skill_ref) {
         Some(ms) => ms.clone(),
         None => return Ok(None),
     };
