@@ -135,10 +135,8 @@ pub fn install_with_options<V: SignatureVerifier>(
 
         // Try install
         if let Err(e) = perform_install(&target, &blob.bytes) {
-            // Rollback this skill and previous ones
-            if target.exists() {
-                let _ = std::fs::remove_dir_all(&target);
-            }
+            // perform_install is atomic; if it fails, target was not created by us.
+            // We only rollback previous successes.
             rollback_install(&installed_paths);
             return Err(e);
         }
@@ -157,9 +155,48 @@ pub fn install_with_options<V: SignatureVerifier>(
 }
 
 fn perform_install(target: &Path, bytes: &[u8]) -> Result<()> {
-    std::fs::create_dir_all(target)
-        .map_err(|err| MsError::Config(format!("create {}: {err}", target.display())))?;
-    unpack_blob(target, bytes)
+    // Ensure parent directory exists
+    let parent = target.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)
+        .map_err(|err| MsError::Config(format!("create parent {}: {err}", parent.display())))?;
+
+    // Create temporary directory on the same filesystem (sibling to target)
+    let temp_name = format!(".tmp_install_{}", uuid::Uuid::new_v4());
+    let temp_path = parent.join(&temp_name);
+
+    std::fs::create_dir(&temp_path)
+        .map_err(|err| MsError::Config(format!("create temp {}: {err}", temp_path.display())))?;
+
+    // Unpack into temp directory
+    if let Err(e) = unpack_blob(&temp_path, bytes) {
+        let _ = std::fs::remove_dir_all(&temp_path);
+        return Err(e);
+    }
+
+    // Atomic rename to final target
+    // Note: rename fails if target exists (on most POSIX) or if non-empty (Windows)
+    if let Err(e) = std::fs::rename(&temp_path, target) {
+        let _ = std::fs::remove_dir_all(&temp_path);
+
+        // Check for "already exists" errors
+        if e.kind() == std::io::ErrorKind::AlreadyExists
+            || (cfg!(windows) && e.kind() == std::io::ErrorKind::PermissionDenied)
+        {
+            return Err(MsError::ValidationFailed(format!(
+                "skill already exists at {}",
+                target.display()
+            )));
+        }
+
+        return Err(MsError::Config(format!(
+            "install finalization failed (rename {}: {}): {}",
+            temp_path.display(),
+            target.display(),
+            e
+        )));
+    }
+
+    Ok(())
 }
 
 fn rollback_install(paths: &[PathBuf]) {
