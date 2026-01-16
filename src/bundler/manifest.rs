@@ -119,6 +119,27 @@ impl BundleManifest {
                     skill.name
                 )));
             }
+            if skill.path.is_absolute() {
+                return Err(MsError::ValidationFailed(format!(
+                    "skill path must be relative for {}: {}",
+                    skill.name,
+                    skill.path.display()
+                )));
+            }
+            for comp in skill.path.components() {
+                match comp {
+                    std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_) => {
+                        return Err(MsError::ValidationFailed(format!(
+                            "skill path contains invalid component for {}: {}",
+                            skill.name,
+                            skill.path.display()
+                        )));
+                    }
+                    _ => {}
+                }
+            }
             if let Some(version) = skill.version.as_ref() {
                 validate_semver("skills.version", version)?;
             }
@@ -417,7 +438,10 @@ fn parse_openssh_ed25519_key(pem: &str) -> Result<([u8; 32], [u8; 32])> {
 }
 
 fn read_openssh_u32(data: &[u8], cursor: &mut usize) -> Result<u32> {
-    if *cursor + 4 > data.len() {
+    let end = cursor
+        .checked_add(4)
+        .ok_or_else(|| MsError::ValidationFailed("SSH key parse overflow".to_string()))?;
+    if end > data.len() {
         return Err(MsError::ValidationFailed(
             "truncated SSH key data".to_string(),
         ));
@@ -428,19 +452,22 @@ fn read_openssh_u32(data: &[u8], cursor: &mut usize) -> Result<u32> {
         data[*cursor + 2],
         data[*cursor + 3],
     ]);
-    *cursor += 4;
+    *cursor = end;
     Ok(value)
 }
 
 fn read_openssh_bytes<'a>(data: &'a [u8], cursor: &mut usize) -> Result<&'a [u8]> {
     let len = read_openssh_u32(data, cursor)? as usize;
-    if *cursor + len > data.len() {
+    let end = cursor
+        .checked_add(len)
+        .ok_or_else(|| MsError::ValidationFailed("SSH key parse overflow".to_string()))?;
+    if end > data.len() {
         return Err(MsError::ValidationFailed(
             "truncated SSH key data".to_string(),
         ));
     }
-    let bytes = &data[*cursor..*cursor + len];
-    *cursor += len;
+    let bytes = &data[*cursor..end];
+    *cursor = end;
     Ok(bytes)
 }
 
@@ -610,6 +637,26 @@ checksum = "sha256:abc123"
         });
         let err = manifest.validate().unwrap_err();
         assert!(err.to_string().contains("dependencies.version"));
+    }
+
+    #[test]
+    fn validate_rejects_unsafe_paths() {
+        let mut manifest = BundleManifest::from_toml_str(SAMPLE_TOML).unwrap();
+        
+        // Absolute path
+        manifest.skills[0].path = PathBuf::from("/etc/passwd");
+        let err = manifest.validate().unwrap_err();
+        assert!(err.to_string().contains("must be relative"));
+
+        // Parent traversal
+        manifest.skills[0].path = PathBuf::from("../outside");
+        let err = manifest.validate().unwrap_err();
+        assert!(err.to_string().contains("invalid component"));
+
+        // Nested parent traversal
+        manifest.skills[0].path = PathBuf::from("nested/../outside");
+        let err = manifest.validate().unwrap_err();
+        assert!(err.to_string().contains("invalid component"));
     }
 
     // --- Ed25519 signature verification tests ---

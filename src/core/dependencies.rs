@@ -266,7 +266,10 @@ impl<'a> DependencyResolver<'a> {
         } else {
             // If there are cycles, we can't do a clean topo sort
             // Return partial ordering with cycle members at the end
-            closure.into_iter().collect()
+            // Sort for determinism in error scenarios
+            let mut sorted: Vec<String> = closure.into_iter().collect();
+            sorted.sort();
+            sorted
         };
 
         // Step 4: Assign disclosure levels
@@ -293,15 +296,27 @@ impl<'a> DependencyResolver<'a> {
         while !queue.is_empty() && depth < self.max_depth {
             let level_size = queue.len();
 
+            // Collect level nodes to process them deterministically if needed, 
+            // but BFS queue order is already determined by insertion order.
+            // We just need to ensure insertion order is deterministic.
+
             for _ in 0..level_size {
                 if let Some(skill_id) = queue.pop_front() {
                     if let Some(node) = self.graph.get_node(&skill_id) {
-                        for required_cap in &node.requires {
+                        // Sort requirements for deterministic processing
+                        let mut requires = node.requires.clone();
+                        requires.sort();
+
+                        for required_cap in &requires {
                             if let Some(providers) = self.graph.find_providers(required_cap) {
-                                for provider in providers {
-                                    if !closure.contains(provider) {
+                                // Sort providers for deterministic queue insertion
+                                let mut sorted_providers = providers.clone();
+                                sorted_providers.sort();
+
+                                for provider in sorted_providers {
+                                    if !closure.contains(&provider) {
                                         closure.insert(provider.clone());
-                                        queue.push_back(provider.clone());
+                                        queue.push_back(provider);
                                     }
                                 }
                             } else {

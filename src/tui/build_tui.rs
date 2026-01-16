@@ -20,7 +20,7 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
 };
 
-use crate::cass::brenner::{BrennerConfig, BrennerWizard, MoveDecision, WizardOutput, WizardState};
+use crate::cass::brenner::{BrennerConfig, BrennerWizard, MoveDecision, SelectedSession, WizardOutput, WizardState};
 use crate::cass::{CassClient, QualityScorer};
 use crate::error::Result;
 
@@ -416,7 +416,7 @@ impl BuildTui {
                 results,
                 selected,
             } => {
-                self.handle_session_selection_key(key, &query, &results, &selected, client)?;
+                self.handle_session_selection_key(key, &query, &results, &selected, client, quality_scorer)?;
             }
             WizardState::MoveExtraction { .. } => {
                 self.handle_move_extraction_key(key)?;
@@ -441,8 +441,9 @@ impl BuildTui {
         key: KeyCode,
         _query: &str,
         results: &[crate::cass::client::SessionMatch],
-        _selected: &std::collections::HashSet<usize>,
-        _client: &CassClient,
+        selected: &std::collections::HashSet<usize>,
+        client: &CassClient,
+        quality_scorer: &QualityScorer,
     ) -> Result<()> {
         match key {
             KeyCode::Up | KeyCode::Char('k') => {
@@ -493,9 +494,32 @@ impl BuildTui {
                 self.status_message = Some("Loaded demo data".to_string());
             }
             KeyCode::Char('n') => {
-                // Proceed to next phase
-                let scorer = QualityScorer::with_defaults();
-                if let Err(e) = self.wizard.confirm_sessions(&scorer) {
+                // Proceed to next phase - build selected sessions
+                let mut sessions = Vec::new();
+                for &idx in selected {
+                    if let Some(match_data) = results.get(idx) {
+                        // Attempt to load full session
+                        match client.get_session(&match_data.session_id) {
+                            Ok(session) => {
+                                let quality = quality_scorer.score(&session);
+                                sessions.push(SelectedSession {
+                                    match_data: match_data.clone(),
+                                    session,
+                                    quality,
+                                    confirmed: true,
+                                });
+                            }
+                            Err(e) => {
+                                self.status_message = Some(format!(
+                                    "Failed to load session {}: {}",
+                                    match_data.session_id, e
+                                ));
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+                if let Err(e) = self.wizard.confirm_sessions(sessions) {
                     self.status_message = Some(format!("Error: {}", e));
                 }
             }

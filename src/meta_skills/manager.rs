@@ -296,19 +296,10 @@ impl<'a> MetaSkillManager<'a> {
     }
 
     fn lookup_skill(&self, skill_id: &str) -> Option<SkillRecord> {
-        // Try exact match first
-        if let Ok(Some(record)) = self.ctx.db.get_skill(skill_id) {
-            return Some(record);
-        }
-
-        // Try name-based lookup
-        if let Ok(records) = self.ctx.db.search_fts(skill_id, 1) {
-            if let Ok(Some(record)) = self.ctx.db.get_skill(records.first()?) {
-                return Some(record);
-            }
-        }
-
-        None
+        // Only use exact match for meta-skill resolution to ensure deterministic
+        // and safe dependency loading. Fuzzy search (FTS) is appropriate for
+        // user queries but not for spec resolution.
+        self.ctx.db.get_skill(skill_id).ok().flatten()
     }
 
     fn pack_within_budget(
@@ -357,7 +348,12 @@ impl<'a> MetaSkillManager<'a> {
             by_skill.entry(&slice.skill_id).or_default().push(slice);
         }
 
-        for (skill_id, skill_slices) in by_skill {
+        // Sort skills by ID for deterministic output
+        let mut skill_ids: Vec<&str> = by_skill.keys().copied().collect();
+        skill_ids.sort();
+
+        for skill_id in skill_ids {
+            let skill_slices = &by_skill[skill_id];
             output.push_str(&format!("## From: {}\n\n", skill_id));
             for slice in skill_slices {
                 output.push_str(&slice.content);

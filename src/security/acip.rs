@@ -196,8 +196,7 @@ pub fn build_quarantine_record(
         audit_tag: analysis.audit_tag.clone(),
         created_at: chrono::Utc::now().to_rfc3339(),
         replay_command: format!(
-            "ms security quarantine replay {} --i-understand-the-risks",
-            quarantine_id
+            "ms security quarantine replay {quarantine_id} --i-understand-the-risks"
         ),
     }
 }
@@ -293,7 +292,7 @@ fn truncate_excerpt(content: &str) -> String {
         trimmed.to_string()
     } else {
         let excerpt: String = trimmed.chars().take(277).collect();
-        format!("{}...", excerpt)
+        format!("{excerpt}...")
     }
 }
 

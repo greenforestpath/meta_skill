@@ -244,8 +244,11 @@ impl SyncEngine {
         };
         let mut needs_git_push = false;
 
-        let local_map = self.snapshot_archive(self.git.as_ref())?;
-        let remote_map = self.snapshot_archive(remote_git)?;
+        let (local_map, local_errors) = self.snapshot_archive(self.git.as_ref())?;
+        let (remote_map, remote_errors) = self.snapshot_archive(remote_git)?;
+
+        report.errors.extend(local_errors);
+        report.errors.extend(remote_errors);
 
         let mut all_ids = HashSet::new();
         all_ids.extend(local_map.keys().cloned());
@@ -491,7 +494,10 @@ impl SyncEngine {
         }
     }
 
-    fn snapshot_archive(&self, archive: &GitArchive) -> Result<HashMap<String, SkillSnapshot>> {
+    fn snapshot_archive(
+        &self,
+        archive: &GitArchive,
+    ) -> Result<(HashMap<String, SkillSnapshot>, Vec<String>)> {
         let ids = archive.list_skill_ids()?;
         let mut id_to_path = HashMap::new();
         let mut paths = Vec::new();
@@ -508,12 +514,27 @@ impl SyncEngine {
         }
 
         // Bulk fetch modification times (O(1) history walk)
-        let modified_times = archive.get_bulk_last_modified(&paths)?;
+        let modified_times = archive.get_bulk_last_modified(&paths).unwrap_or_default();
 
         let mut map = HashMap::new();
+        let mut errors = Vec::new();
+
         for id in ids {
-            let spec = archive.read_skill(&id)?;
-            let hash = hash_skill_spec(&spec)?;
+            let spec = match archive.read_skill(&id) {
+                Ok(s) => s,
+                Err(e) => {
+                    errors.push(format!("Failed to read skill {}: {}", id, e));
+                    continue;
+                }
+            };
+            
+            let hash = match hash_skill_spec(&spec) {
+                Ok(h) => h,
+                Err(e) => {
+                    errors.push(format!("Failed to hash skill {}: {}", id, e));
+                    continue;
+                }
+            };
             
             // Determine modified time: check bulk result, fallback to FS
             let modified = if let Some(rel_path) = id_to_path.get(&id) {
@@ -522,8 +543,12 @@ impl SyncEngine {
                 } else {
                     // Fallback to FS metadata
                     let abs_path = archive.root().join(rel_path);
-                    let metadata = std::fs::metadata(&abs_path)?;
-                    DateTime::<Utc>::from(metadata.modified()?)
+                    match std::fs::metadata(&abs_path) {
+                        Ok(metadata) => {
+                            metadata.modified().map(DateTime::<Utc>::from).unwrap_or_else(|_| Utc::now())
+                        },
+                        Err(_) => Utc::now()
+                    }
                 }
             } else {
                 // Fallback (shouldn't happen if path logic is consistent)
@@ -532,7 +557,7 @@ impl SyncEngine {
 
             map.insert(id.clone(), SkillSnapshot { id, hash, modified });
         }
-        Ok(map)
+        Ok((map, errors))
     }
 }
 

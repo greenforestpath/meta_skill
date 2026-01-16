@@ -155,7 +155,7 @@ impl SafetyGate {
             return Ok(());
         };
         let event = CommandSafetyEvent {
-            session_id: session_id.map(|s| s.to_string()),
+            session_id: session_id.map(str::to_string),
             command: command.to_string(),
             dcg_version: self.dcg_version.clone(),
             dcg_pack: decision.pack.clone(),

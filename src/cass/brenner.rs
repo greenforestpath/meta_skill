@@ -18,7 +18,7 @@ use uuid::Uuid;
 
 use crate::error::{MsError, Result};
 
-use super::client::{CassClient, SessionMatch};
+use super::client::{CassClient, Session, SessionMatch};
 use super::quality::{QualityScorer, SessionQuality};
 use super::transformation::{GeneralizationValidation, SpecificToGeneralTransformer};
 use super::uncertainty::UncertaintyQueue;
@@ -132,8 +132,10 @@ pub enum MoveDecision {
 /// A session selected for mining
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SelectedSession {
-    /// The session data
-    pub session: SessionMatch,
+    /// The session search match data
+    pub match_data: SessionMatch,
+    /// Full session content
+    pub session: Session,
     /// Quality score
     pub quality: SessionQuality,
     /// Whether user has confirmed selection
@@ -465,35 +467,11 @@ impl BrennerWizard {
     }
 
     /// Confirm session selection and move to extraction
-    pub fn confirm_sessions(&mut self, _quality_scorer: &QualityScorer) -> Result<()> {
-        let (results, selected) = match &self.state {
-            WizardState::SessionSelection {
-                results, selected, ..
-            } => (results.clone(), selected.clone()),
-            _ => return Err(MsError::Config("Not in session selection state".into())),
-        };
-
-        if selected.is_empty() {
+    ///
+    /// The caller is responsible for fetching full sessions and scoring them.
+    pub fn confirm_sessions(&mut self, sessions: Vec<SelectedSession>) -> Result<()> {
+        if sessions.is_empty() {
             return Err(MsError::Config("No sessions selected".into()));
-        }
-
-        // Build selected sessions with quality scores
-        let mut sessions = Vec::new();
-        for idx in selected {
-            if let Some(session) = results.get(idx) {
-                // Score quality (simplified - in real impl would load full session)
-                let quality = SessionQuality {
-                    score: 0.7, // Placeholder
-                    signals: vec!["test_pass".to_string()],
-                    missing: vec![],
-                    computed_at: Utc::now(),
-                };
-                sessions.push(SelectedSession {
-                    session: session.clone(),
-                    quality,
-                    confirmed: true,
-                });
-            }
         }
 
         self.state = WizardState::MoveExtraction {
@@ -788,7 +766,7 @@ impl BrennerWizard {
 /// Run the wizard interactively
 pub fn run_interactive(
     wizard: &mut BrennerWizard,
-    _client: &CassClient,
+    client: &CassClient,
     quality_scorer: &QualityScorer,
 ) -> Result<WizardOutput> {
     let stdin = io::stdin();
@@ -830,7 +808,31 @@ pub fn run_interactive(
                         break;
                     }
                     "c" => {
-                        if let Err(e) = wizard.confirm_sessions(quality_scorer) {
+                        // Build Vec<SelectedSession> from selected indices
+                        let mut sessions = Vec::new();
+                        for &idx in selected.iter() {
+                            if let Some(match_data) = results.get(idx) {
+                                match client.get_session(&match_data.session_id) {
+                                    Ok(session) => {
+                                        let quality = quality_scorer.score(&session);
+                                        sessions.push(SelectedSession {
+                                            match_data: match_data.clone(),
+                                            session,
+                                            quality,
+                                            confirmed: true,
+                                        });
+                                    }
+                                    Err(e) => {
+                                        println!("Failed to load session {}: {}", match_data.session_id, e);
+                                    }
+                                }
+                            }
+                        }
+                        if sessions.is_empty() {
+                            println!("No valid sessions to confirm");
+                            continue;
+                        }
+                        if let Err(e) = wizard.confirm_sessions(sessions) {
                             println!("Error: {}", e);
                             continue;
                         }
@@ -883,7 +885,7 @@ pub fn run_interactive(
                     sessions.len(),
                     sessions
                         .get(*current_session_idx)
-                        .map(|s| s.session.session_id.as_str())
+                        .map(|s| s.session.id.as_str())
                         .unwrap_or("?")
                 );
                 println!("Moves extracted: {}", moves.len());
@@ -934,7 +936,7 @@ pub fn run_interactive(
                                     description: parts[2].to_string(),
                                     evidence: MoveEvidence {
                                         session_id: session
-                                            .map(|s| s.session.session_id.clone())
+                                            .map(|s| s.session.id.clone())
                                             .unwrap_or_default(),
                                         message_indices: vec![],
                                         excerpt: "...".to_string(),
