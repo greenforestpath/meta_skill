@@ -55,6 +55,7 @@ pub mod pre_commit;
 pub mod preferences;
 pub mod prune;
 pub mod quality;
+pub mod recommend;
 pub mod remote;
 pub mod requirements;
 pub mod safety;
@@ -129,6 +130,7 @@ pub fn run(ctx: &AppContext, command: &Commands) -> Result<()> {
         Commands::Unhide(args) => unhide::run(ctx, args),
         Commands::Simulate(args) => simulate::run(ctx, args),
         Commands::Quality(args) => quality::run(ctx, args),
+        Commands::Recommend(args) => recommend::run(ctx, args),
         Commands::Evidence(args) => evidence::run(ctx, args),
         Commands::Mcp(args) => mcp::run(ctx, args),
         Commands::Template(args) => template::run(ctx, args),

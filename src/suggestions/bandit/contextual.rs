@@ -484,6 +484,91 @@ impl ContextualBandit {
     pub fn has_skill(&self, skill_id: &str) -> bool {
         self.arms.contains_key(skill_id)
     }
+
+    /// Get the total number of recommendations made.
+    #[must_use]
+    pub fn total_recommendations(&self) -> u64 {
+        self.total_recommendations
+    }
+
+    /// Get the total number of updates received.
+    #[must_use]
+    pub fn total_updates(&self) -> u64 {
+        self.total_updates
+    }
+
+    /// Get the number of registered skills (alias for `num_skills`).
+    #[must_use]
+    pub fn skill_count(&self) -> usize {
+        self.arms.len()
+    }
+
+    /// Get configuration summary as JSON.
+    #[must_use]
+    pub fn config_summary(&self) -> serde_json::Value {
+        serde_json::json!({
+            "exploration_rate": self.config.exploration_rate,
+            "learning_rate": self.config.learning_rate,
+            "cold_start_threshold": self.config.cold_start_threshold,
+            "regularization": self.config.regularization,
+            "feature_dim": self.feature_dim,
+        })
+    }
+
+    /// Get statistics for all skills, sorted by UCB score descending.
+    #[must_use]
+    pub fn get_all_skill_stats(&self) -> Vec<(String, SkillStats)> {
+        let mut stats: Vec<(String, SkillStats)> = self
+            .arms
+            .iter()
+            .map(|(skill_id, arm)| {
+                let ucb_score = self.compute_ucb_score(arm);
+                (
+                    skill_id.clone(),
+                    SkillStats {
+                        pulls: arm.pulls,
+                        avg_reward: arm.avg_reward,
+                        ucb_score,
+                        alpha: arm.alpha,
+                        beta: arm.beta,
+                    },
+                )
+            })
+            .collect();
+
+        // Sort by UCB score descending
+        stats.sort_by(|a, b| {
+            b.1.ucb_score
+                .partial_cmp(&a.1.ucb_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        stats
+    }
+
+    /// Compute UCB score for an arm.
+    fn compute_ucb_score(&self, arm: &ContextualArm) -> f64 {
+        let avg = arm.avg_reward;
+        let exploration_bonus = if arm.pulls < self.config.cold_start_threshold {
+            let factor = 1.0 - (arm.pulls as f64 / self.config.cold_start_threshold as f64);
+            self.config.exploration_rate as f64 * factor
+        } else {
+            let t = self.total_recommendations.max(1) as f64;
+            let n = arm.pulls.max(1) as f64;
+            self.config.exploration_rate as f64 * (2.0 * t.ln() / n).sqrt()
+        };
+        avg + exploration_bonus
+    }
+
+    /// Set the exploration rate.
+    pub fn set_exploration_rate(&mut self, rate: f64) {
+        self.config.exploration_rate = rate.clamp(0.0, 1.0) as f32;
+    }
+
+    /// Set the learning rate.
+    pub fn set_learning_rate(&mut self, rate: f64) {
+        self.config.learning_rate = rate.clamp(0.0, 1.0) as f32;
+    }
 }
 
 /// Statistics about the bandit state.
@@ -506,6 +591,25 @@ pub struct BanditStats {
 
     /// Number of skills still in cold start phase.
     pub cold_start_skills: usize,
+}
+
+/// Per-skill statistics for the recommend command.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillStats {
+    /// Total times this skill was pulled/recommended.
+    pub pulls: u64,
+
+    /// Average reward from interactions.
+    pub avg_reward: f64,
+
+    /// Upper confidence bound score.
+    pub ucb_score: f64,
+
+    /// Beta distribution alpha (successes + 1).
+    pub alpha: f32,
+
+    /// Beta distribution beta (failures + 1).
+    pub beta: f32,
 }
 
 /// Sigmoid activation function.
