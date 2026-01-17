@@ -25,6 +25,10 @@ use crate::core::spec_lens::parse_markdown;
 use crate::error::{MsError, Result};
 use crate::meta_skills::{ConditionContext, MetaSkillManager, MetaSkillRegistry};
 use crate::storage::sqlite::SkillRecord;
+use crate::suggestions::bandit::{
+    ContextualBandit, DefaultFeatureExtractor, FeatureExtractor,
+    SkillFeedback, UserHistory,
+};
 
 /// Dependency loading strategy
 #[derive(Debug, Clone, Copy, Default, ValueEnum)]
@@ -265,7 +269,23 @@ fn run_auto_load(ctx: &AppContext, args: &LoadArgs) -> Result<()> {
 
     // Score and rank skills
     let scorer = RelevanceScorer::default();
-    let candidates = scorer.above_threshold(&skills, &scoring_context, args.threshold);
+    let mut candidates = scorer.above_threshold(&skills, &scoring_context, args.threshold);
+
+    // Blend in bandit scores from historical learning
+    let skill_ids: Vec<String> = candidates.iter().map(|c| c.skill_id.clone()).collect();
+    let bandit_scores = get_bandit_scores(&collected, &skill_ids);
+
+    // Apply bandit score boost (blend_factor from config, default 0.3)
+    let blend_factor = ctx.config.auto_load.bandit_blend;
+    for candidate in &mut candidates {
+        if let Some(&bandit_score) = bandit_scores.get(&candidate.skill_id) {
+            // Blend: final = (1 - blend) * relevance + blend * bandit
+            candidate.score = (1.0 - blend_factor) * candidate.score + blend_factor * bandit_score;
+        }
+    }
+
+    // Re-sort after blending bandit scores
+    candidates.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
 
     if candidates.is_empty() {
         match ctx.output_format {
@@ -333,6 +353,21 @@ fn run_auto_load(ctx: &AppContext, args: &LoadArgs) -> Result<()> {
         }
     }
 
+    // Record auto-load events to the contextual bandit for learning
+    if ctx.config.auto_load.learning_enabled {
+        let scores: Vec<(String, f32)> = candidates
+            .iter()
+            .map(|c| (c.skill_id.clone(), c.score))
+            .collect();
+        record_auto_load_events(
+            &collected,
+            &loaded_results,
+            &scores,
+            &ctx.config.auto_load,
+            ctx.verbosity.into(),
+        );
+    }
+
     let auto_result = AutoLoadResult {
         context_summary,
         candidates,
@@ -359,6 +394,107 @@ fn convert_to_scoring_context(collected: &CollectedContext) -> WorkingContext {
                 .collect(),
         )
         .with_tools(collected.detected_tools.iter().cloned())
+}
+
+// =============================================================================
+// CONTEXTUAL BANDIT INTEGRATION FOR AUTO-LOAD
+// =============================================================================
+
+/// Default path for the contextual bandit state file.
+fn default_bandit_path() -> PathBuf {
+    let base = dirs::data_dir().unwrap_or_else(|| PathBuf::from("."));
+    base.join("ms").join("contextual_bandit.json")
+}
+
+/// Record auto-load events to the contextual bandit for learning.
+///
+/// This function records that skills were auto-loaded based on context,
+/// enabling the bandit to learn which skills are relevant in different contexts.
+fn record_auto_load_events(
+    collected: &CollectedContext,
+    loaded_skills: &[LoadResult],
+    _scores: &[(String, f32)], // Reserved for future: weighted feedback based on relevance
+    config: &crate::config::AutoLoadConfig,
+    verbosity: i32,
+) {
+    use crate::suggestions::bandit::{
+        contextual::ContextualBanditConfig,
+        features::FEATURE_DIM,
+    };
+
+    // Skip if persistence is disabled
+    if !config.persist_state {
+        return;
+    }
+
+    // Extract context features from the collected context
+    let extractor = DefaultFeatureExtractor::new();
+    let history = UserHistory::default(); // TODO: Load from database for personalization
+    let features = extractor.extract_from_collected(collected, &history);
+
+    // Load the bandit or create new with configured parameters
+    let bandit_path = default_bandit_path();
+    let mut bandit = match ContextualBandit::load(&bandit_path) {
+        Ok(b) => b,
+        Err(e) => {
+            if verbosity > 1 {
+                eprintln!("note: creating new bandit (load failed: {e})");
+            }
+            // Create new bandit with config from AutoLoadConfig
+            let bandit_config = ContextualBanditConfig {
+                exploration_rate: config.exploration_rate,
+                learning_rate: config.learning_rate,
+                cold_start_threshold: config.cold_start_threshold,
+                ..Default::default()
+            };
+            ContextualBandit::new(bandit_config, FEATURE_DIM)
+        }
+    };
+
+    // Register and update each loaded skill
+    for result in loaded_skills {
+        // Register the skill if not already known
+        bandit.register_skill(&result.skill_id);
+
+        // Record as LoadedOnly initially - user feedback will upgrade this
+        bandit.update(&result.skill_id, &features, &SkillFeedback::LoadedOnly);
+    }
+
+    // Save the updated bandit
+    if let Err(e) = bandit.save(&bandit_path) {
+        if verbosity > 0 {
+            eprintln!("warning: failed to save bandit: {e}");
+        }
+    }
+}
+
+/// Get bandit-boosted scores for skills based on historical learning.
+///
+/// This function samples from the contextual bandit to boost scores for
+/// skills that have historically performed well in similar contexts.
+fn get_bandit_scores(
+    collected: &CollectedContext,
+    skill_ids: &[String],
+) -> HashMap<String, f32> {
+    let extractor = DefaultFeatureExtractor::new();
+    let history = UserHistory::default();
+    let features = extractor.extract_from_collected(collected, &history);
+
+    let bandit_path = default_bandit_path();
+    let mut bandit = match ContextualBandit::load(&bandit_path) {
+        Ok(b) => b,
+        Err(_) => return HashMap::new(),
+    };
+
+    let mut scores = HashMap::new();
+    for skill_id in skill_ids {
+        if bandit.has_skill(skill_id) {
+            let sample = bandit.sample(skill_id, &features);
+            scores.insert(skill_id.clone(), sample);
+        }
+    }
+
+    scores
 }
 
 /// Create a context summary for output

@@ -35,6 +35,8 @@ pub struct Config {
     pub security: SecurityConfig,
     #[serde(default)]
     pub safety: SafetyConfig,
+    #[serde(default)]
+    pub auto_load: AutoLoadConfig,
 }
 
 
@@ -127,6 +129,9 @@ impl Config {
         }
         if let Some(patch) = patch.safety {
             self.safety.merge(patch);
+        }
+        if let Some(patch) = patch.auto_load {
+            self.auto_load.merge(patch);
         }
     }
 
@@ -290,6 +295,29 @@ impl Config {
         }
         if let Some(value) = env_bool("MS_SAFETY_REQUIRE_VERBATIM_APPROVAL")? {
             self.safety.require_verbatim_approval = value;
+        }
+
+        // Auto-load learning config
+        if let Some(value) = env_bool("MS_AUTO_LOAD_LEARNING_ENABLED")? {
+            self.auto_load.learning_enabled = value;
+        }
+        if let Some(value) = env_f32("MS_AUTO_LOAD_EXPLORATION_RATE")? {
+            validate_weight("MS_AUTO_LOAD_EXPLORATION_RATE", value)?;
+            self.auto_load.exploration_rate = value;
+        }
+        if let Some(value) = env_f32("MS_AUTO_LOAD_LEARNING_RATE")? {
+            validate_weight("MS_AUTO_LOAD_LEARNING_RATE", value)?;
+            self.auto_load.learning_rate = value;
+        }
+        if let Some(value) = env_u64("MS_AUTO_LOAD_COLD_START_THRESHOLD")? {
+            self.auto_load.cold_start_threshold = value;
+        }
+        if let Some(value) = env_f32("MS_AUTO_LOAD_BANDIT_BLEND")? {
+            validate_weight("MS_AUTO_LOAD_BANDIT_BLEND", value)?;
+            self.auto_load.bandit_blend = value;
+        }
+        if let Some(value) = env_bool("MS_AUTO_LOAD_PERSIST_STATE")? {
+            self.auto_load.persist_state = value;
         }
 
         Ok(())
@@ -806,6 +834,95 @@ impl SafetyConfig {
     }
 }
 
+/// Configuration for auto-load learning (contextual bandit)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutoLoadConfig {
+    /// Enable learning from auto-load feedback
+    #[serde(default = "default_learning_enabled")]
+    pub learning_enabled: bool,
+
+    /// Exploration rate for UCB bonus (0.0-1.0)
+    #[serde(default = "default_exploration_rate")]
+    pub exploration_rate: f32,
+
+    /// Learning rate for gradient descent updates (0.0-1.0)
+    #[serde(default = "default_learning_rate")]
+    pub learning_rate: f32,
+
+    /// Minimum uses before relying on learned weights
+    #[serde(default = "default_cold_start_threshold")]
+    pub cold_start_threshold: u64,
+
+    /// Blend factor for bandit scores vs relevance scores (0.0-1.0)
+    /// 0.0 = pure relevance scoring, 1.0 = pure bandit scoring
+    #[serde(default = "default_bandit_blend")]
+    pub bandit_blend: f32,
+
+    /// Persist bandit state to disk
+    #[serde(default = "default_persist_state")]
+    pub persist_state: bool,
+}
+
+const fn default_learning_enabled() -> bool {
+    true
+}
+
+const fn default_exploration_rate() -> f32 {
+    0.1
+}
+
+const fn default_learning_rate() -> f32 {
+    0.01
+}
+
+const fn default_cold_start_threshold() -> u64 {
+    10
+}
+
+const fn default_bandit_blend() -> f32 {
+    0.3
+}
+
+const fn default_persist_state() -> bool {
+    true
+}
+
+impl Default for AutoLoadConfig {
+    fn default() -> Self {
+        Self {
+            learning_enabled: default_learning_enabled(),
+            exploration_rate: default_exploration_rate(),
+            learning_rate: default_learning_rate(),
+            cold_start_threshold: default_cold_start_threshold(),
+            bandit_blend: default_bandit_blend(),
+            persist_state: default_persist_state(),
+        }
+    }
+}
+
+impl AutoLoadConfig {
+    fn merge(&mut self, patch: AutoLoadPatch) {
+        if let Some(value) = patch.learning_enabled {
+            self.learning_enabled = value;
+        }
+        if let Some(value) = patch.exploration_rate {
+            self.exploration_rate = value;
+        }
+        if let Some(value) = patch.learning_rate {
+            self.learning_rate = value;
+        }
+        if let Some(value) = patch.cold_start_threshold {
+            self.cold_start_threshold = value;
+        }
+        if let Some(value) = patch.bandit_blend {
+            self.bandit_blend = value;
+        }
+        if let Some(value) = patch.persist_state {
+            self.persist_state = value;
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 struct ConfigPatch {
     pub skill_paths: Option<SkillPathsPatch>,
@@ -821,6 +938,7 @@ struct ConfigPatch {
     pub agent_mail: Option<AgentMailPatch>,
     pub security: Option<SecurityPatch>,
     pub safety: Option<SafetyPatch>,
+    pub auto_load: Option<AutoLoadPatch>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -921,6 +1039,16 @@ struct SafetyPatch {
     pub dcg_packs: Option<Vec<String>>,
     pub dcg_explain_format: Option<String>,
     pub require_verbatim_approval: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct AutoLoadPatch {
+    pub learning_enabled: Option<bool>,
+    pub exploration_rate: Option<f32>,
+    pub learning_rate: Option<f32>,
+    pub cold_start_threshold: Option<u64>,
+    pub bandit_blend: Option<f32>,
+    pub persist_state: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

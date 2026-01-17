@@ -319,6 +319,7 @@ pub fn arb_config() -> impl Strategy<Value = Config> {
                     agent_mail,
                     security,
                     safety,
+                    auto_load: crate::config::AutoLoadConfig::default(),
                 }
             },
         )

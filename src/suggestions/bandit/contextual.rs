@@ -709,4 +709,126 @@ mod tests {
         assert!(loaded.has_skill("skill-a"));
         assert_eq!(loaded.arms.get("skill-a").unwrap().pulls, 1);
     }
+
+    /// Integration test demonstrating learning over time with auto-load feedback.
+    ///
+    /// This test simulates the auto-load feedback loop:
+    /// 1. Skills are auto-loaded based on context
+    /// 2. User provides implicit feedback (LoadedOnly, or explicit feedback)
+    /// 3. Bandit learns which skills work well in which contexts
+    /// 4. Future recommendations are improved based on learning
+    #[test]
+    fn test_auto_load_learning_integration() {
+        let mut bandit = ContextualBandit::with_feature_dim(10);
+
+        // Register skills that might be auto-loaded
+        bandit.register_skill("rust-errors");
+        bandit.register_skill("rust-testing");
+        bandit.register_skill("python-errors");
+        bandit.register_skill("python-testing");
+
+        // Rust project context features
+        let rust_features = ContextFeatures {
+            project_type: vec![1.0, 0.0, 0.0], // Rust
+            time_features: vec![0.5, 0.5, 0.0, 1.0],
+            activity_features: vec![0.3, 0.2, 1.0],
+            history_features: vec![0.5, 0.8, 0.4],
+        };
+
+        // Python project context features
+        let python_features = ContextFeatures {
+            project_type: vec![0.0, 0.0, 1.0], // Python
+            time_features: vec![0.5, 0.5, 0.0, 1.0],
+            activity_features: vec![0.3, 0.2, 1.0],
+            history_features: vec![0.5, 0.8, 0.4],
+        };
+
+        // Simulate auto-load sessions over time
+        // Session 1-5: Rust project, user finds rust-errors helpful, ignores python-*
+        for _ in 0..5 {
+            // Auto-load records initial LoadedOnly signal
+            bandit.update("rust-errors", &rust_features, &SkillFeedback::LoadedOnly);
+            bandit.update("rust-testing", &rust_features, &SkillFeedback::LoadedOnly);
+
+            // User provides explicit positive feedback for rust-errors
+            bandit.update("rust-errors", &rust_features, &SkillFeedback::ExplicitHelpful);
+
+            // User provides usage duration feedback for rust-testing (3 mins = moderate use)
+            bandit.update("rust-testing", &rust_features, &SkillFeedback::UsedDuration { minutes: 3 });
+        }
+
+        // Session 6-10: Python project, user finds python-errors helpful
+        for _ in 0..5 {
+            bandit.update("python-errors", &python_features, &SkillFeedback::LoadedOnly);
+            bandit.update("python-errors", &python_features, &SkillFeedback::ExplicitHelpful);
+        }
+
+        // Verify learning: In Rust context, rust-errors should rank higher
+        let rust_recs = bandit.recommend(&rust_features, 4);
+        assert!(!rust_recs.is_empty());
+
+        // Find the rust-errors recommendation
+        let rust_errors_rec = rust_recs.iter().find(|r| r.skill_id == "rust-errors");
+        let python_errors_rec = rust_recs.iter().find(|r| r.skill_id == "python-errors");
+
+        // Rust-errors should have a higher score in Rust context
+        if let (Some(rust_rec), Some(python_rec)) = (rust_errors_rec, python_errors_rec) {
+            assert!(
+                rust_rec.score >= python_rec.score,
+                "Expected rust-errors ({}) to score higher than python-errors ({}) in Rust context",
+                rust_rec.score,
+                python_rec.score
+            );
+        }
+
+        // Verify learning: In Python context, python-errors should rank well
+        let python_recs = bandit.recommend(&python_features, 4);
+        let python_errors_in_py = python_recs.iter().find(|r| r.skill_id == "python-errors");
+
+        if let Some(rec) = python_errors_in_py {
+            // Should have a reasonable score after positive feedback
+            assert!(
+                rec.score > 0.4,
+                "Expected python-errors to have score > 0.4 after positive feedback, got {}",
+                rec.score
+            );
+        }
+
+        // Verify statistics reflect the learning
+        let stats = bandit.stats();
+        assert_eq!(stats.num_skills, 4);
+        assert!(stats.total_updates > 0);
+
+        // Skills should no longer all be in cold start after training
+        assert!(
+            stats.cold_start_skills < 4,
+            "Expected some skills to exit cold start after training"
+        );
+    }
+
+    /// Test that implicit feedback (LoadedOnly) provides weak signal for learning.
+    #[test]
+    fn test_implicit_feedback_signal() {
+        let mut bandit = ContextualBandit::with_feature_dim(10);
+        bandit.register_skill("skill-a");
+
+        let features = sample_features();
+
+        // Record multiple LoadedOnly signals (implicit positive)
+        for _ in 0..10 {
+            bandit.update("skill-a", &features, &SkillFeedback::LoadedOnly);
+        }
+
+        let arm = bandit.arms.get("skill-a").unwrap();
+
+        // LoadedOnly gives 0.3 reward, so avg should be around 0.3
+        assert!(
+            (arm.avg_reward - 0.3).abs() < 0.05,
+            "Expected avg_reward ~0.3 for LoadedOnly feedback, got {}",
+            arm.avg_reward
+        );
+
+        // Alpha should increase (successes)
+        assert!(arm.alpha > 1.0, "Expected alpha > 1.0 after updates");
+    }
 }
