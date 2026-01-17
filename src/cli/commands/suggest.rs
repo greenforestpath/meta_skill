@@ -2,10 +2,10 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use clap::Args;
-use colored::Colorize;
 
 use crate::app::AppContext;
-use crate::cli::output::{HumanLayout, emit_json};
+use crate::cli::formatters::{SuggestionContext, SuggestionItem, SuggestionOutput};
+use crate::cli::output::Formattable;
 use crate::context::collector::{CollectedContext, ContextCollector, ContextCollectorConfig};
 use crate::context::{ContextCapture, ContextFingerprint};
 use crate::error::Result;
@@ -109,7 +109,7 @@ pub fn run(ctx: &AppContext, args: &SuggestArgs) -> Result<()> {
         SuggestionCooldownCache::new()
     } else {
         SuggestionCooldownCache::load(&cache_path).unwrap_or_else(|e| {
-            if !ctx.robot_mode {
+            if !ctx.output_format.is_machine_readable() {
                 eprintln!("Warning: Failed to load cooldown cache: {e}. Starting fresh.");
             }
             SuggestionCooldownCache::new()
@@ -128,7 +128,7 @@ pub fn run(ctx: &AppContext, args: &SuggestArgs) -> Result<()> {
         bandit
     } else {
         ContextualBandit::load(&contextual_bandit_path).unwrap_or_else(|e| {
-            if !ctx.robot_mode {
+            if !ctx.output_format.is_machine_readable() {
                 eprintln!("Warning: Failed to load bandit state: {e}. Starting fresh.");
             }
             ContextualBandit::with_feature_dim(FEATURE_DIM)
@@ -289,11 +289,7 @@ pub fn run(ctx: &AppContext, args: &SuggestArgs) -> Result<()> {
     cache.save(&cache_path)?;
 
     // 16. Output results
-    if ctx.robot_mode {
-        output_robot(ctx, args, &fingerprint, &suggestions, &discovery_suggestions, &collected_context, &contextual_bandit)
-    } else {
-        output_human(ctx, args, &fingerprint, &suggestions, &discovery_suggestions, &collected_context)
-    }
+    output_suggestions(ctx, args, &fingerprint, &suggestions, &discovery_suggestions, &collected_context, &contextual_bandit)
 }
 
 /// Output when no skills are available.
@@ -303,261 +299,81 @@ fn output_empty_suggestions(
     fingerprint: &ContextFingerprint,
     _cache: &SuggestionCooldownCache,
 ) -> Result<()> {
-    if ctx.robot_mode {
-        let payload = serde_json::json!({
-            "status": "ok",
-            "fingerprint": fingerprint.as_u64(),
-            "suggestions": [],
-            "discovery_suggestions": [],
-            "message": "No skills indexed. Run 'ms index' to index skills."
-        });
-        emit_json(&payload)
-    } else {
-        let mut layout = HumanLayout::new();
-        layout
-            .title("Suggestions")
-            .section("Status")
-            .bullet("No skills indexed. Run 'ms index' to index skills first.");
-        crate::cli::output::emit_human(layout);
-        Ok(())
-    }
+    let output = SuggestionOutput::new().with_fingerprint(fingerprint.as_u64());
+    println!("{}", output.format(ctx.output_format));
+    Ok(())
 }
 
-/// Output in robot (JSON) mode.
-fn output_robot(
-    _ctx: &AppContext,
-    args: &SuggestArgs,
+/// Unified output function using the new formatter system.
+fn output_suggestions(
+    ctx: &AppContext,
+    _args: &SuggestArgs,
     fingerprint: &ContextFingerprint,
     suggestions: &[Suggestion],
     discovery_suggestions: &[Suggestion],
     context: &CollectedContext,
-    bandit: &ContextualBandit,
+    _bandit: &ContextualBandit,
 ) -> Result<()> {
-    let context_json = serde_json::json!({
-        "project_types": context.detected_projects.iter().map(|p| serde_json::json!({
-            "type": format!("{:?}", p.project_type),
-            "confidence": p.confidence
-        })).collect::<Vec<_>>(),
-        "recent_files": context.recent_files.len(),
-        "tools": context.detected_tools.iter().collect::<Vec<_>>()
-    });
+    // Build context
+    let suggestion_context = SuggestionContext {
+        cwd: std::env::current_dir()
+            .ok()
+            .map(|p| p.display().to_string()),
+        git_branch: context.git_context.as_ref().map(|g| g.branch.clone()),
+        recent_files: context
+            .recent_files
+            .iter()
+            .take(10)
+            .map(|f| f.path.display().to_string())
+            .collect(),
+        fingerprint: Some(fingerprint.as_u64()),
+    };
 
-    let suggestions_json: Vec<serde_json::Value> = suggestions
-        .iter()
-        .map(|s| {
-            let mut obj = serde_json::json!({
-                "skill_id": s.skill_id,
-                "name": s.name,
-                "description": s.description,
-                "score": s.score,
-                "tags": s.tags,
-                "discovery": s.is_discovery
-            });
-            if args.explain {
-                obj["breakdown"] = serde_json::json!({
-                    "contextual_score": s.breakdown.contextual_score,
-                    "thompson_score": s.breakdown.thompson_score,
-                    "exploration_bonus": s.breakdown.exploration_bonus,
-                    "personal_boost": s.breakdown.personal_boost,
-                    "pull_count": s.breakdown.pull_count,
-                    "avg_reward": s.breakdown.avg_reward
-                });
-            }
-            obj
-        })
-        .collect();
+    // Build output
+    let mut output = SuggestionOutput::new().with_context(suggestion_context);
 
-    let discovery_json: Vec<serde_json::Value> = discovery_suggestions
-        .iter()
-        .map(|s| serde_json::json!({
-            "skill_id": s.skill_id,
-            "name": s.name,
-            "description": s.description,
-            "score": s.score,
-            "reason": format!("under-explored ({} uses), high exploration potential", s.breakdown.pull_count)
-        }))
-        .collect();
+    // Add main suggestions
+    for s in suggestions {
+        let reason = if s.breakdown.contextual_score > 0.5 {
+            Some(format!(
+                "High context match ({:.0}%)",
+                s.breakdown.contextual_score * 100.0
+            ))
+        } else if s.breakdown.pull_count > 10 {
+            Some(format!("Historically useful ({} uses)", s.breakdown.pull_count))
+        } else {
+            None
+        };
 
-    let bandit_stats = bandit.stats();
-    let payload = serde_json::json!({
-        "status": "ok",
-        "fingerprint": fingerprint.as_u64(),
-        "context": context_json,
-        "suggestions": suggestions_json,
-        "discovery_suggestions": discovery_json,
-        "bandit_stats": {
-            "num_skills": bandit_stats.num_skills,
-            "total_recommendations": bandit_stats.total_recommendations,
-            "total_updates": bandit_stats.total_updates,
-            "avg_reward": bandit_stats.avg_reward,
-            "cold_start_skills": bandit_stats.cold_start_skills
-        }
-    });
-
-    emit_json(&payload)
-}
-
-/// Output in human-readable mode.
-fn output_human(
-    _ctx: &AppContext,
-    args: &SuggestArgs,
-    _fingerprint: &ContextFingerprint,
-    suggestions: &[Suggestion],
-    discovery_suggestions: &[Suggestion],
-    context: &CollectedContext,
-) -> Result<()> {
-    // Context summary
-    println!("{}", "Analyzing context...".dimmed());
-    for project in &context.detected_projects {
-        println!(
-            "  {}: {:?} (confidence: {:.2})",
-            "Project".cyan(),
-            project.project_type,
-            project.confidence
-        );
-    }
-    if !context.recent_files.is_empty() {
-        println!(
-            "  {}: {} files modified recently",
-            "Recent".cyan(),
-            context.recent_files.len()
-        );
-    }
-    if !context.detected_tools.is_empty() {
-        let tools: Vec<&str> = context.detected_tools.iter().take(5).map(|s| s.as_str()).collect();
-        println!("  {}: {}", "Tools".cyan(), tools.join(", "));
-    }
-    println!();
-
-    // Main suggestions
-    if suggestions.is_empty() {
-        println!("{}", "No suggestions available for current context.".yellow());
-        println!("Try running 'ms index' to index skills, or use --discover for exploration.");
-    } else {
-        println!("{}", "Suggested skills:".bold());
-        println!();
-
-        for (i, suggestion) in suggestions.iter().enumerate() {
-            let stars = score_to_stars(suggestion.score);
-            println!(
-                "  {}. {}",
-                format!("{}", i + 1).bold(),
-                suggestion.name.green().bold()
-            );
-            if !suggestion.description.is_empty() {
-                println!("     {}", suggestion.description.dimmed());
-            }
-            println!(
-                "     Score: {:.2} {}",
-                suggestion.score,
-                stars.yellow()
-            );
-
-            // Explain mode: show score breakdown
-            if args.explain {
-                println!("     {}", "├─".dimmed());
-                println!(
-                    "     {} Context match: {:.2}",
-                    "├─".dimmed(),
-                    suggestion.breakdown.contextual_score
-                );
-                println!(
-                    "     {} Thompson sample: {:.2}",
-                    "├─".dimmed(),
-                    suggestion.breakdown.thompson_score
-                );
-                println!(
-                    "     {} Exploration bonus: {:.2}",
-                    "├─".dimmed(),
-                    suggestion.breakdown.exploration_bonus
-                );
-                if args.personal && suggestion.breakdown.personal_boost > 0.0 {
-                    println!(
-                        "     {} Personal boost: +{:.2}",
-                        "├─".dimmed(),
-                        suggestion.breakdown.personal_boost
-                    );
-                }
-                println!(
-                    "     {} Historical: {} uses, avg reward {:.2}",
-                    "└─".dimmed(),
-                    suggestion.breakdown.pull_count,
-                    suggestion.breakdown.avg_reward
-                );
-            }
-
-            if !suggestion.tags.is_empty() {
-                let tags_str = suggestion.tags.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
-                println!("     Tags: {}", tags_str.dimmed());
-            }
-            println!();
-        }
+        output.add_suggestion(SuggestionItem {
+            skill_id: s.skill_id.clone(),
+            name: s.name.clone(),
+            description: s.description.clone(),
+            confidence: s.score,
+            reason,
+            is_discovery: false,
+            tags: s.tags.clone(),
+        });
     }
 
-    // Discovery suggestions
-    if !discovery_suggestions.is_empty() {
-        println!("{}", "Discovery suggestions (things you might like):".bold());
-        println!();
-
-        for suggestion in discovery_suggestions {
-            println!(
-                "  {} {}",
-                "🔍".to_string(),
-                suggestion.name.blue()
-            );
-            if !suggestion.description.is_empty() {
-                println!("     {}", suggestion.description.dimmed());
-            }
-            println!(
-                "     {}",
-                format!(
-                    "\"You haven't tried this yet ({} uses), but it might be useful for your context\"",
-                    suggestion.breakdown.pull_count
-                ).italic().dimmed()
-            );
-            println!();
-        }
+    // Add discovery suggestions
+    for s in discovery_suggestions {
+        output.add_suggestion(SuggestionItem {
+            skill_id: s.skill_id.clone(),
+            name: s.name.clone(),
+            description: s.description.clone(),
+            confidence: s.score,
+            reason: Some(format!(
+                "Under-explored ({} uses), high exploration potential",
+                s.breakdown.pull_count
+            )),
+            is_discovery: true,
+            tags: s.tags.clone(),
+        });
     }
 
-    // Auto-load prompt (if not in auto-load mode)
-    if !suggestions.is_empty() && !args.load {
-        println!(
-            "{}",
-            format!(
-                "Tip: Use 'ms suggest --load' to automatically load top {} skills",
-                args.top
-            ).dimmed()
-        );
-    }
-
-    // Handle auto-load
-    if args.load && !suggestions.is_empty() {
-        let to_load: Vec<_> = suggestions.iter().take(args.top).collect();
-        println!();
-        println!(
-            "{}",
-            format!("Loading top {} suggested skills...", to_load.len()).cyan()
-        );
-        for suggestion in &to_load {
-            println!("  → Loading: {}", suggestion.name);
-            // The actual loading would be done by invoking the load command
-            // For now, we just indicate what would be loaded
-        }
-        println!();
-        println!(
-            "{}",
-            "Use 'ms load <skill-name>' to load skills individually.".dimmed()
-        );
-    }
-
+    println!("{}", output.format(ctx.output_format));
     Ok(())
-}
-
-/// Convert score (0-1) to star rating.
-fn score_to_stars(score: f32) -> String {
-    let filled = (score * 5.0).round() as usize;
-    let empty = 5 - filled;
-    format!("{}{}", "★".repeat(filled), "☆".repeat(empty))
 }
 
 /// Parse tags from skill metadata JSON.

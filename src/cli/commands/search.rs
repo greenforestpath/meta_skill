@@ -4,9 +4,11 @@
 //! similarity via RRF fusion.
 
 use clap::Args;
-use colored::Colorize;
+use console::style;
 
 use crate::app::AppContext;
+use crate::cli::formatters::SearchResults;
+use crate::cli::output::{Formattable, OutputFormat};
 use crate::error::{MsError, Result};
 use crate::search::{
     RrfConfig, SearchFilters, SearchLayer, VectorIndex, build_embedder, fuse_simple,
@@ -58,20 +60,23 @@ pub fn run(ctx: &AppContext, args: &SearchArgs) -> Result<()> {
         if let Some(layer) = SearchLayer::from_str(layer_str) {
             filters = filters.layer(layer);
         } else {
-            if ctx.robot_mode {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "status": "error",
-                        "message": format!("Invalid layer: {}. Valid: base, org, project, user", layer_str)
-                    })
-                );
-            } else {
-                println!(
-                    "{} Invalid layer '{}'. Valid: base, org, project, user",
-                    "!".yellow(),
-                    layer_str
-                );
+            let error_msg = format!(
+                "Invalid layer '{}'. Valid: base, org, project, user",
+                layer_str
+            );
+            match ctx.output_format {
+                OutputFormat::Json | OutputFormat::Jsonl => {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "status": "error",
+                            "message": error_msg
+                        })
+                    );
+                }
+                _ => {
+                    println!("{} {}", style("!").yellow(), error_msg);
+                }
             }
             return Ok(());
         }
@@ -105,10 +110,11 @@ pub fn run(ctx: &AppContext, args: &SearchArgs) -> Result<()> {
 
 fn search_hybrid(ctx: &AppContext, args: &SearchArgs, filters: &SearchFilters) -> Result<()> {
     // Fetch enough results from both systems for fusion
-    let fetch_limit = args.limit * 2;
+    // Increase limit to allow for filtering
+    let fetch_limit = args.limit * 50;
 
     // BM25 search using SQLite FTS
-    let bm25_ids = ctx.db.search_fts(&args.query, fetch_limit)?;
+    let bm25_candidates = ctx.db.search_fts(&args.query, fetch_limit)?;
 
     // Build semantic search using embeddings
     let embedder = build_embedder(&ctx.config.search)?;
@@ -126,10 +132,10 @@ fn search_hybrid(ctx: &AppContext, args: &SearchArgs, filters: &SearchFilters) -
     let semantic_results = vector_index.search(&query_embedding, fetch_limit);
 
     // Convert to (id, score) format
-    let bm25_results: Vec<(String, f32)> = bm25_ids
+    let bm25_results: Vec<(String, f32)> = bm25_candidates
         .iter()
         .enumerate()
-        .map(|(i, id)| (id.clone(), 1.0 / (i + 1) as f32)) // Convert rank to pseudo-score
+        .map(|(i, c)| (c.id.clone(), 1.0 / (i + 1) as f32)) // Convert rank to pseudo-score
         .collect();
 
     // RRF fusion
@@ -142,18 +148,27 @@ fn search_hybrid(ctx: &AppContext, args: &SearchArgs, filters: &SearchFilters) -
     // Fetch full skill records and apply filters
     let mut results = Vec::new();
     for (skill_id, score) in fused {
-        if let Some(skill) = ctx.db.get_skill(&skill_id)? {
-            // Parse tags from metadata
-            let skill_tags = parse_tags_from_metadata(&skill.metadata_json);
+        // Optimization: Check metadata first
+        let candidate = if let Some(c) = bm25_candidates.iter().find(|c| c.id == skill_id) {
+            Some(c.clone())
+        } else {
+            ctx.db.get_skill_candidate(&skill_id)?
+        };
 
-            // Apply filters
+        if let Some(candidate) = candidate {
+            let skill_tags = parse_tags_from_metadata(&candidate.metadata_json);
+
+            // Apply filters on metadata
             if filters.matches(
                 &skill_tags,
-                &skill.source_layer,
-                skill.quality_score as f32,
-                skill.is_deprecated,
+                &candidate.source_layer,
+                candidate.quality_score as f32,
+                candidate.is_deprecated,
             ) {
-                results.push((skill, score));
+                // Only load full skill if it passes filters
+                if let Some(skill) = ctx.db.get_skill(&skill_id)? {
+                    results.push((skill, score));
+                }
             }
         }
 
@@ -166,19 +181,20 @@ fn search_hybrid(ctx: &AppContext, args: &SearchArgs, filters: &SearchFilters) -
 }
 
 fn search_bm25(ctx: &AppContext, args: &SearchArgs, filters: &SearchFilters) -> Result<()> {
-    let ids = ctx.db.search_fts(&args.query, args.limit * 2)?;
+    // Increase limit to allow for filtering
+    let candidates = ctx.db.search_fts(&args.query, args.limit * 50)?;
 
     let mut results = Vec::new();
-    for (i, id) in ids.iter().enumerate() {
-        if let Some(skill) = ctx.db.get_skill(id)? {
-            let skill_tags = parse_tags_from_metadata(&skill.metadata_json);
+    for (i, candidate) in candidates.iter().enumerate() {
+        let skill_tags = parse_tags_from_metadata(&candidate.metadata_json);
 
-            if filters.matches(
-                &skill_tags,
-                &skill.source_layer,
-                skill.quality_score as f32,
-                skill.is_deprecated,
-            ) {
+        if filters.matches(
+            &skill_tags,
+            &candidate.source_layer,
+            candidate.quality_score as f32,
+            candidate.is_deprecated,
+        ) {
+            if let Some(skill) = ctx.db.get_skill(&candidate.id)? {
                 let score = 1.0 / (i + 1) as f32;
                 results.push((skill, score));
             }
@@ -204,20 +220,24 @@ fn search_semantic(ctx: &AppContext, args: &SearchArgs, filters: &SearchFilters)
         let _ = vector_index.insert(id, embedding);
     }
 
-    let search_results = vector_index.search(&query_embedding, args.limit * 2);
+    // Search more to allow filtering
+    let search_results = vector_index.search(&query_embedding, args.limit * 50);
 
     let mut results = Vec::new();
     for (skill_id, score) in search_results {
-        if let Some(skill) = ctx.db.get_skill(&skill_id)? {
-            let skill_tags = parse_tags_from_metadata(&skill.metadata_json);
+        // Fetch metadata first
+        if let Some(candidate) = ctx.db.get_skill_candidate(&skill_id)? {
+            let skill_tags = parse_tags_from_metadata(&candidate.metadata_json);
 
             if filters.matches(
                 &skill_tags,
-                &skill.source_layer,
-                skill.quality_score as f32,
-                skill.is_deprecated,
+                &candidate.source_layer,
+                candidate.quality_score as f32,
+                candidate.is_deprecated,
             ) {
-                results.push((skill, score));
+                if let Some(skill) = ctx.db.get_skill(&skill_id)? {
+                    results.push((skill, score));
+                }
             }
         }
 
@@ -235,105 +255,24 @@ fn display_results(
     args: &SearchArgs,
     search_type: &str,
 ) -> Result<()> {
-    if ctx.robot_mode {
-        let output: Vec<serde_json::Value> = results
-            .iter()
-            .map(|(skill, score)| {
-                serde_json::json!({
-                    "id": skill.id,
-                    "name": skill.name,
-                    "description": skill.description,
-                    "layer": skill.source_layer,
-                    "score": score,
-                    "quality": skill.quality_score,
-                    "is_deprecated": skill.is_deprecated,
-                })
-            })
-            .collect();
+    // Build SearchResults using the new formatter
+    let mut search_results = SearchResults::from_tuples(&args.query, search_type, results);
 
-        println!(
-            "{}",
-            serde_json::json!({
-                "status": "ok",
-                "query": args.query,
-                "search_type": search_type,
-                "count": results.len(),
-                "limit": args.limit,
-                "results": output
-            })
-        );
-    } else if results.is_empty() {
-        println!(
-            "{} No skills found for '{}'",
-            "!".yellow(),
-            args.query.cyan()
-        );
-        println!();
-        println!("Try:");
-        println!("  - Using different keywords");
-        println!("  - Removing filters (--tags, --layer, --min-quality)");
-        println!("  - Including deprecated skills: --include-deprecated");
-    } else {
-        println!(
-            "{} results for '{}' ({} search):",
-            results.len().to_string().bold(),
-            args.query.cyan(),
-            search_type
-        );
-        println!();
-
-        for (i, (skill, score)) in results.iter().enumerate() {
-            let rank = format!("{}.", i + 1);
-            let layer = skill.source_layer.as_str();
-            let layer_colored = match layer {
-                "base" => layer.blue(),
-                "org" => layer.green(),
-                "project" => layer.yellow(),
-                "user" => layer.magenta(),
-                _ => layer.normal(),
-            };
-
-            let deprecated_marker = if skill.is_deprecated {
-                " [deprecated]".red().to_string()
-            } else {
-                String::new()
-            };
-
-            println!(
-                "{:4} {} {}{}",
-                rank.dimmed(),
-                skill.name.bold(),
-                layer_colored,
-                deprecated_marker
-            );
-            println!(
-                "     {} (score: {:.3}, quality: {:.2})",
-                skill.id.dimmed(),
-                score,
-                skill.quality_score
-            );
-
-            // Show description (truncated safely for UTF-8)
-            if !skill.description.is_empty() {
-                let desc = truncate_str(&skill.description, 77);
-                let suffix = if skill.description.chars().count() > 77 {
-                    "..."
-                } else {
-                    ""
-                };
-                println!("     {}{}", desc.dimmed(), suffix);
-            }
-
-            if args.snippets && !skill.body.is_empty() {
-                // Find relevant snippet
+    // Add snippets if requested
+    if args.snippets {
+        for (i, (skill, _)) in results.iter().enumerate() {
+            if !skill.body.is_empty() {
                 if let Some(snippet) = find_snippet(&skill.body, &args.query) {
-                    println!("     \"{}\"", snippet.italic());
+                    if i < search_results.results.len() {
+                        search_results.results[i].snippet = Some(snippet);
+                    }
                 }
             }
-
-            println!();
         }
     }
+
+    // Use the new output format
+    println!("{}", search_results.format(ctx.output_format));
 
     Ok(())
 }
@@ -419,6 +358,7 @@ fn count_source_chars_consumed(body: &str, start_byte: usize, word_lower: &str) 
 }
 
 /// Truncate a string to a maximum number of characters (not bytes), safe for UTF-8
+#[cfg(test)]
 fn truncate_str(s: &str, max_chars: usize) -> String {
     s.chars().take(max_chars).collect()
 }

@@ -2,9 +2,12 @@
 
 use clap::Args;
 use colored::Colorize;
+use serde::Serialize;
 
 use crate::app::AppContext;
+use crate::cli::output::OutputFormat;
 use crate::error::Result;
+use crate::storage::sqlite::SkillRecord;
 
 #[derive(Args, Debug)]
 pub struct ListArgs {
@@ -85,18 +88,89 @@ pub fn run(ctx: &AppContext, args: &ListArgs) -> Result<()> {
         _ => {}
     }
 
-    if ctx.robot_mode {
-        list_robot(ctx, &skills)
-    } else {
-        list_human(ctx, &skills, args)
+    display_list(ctx, &skills, args)
+}
+
+/// Serializable skill entry for JSON/JSONL output
+#[derive(Debug, Clone, Serialize)]
+struct SkillEntry {
+    id: String,
+    name: String,
+    version: Option<String>,
+    description: String,
+    author: Option<String>,
+    layer: String,
+    source_path: String,
+    modified_at: String,
+    is_deprecated: bool,
+    deprecation_reason: Option<String>,
+    quality_score: f64,
+}
+
+impl From<&SkillRecord> for SkillEntry {
+    fn from(s: &SkillRecord) -> Self {
+        Self {
+            id: s.id.clone(),
+            name: s.name.clone(),
+            version: s.version.clone(),
+            description: s.description.clone(),
+            author: s.author.clone(),
+            layer: s.source_layer.clone(),
+            source_path: s.source_path.clone(),
+            modified_at: s.modified_at.clone(),
+            is_deprecated: s.is_deprecated,
+            deprecation_reason: s.deprecation_reason.clone(),
+            quality_score: s.quality_score,
+        }
     }
 }
 
-fn list_human(
-    _ctx: &AppContext,
-    skills: &[crate::storage::sqlite::SkillRecord],
-    args: &ListArgs,
-) -> Result<()> {
+fn display_list(ctx: &AppContext, skills: &[SkillRecord], args: &ListArgs) -> Result<()> {
+    match ctx.output_format {
+        OutputFormat::Human => display_list_human(skills, args),
+        OutputFormat::Json => {
+            let entries: Vec<SkillEntry> = skills.iter().map(SkillEntry::from).collect();
+            let output = serde_json::json!({
+                "status": "ok",
+                "count": entries.len(),
+                "skills": entries
+            });
+            println!("{}", serde_json::to_string_pretty(&output).unwrap_or_default());
+            Ok(())
+        }
+        OutputFormat::Jsonl => {
+            for skill in skills {
+                let entry = SkillEntry::from(skill);
+                println!("{}", serde_json::to_string(&entry).unwrap_or_default());
+            }
+            Ok(())
+        }
+        OutputFormat::Plain => {
+            for skill in skills {
+                println!("{}", skill.id);
+            }
+            Ok(())
+        }
+        OutputFormat::Tsv => {
+            println!("id\tname\tversion\tlayer\tquality\tmodified_at\tis_deprecated");
+            for skill in skills {
+                println!(
+                    "{}\t{}\t{}\t{}\t{:.2}\t{}\t{}",
+                    skill.id,
+                    skill.name,
+                    skill.version.as_deref().unwrap_or("-"),
+                    skill.source_layer,
+                    skill.quality_score,
+                    skill.modified_at.split('T').next().unwrap_or(&skill.modified_at),
+                    skill.is_deprecated
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
+fn display_list_human(skills: &[SkillRecord], args: &ListArgs) -> Result<()> {
     if skills.is_empty() {
         println!("{}", "No skills found".dimmed());
         println!();
@@ -161,38 +235,6 @@ fn list_human(
         skills.len(),
         args.limit,
         args.offset
-    );
-
-    Ok(())
-}
-
-fn list_robot(_ctx: &AppContext, skills: &[crate::storage::sqlite::SkillRecord]) -> Result<()> {
-    let output: Vec<serde_json::Value> = skills
-        .iter()
-        .map(|s| {
-            serde_json::json!({
-                "id": s.id,
-                "name": s.name,
-                "version": s.version,
-                "description": s.description,
-                "author": s.author,
-                "layer": s.source_layer,
-                "source_path": s.source_path,
-                "modified_at": s.modified_at,
-                "is_deprecated": s.is_deprecated,
-                "deprecation_reason": s.deprecation_reason,
-                "quality_score": s.quality_score,
-            })
-        })
-        .collect();
-
-    println!(
-        "{}",
-        serde_json::json!({
-            "status": "ok",
-            "count": skills.len(),
-            "skills": output
-        })
     );
 
     Ok(())

@@ -1,10 +1,11 @@
 //! ms show - Show skill details
 
 use clap::Args;
-use colored::Colorize;
 
 use crate::app::AppContext;
+use crate::cli::output::OutputFormat;
 use crate::error::{MsError, Result};
+use crate::storage::sqlite::SkillRecord;
 
 #[derive(Args, Debug)]
 pub struct ShowArgs {
@@ -39,18 +40,21 @@ pub fn run(ctx: &AppContext, args: &ShowArgs) -> Result<()> {
         })
         .ok_or_else(|| MsError::SkillNotFound(format!("skill not found: {}", args.skill)))?;
 
-    if ctx.robot_mode {
-        show_robot(ctx, &skill, args)
-    } else {
-        show_human(ctx, &skill, args)
+    display_skill(ctx, &skill, args)
+}
+
+fn display_skill(ctx: &AppContext, skill: &SkillRecord, args: &ShowArgs) -> Result<()> {
+    match ctx.output_format {
+        OutputFormat::Human => show_human(ctx, skill, args),
+        OutputFormat::Json => show_json(skill, args, true),
+        OutputFormat::Jsonl => show_json(skill, args, false),
+        OutputFormat::Plain => show_plain(skill),
+        OutputFormat::Tsv => show_tsv(skill),
     }
 }
 
-fn show_human(
-    _ctx: &AppContext,
-    skill: &crate::storage::sqlite::SkillRecord,
-    args: &ShowArgs,
-) -> Result<()> {
+fn show_human(_ctx: &AppContext, skill: &SkillRecord, args: &ShowArgs) -> Result<()> {
+    use colored::Colorize;
     // Header
     println!("{}", skill.name.bold());
     println!("{}", "═".repeat(skill.name.len()));
@@ -178,11 +182,7 @@ fn show_human(
     Ok(())
 }
 
-fn show_robot(
-    _ctx: &AppContext,
-    skill: &crate::storage::sqlite::SkillRecord,
-    args: &ShowArgs,
-) -> Result<()> {
+fn show_json(skill: &SkillRecord, args: &ShowArgs, pretty: bool) -> Result<()> {
     let mut output = serde_json::json!({
         "status": "ok",
         "skill": {
@@ -225,8 +225,30 @@ fn show_robot(
         }
     }
 
-    println!("{}", serde_json::to_string_pretty(&output)?);
+    if pretty {
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        println!("{}", serde_json::to_string(&output)?);
+    }
 
+    Ok(())
+}
+
+fn show_plain(skill: &SkillRecord) -> Result<()> {
+    println!("{}", skill.id);
+    Ok(())
+}
+
+fn show_tsv(skill: &SkillRecord) -> Result<()> {
+    println!(
+        "{}\t{}\t{}\t{}\t{:.2}\t{}",
+        skill.id,
+        skill.name,
+        skill.source_layer,
+        skill.version.as_deref().unwrap_or("-"),
+        skill.quality_score,
+        skill.is_deprecated
+    );
     Ok(())
 }
 
