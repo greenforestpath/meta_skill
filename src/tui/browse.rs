@@ -145,8 +145,6 @@ pub struct BrowseTui {
     show_help: bool,
     /// Status message to display
     status_message: Option<String>,
-    /// Whether app should exit
-    should_quit: bool,
 }
 
 impl BrowseTui {
@@ -172,7 +170,6 @@ impl BrowseTui {
             detail_scroll: 0,
             show_help: false,
             status_message: None,
-            should_quit: false,
         })
     }
 
@@ -196,7 +193,6 @@ impl BrowseTui {
             detail_scroll: 0,
             show_help: false,
             status_message: None,
-            should_quit: false,
         }
     }
 
