@@ -10,4 +10,5 @@ mod migration_tests;
 mod more_cli_tests;
 mod output_format_tests;
 mod security_tests;
+mod skill_md_tests;
 mod workflow_tests;

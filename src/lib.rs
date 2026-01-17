@@ -20,6 +20,7 @@ pub mod quality;
 pub mod search;
 pub mod security;
 pub mod simulation;
+pub mod skill_md;
 pub mod storage;
 pub mod suggestions;
 pub mod sync;

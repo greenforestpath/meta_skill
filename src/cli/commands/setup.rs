@@ -18,6 +18,7 @@ use crate::agent_detection::{
 use crate::app::AppContext;
 use crate::cli::output::{emit_json, robot_ok, OutputFormat};
 use crate::error::{MsError, Result};
+use crate::skill_md::SkillMdGenerator;
 
 /// Setup command arguments.
 #[derive(Args, Debug)]
@@ -584,7 +585,8 @@ fn setup_skill_md(project_root: &Path, args: &SetupArgs) -> Result<SetupAction> 
             ActionStatus::WouldCreate
         }
     } else {
-        let content = generate_skill_md();
+        let generator = SkillMdGenerator::new();
+        let content = generator.generate();
         fs::write(&skill_md_path, content)?;
         ActionStatus::Created
     };
@@ -597,73 +599,6 @@ fn setup_skill_md(project_root: &Path, args: &SetupArgs) -> Result<SetupAction> 
     .with_status(status))
 }
 
-/// Generate SKILL.md content.
-fn generate_skill_md() -> String {
-    let version = env!("CARGO_PKG_VERSION");
-    format!(
-        r#"# ms - Meta Skill CLI
-
-> Local-first skill management platform for AI coding agents
-
-> Version: {version}
-
-## Capabilities
-
-### Core Commands
-- **search**: Hybrid BM25 + semantic skill search
-- **load**: Progressive disclosure skill loading with token packing
-- **suggest**: Context-aware recommendations with Thompson sampling
-- **build**: Extract skills from CASS sessions
-
-### Robot Mode
-All commands support `-O json` for JSON output:
-```bash
-ms search "query" -O json
-ms load skill-name -O json --level overview
-ms suggest -O json
-```
-
-## MCP Server
-Start MCP server for native tool integration:
-```bash
-ms mcp serve           # stdio transport (Claude Code)
-ms mcp serve --tcp-port 8080  # HTTP transport
-```
-
-### Available MCP Tools
-- `search` - Search for skills by query
-- `load` - Load skill content
-- `suggest` - Get context-aware suggestions
-- `evidence` - View skill provenance
-- `list` - List all skills
-- `show` - Show skill details
-- `doctor` - Health checks
-- `lint` - Validate skill files
-- `feedback` - Record skill feedback
-- `index` - Re-index skills
-
-## Context Integration
-- Reads `.ms/config.toml` for project-specific settings
-- Respects `NO_COLOR` and `FORCE_COLOR` environment variables
-- Auto-detects project type from marker files
-
-## Examples
-```bash
-# Find skills for error handling
-ms search "rust error handling"
-
-# Load with full content
-ms load rust-error-patterns --level full
-
-# Get suggestions for current project
-ms suggest --explain
-
-# Validate a skill file
-ms lint SKILL.md
-```
-"#
-    )
-}
 
 /// Setup shell completions.
 fn setup_shell_completions(shell: Shell, dry_run: bool) -> Result<SetupAction> {
@@ -941,14 +876,16 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn test_generate_skill_md_contains_version() {
-        let content = generate_skill_md();
+    fn test_skill_md_generator_contains_version() {
+        let generator = SkillMdGenerator::new();
+        let content = generator.generate();
         assert!(content.contains(env!("CARGO_PKG_VERSION")));
     }
 
     #[test]
-    fn test_generate_skill_md_structure() {
-        let content = generate_skill_md();
+    fn test_skill_md_generator_structure() {
+        let generator = SkillMdGenerator::new();
+        let content = generator.generate();
         assert!(content.starts_with("# ms"));
         assert!(content.contains("## Capabilities"));
         assert!(content.contains("## MCP Server"));
