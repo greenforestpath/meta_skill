@@ -248,6 +248,63 @@ impl Database {
         Ok(count.max(0) as u64)
     }
 
+    /// Get skill usage statistics for building UserHistory.
+    ///
+    /// Returns a tuple of (total_loads, skill_load_counts, skill_last_load).
+    pub fn get_skill_usage_stats(
+        &self,
+    ) -> Result<(
+        u64,
+        std::collections::HashMap<String, u64>,
+        std::collections::HashMap<String, chrono::DateTime<chrono::Utc>>,
+    )> {
+        use std::collections::HashMap;
+
+        // Get total loads
+        let total_loads: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM skill_usage",
+            [],
+            |row| row.get(0),
+        )?;
+
+        // Get per-skill load counts
+        let mut stmt = self.conn.prepare(
+            "SELECT skill_id, COUNT(*) as count FROM skill_usage GROUP BY skill_id"
+        )?;
+        let counts: Result<HashMap<String, u64>> = stmt
+            .query_map([], |row| {
+                let skill_id: String = row.get(0)?;
+                let count: i64 = row.get(1)?;
+                Ok((skill_id, count.max(0) as u64))
+            })?
+            .map(|r| r.map_err(Into::into))
+            .collect();
+        let skill_load_counts = counts?;
+
+        // Get per-skill last load timestamps
+        let mut stmt = self.conn.prepare(
+            "SELECT skill_id, MAX(used_at) as last_used FROM skill_usage GROUP BY skill_id"
+        )?;
+        let last_loads: Result<HashMap<String, chrono::DateTime<chrono::Utc>>> = stmt
+            .query_map([], |row| {
+                let skill_id: String = row.get(0)?;
+                let used_at: String = row.get(1)?;
+                Ok((skill_id, used_at))
+            })?
+            .filter_map(|r| {
+                r.ok().and_then(|(skill_id, used_at)| {
+                    chrono::DateTime::parse_from_rfc3339(&used_at)
+                        .ok()
+                        .map(|dt| (skill_id, dt.with_timezone(&chrono::Utc)))
+                })
+            })
+            .map(Ok)
+            .collect();
+        let skill_last_load = last_loads?;
+
+        Ok((total_loads.max(0) as u64, skill_load_counts, skill_last_load))
+    }
+
     /// Record a skill usage entry (lightweight summary table).
     pub fn record_skill_usage(
         &self,

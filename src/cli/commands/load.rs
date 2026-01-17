@@ -429,8 +429,21 @@ fn record_auto_load_events(
 
     // Extract context features from the collected context
     let extractor = DefaultFeatureExtractor::new();
-    let history = UserHistory::default(); // TODO: Load from database for personalization
-    let features = extractor.extract_from_collected(collected, &history);
+    let history_path = UserHistory::default_path();
+    let mut history = UserHistory::load(&history_path);
+    let features = extractor.extract_from_collected(&collected, &history);
+
+    // Record each skill load to user history
+    for result in loaded_skills {
+        history.record_skill_load(&result.skill_id);
+    }
+
+    // Save updated user history
+    if let Err(e) = history.save(&history_path) {
+        if verbosity > 0 {
+            eprintln!("warning: failed to save user history: {e}");
+        }
+    }
 
     // Load the bandit or create new with configured parameters
     let bandit_path = default_bandit_path();
@@ -477,7 +490,7 @@ fn get_bandit_scores(
     skill_ids: &[String],
 ) -> HashMap<String, f32> {
     let extractor = DefaultFeatureExtractor::new();
-    let history = UserHistory::default();
+    let history = UserHistory::load(&UserHistory::default_path());
     let features = extractor.extract_from_collected(collected, &history);
 
     let bandit_path = default_bandit_path();

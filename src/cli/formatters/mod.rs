@@ -9,4 +9,4 @@ mod suggestion;
 
 pub use search_results::SearchResults;
 pub use skill_card::SkillCard;
-pub use suggestion::{SuggestionContext, SuggestionItem, SuggestionOutput};
+pub use suggestion::{ScorePercentageBreakdown, SuggestionContext, SuggestionItem, SuggestionOutput};

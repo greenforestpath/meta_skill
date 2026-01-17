@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use clap::Args;
 
 use crate::app::AppContext;
-use crate::cli::formatters::{SuggestionContext, SuggestionItem, SuggestionOutput};
+use crate::cli::formatters::{ScorePercentageBreakdown, SuggestionContext, SuggestionItem, SuggestionOutput};
 use crate::cli::output::Formattable;
 use crate::context::collector::{CollectedContext, ContextCollector, ContextCollectorConfig};
 use crate::context::{ContextCapture, ContextFingerprint};
@@ -83,6 +83,7 @@ pub struct Suggestion {
     pub score: f32,
     pub breakdown: ScoreBreakdown,
     pub is_discovery: bool,
+    pub is_favorite: bool,
     pub tags: Vec<String>,
 }
 
@@ -167,6 +168,7 @@ pub fn run(ctx: &AppContext, args: &SuggestArgs) -> Result<()> {
         .filter_map(|rec| {
             let skill = skill_map.get(&rec.skill_id)?;
             let tags = parse_tags_from_metadata(&skill.metadata_json);
+            let is_favorite = ctx.db.has_user_preference(&rec.skill_id, "favorite").unwrap_or(false);
 
             Some(Suggestion {
                 skill_id: rec.skill_id.clone(),
@@ -182,12 +184,29 @@ pub fn run(ctx: &AppContext, args: &SuggestArgs) -> Result<()> {
                     avg_reward: rec.components.avg_reward,
                 },
                 is_discovery: rec.components.pull_count < 5,
+                is_favorite,
                 tags,
             })
         })
         .collect();
 
-    // 9. Apply domain filter if specified
+    // 9. Filter out hidden skills and boost favorites
+    suggestions.retain(|s| {
+        !ctx.db.has_user_preference(&s.skill_id, "hidden").unwrap_or(false)
+    });
+
+    // Apply favorites boost (always, not just in personal mode)
+    for suggestion in &mut suggestions {
+        if suggestion.is_favorite {
+            let favorites_boost = 0.25; // Significant boost for favorites
+            suggestion.breakdown.personal_boost += favorites_boost;
+            suggestion.score = (suggestion.score + favorites_boost).clamp(0.0, 1.0);
+        }
+    }
+    // Re-sort after favorites boost
+    suggestions.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+
+    // 10. Apply domain filter if specified
     if let Some(ref domain) = args.domain {
         let domain_lower = domain.to_lowercase();
         suggestions.retain(|s| {
@@ -197,7 +216,7 @@ pub fn run(ctx: &AppContext, args: &SuggestArgs) -> Result<()> {
         });
     }
 
-    // 10. Apply personal mode (boost historical preferences)
+    // 11. Apply personal mode (boost historical preferences)
     if args.personal {
         for suggestion in &mut suggestions {
             let frequency = user_history.skill_frequency(&suggestion.skill_id);
@@ -210,7 +229,7 @@ pub fn run(ctx: &AppContext, args: &SuggestArgs) -> Result<()> {
         suggestions.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
     }
 
-    // 11. Apply cooldown filter (unless ignored)
+    // 12. Apply cooldown filter (unless ignored)
     let fp = fingerprint.as_u64();
     if !args.ignore_cooldowns {
         use crate::suggestions::CooldownStatus;
@@ -219,10 +238,10 @@ pub fn run(ctx: &AppContext, args: &SuggestArgs) -> Result<()> {
         });
     }
 
-    // 12. Truncate to limit
+    // 13. Truncate to limit
     suggestions.truncate(args.limit);
 
-    // 13. Build discovery suggestions if requested
+    // 14. Build discovery suggestions if requested
     let mut discovery_suggestions: Vec<Suggestion> = Vec::new();
     if args.discover {
         // Find skills not in main suggestions that are under-explored
@@ -230,6 +249,8 @@ pub fn run(ctx: &AppContext, args: &SuggestArgs) -> Result<()> {
         let mut discovery_candidates: Vec<Suggestion> = all_skills
             .iter()
             .filter(|s| !suggested_ids.contains(&s.id))
+            // Filter out hidden skills from discovery too
+            .filter(|s| !ctx.db.has_user_preference(&s.id, "hidden").unwrap_or(false))
             .filter_map(|skill| {
                 let rec = recommendations.iter().find(|r| r.skill_id == skill.id);
                 let components = rec.map(|r| &r.components);
@@ -241,7 +262,16 @@ pub fn run(ctx: &AppContext, args: &SuggestArgs) -> Result<()> {
                 }
 
                 let tags = parse_tags_from_metadata(&skill.metadata_json);
-                let base_score = rec.map(|r| r.score).unwrap_or(0.3);
+                let is_favorite = ctx.db.has_user_preference(&skill.id, "favorite").unwrap_or(false);
+                let mut base_score = rec.map(|r| r.score).unwrap_or(0.3);
+                let mut personal_boost = 0.0;
+
+                // Apply favorites boost to discovery suggestions too
+                if is_favorite {
+                    let favorites_boost = 0.25;
+                    personal_boost += favorites_boost;
+                    base_score = (base_score + favorites_boost).clamp(0.0, 1.0);
+                }
 
                 Some(Suggestion {
                     skill_id: skill.id.clone(),
@@ -252,11 +282,12 @@ pub fn run(ctx: &AppContext, args: &SuggestArgs) -> Result<()> {
                         contextual_score: components.map(|c| c.contextual_score).unwrap_or(0.0),
                         thompson_score: components.map(|c| c.thompson_score).unwrap_or(0.5),
                         exploration_bonus: components.map(|c| c.exploration_bonus).unwrap_or(0.1),
-                        personal_boost: 0.0,
+                        personal_boost,
                         pull_count,
                         avg_reward: components.map(|c| c.avg_reward).unwrap_or(0.5),
                     },
                     is_discovery: true,
+                    is_favorite,
                     tags,
                 })
             })
@@ -272,7 +303,7 @@ pub fn run(ctx: &AppContext, args: &SuggestArgs) -> Result<()> {
         discovery_suggestions = discovery_candidates.into_iter().take(3).collect();
     }
 
-    // 14. Record suggestions for learning
+    // 15. Record suggestions for learning
     let mut suggestion_tracker = SuggestionTracker::new();
     let all_suggested_ids: Vec<String> = suggestions
         .iter()
@@ -307,7 +338,7 @@ fn output_empty_suggestions(
 /// Unified output function using the new formatter system.
 fn output_suggestions(
     ctx: &AppContext,
-    _args: &SuggestArgs,
+    args: &SuggestArgs,
     fingerprint: &ContextFingerprint,
     suggestions: &[Suggestion],
     discovery_suggestions: &[Suggestion],
@@ -334,13 +365,16 @@ fn output_suggestions(
 
     // Add main suggestions
     for s in suggestions {
-        let reason = if s.breakdown.contextual_score > 0.5 {
-            Some(format!(
-                "High context match ({:.0}%)",
-                s.breakdown.contextual_score * 100.0
+        let reason = build_suggestion_reason(s);
+
+        // Calculate percentage breakdown if --explain flag is used
+        let breakdown = if args.explain {
+            Some(ScorePercentageBreakdown::from_components(
+                s.breakdown.contextual_score,
+                s.breakdown.thompson_score,
+                s.breakdown.exploration_bonus,
+                s.breakdown.personal_boost,
             ))
-        } else if s.breakdown.pull_count > 10 {
-            Some(format!("Historically useful ({} uses)", s.breakdown.pull_count))
         } else {
             None
         };
@@ -353,27 +387,80 @@ fn output_suggestions(
             reason,
             is_discovery: false,
             tags: s.tags.clone(),
+            breakdown,
         });
     }
 
     // Add discovery suggestions
     for s in discovery_suggestions {
+        let mut reason_parts: Vec<String> = Vec::new();
+
+        // Favorite status
+        if s.is_favorite {
+            reason_parts.push("Favorite".to_string());
+        }
+
+        // Discovery-specific reason
+        reason_parts.push(format!(
+            "under-explored ({} uses)",
+            s.breakdown.pull_count
+        ));
+
+        // Calculate percentage breakdown if --explain flag is used
+        let breakdown = if args.explain {
+            Some(ScorePercentageBreakdown::from_components(
+                s.breakdown.contextual_score,
+                s.breakdown.thompson_score,
+                s.breakdown.exploration_bonus,
+                s.breakdown.personal_boost,
+            ))
+        } else {
+            None
+        };
+
         output.add_suggestion(SuggestionItem {
             skill_id: s.skill_id.clone(),
             name: s.name.clone(),
             description: s.description.clone(),
             confidence: s.score,
-            reason: Some(format!(
-                "Under-explored ({} uses), high exploration potential",
-                s.breakdown.pull_count
-            )),
+            reason: Some(reason_parts.join(", ")),
             is_discovery: true,
             tags: s.tags.clone(),
+            breakdown,
         });
     }
 
     println!("{}", output.format(ctx.output_format));
     Ok(())
+}
+
+/// Build a human-readable reason for why a skill was suggested.
+fn build_suggestion_reason(s: &Suggestion) -> Option<String> {
+    let mut reasons: Vec<String> = Vec::new();
+
+    // Favorite status is important - mention first
+    if s.is_favorite {
+        reasons.push("Favorite".to_string());
+    }
+
+    // Context match
+    if s.breakdown.contextual_score > 0.5 {
+        reasons.push(format!(
+            "context match {:.0}%",
+            s.breakdown.contextual_score * 100.0
+        ));
+    }
+
+    // Historical usage
+    if s.breakdown.pull_count > 10 {
+        reasons.push(format!("{} prior uses", s.breakdown.pull_count));
+    }
+
+    if reasons.is_empty() {
+        None
+    } else {
+        Some(reasons.join(", "))
+    }
 }
 
 /// Parse tags from skill metadata JSON.
@@ -394,19 +481,7 @@ fn parse_tags_from_metadata(metadata_json: &str) -> Vec<String> {
 
 /// Load user history from persistence.
 fn load_user_history() -> UserHistory {
-    let path = user_history_path();
-    if !path.exists() {
-        return UserHistory::default();
-    }
-    std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
-}
-
-fn user_history_path() -> std::path::PathBuf {
-    let base = dirs::data_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
-    base.join("ms").join("user_history.json")
+    UserHistory::load(&UserHistory::default_path())
 }
 
 fn cooldown_path() -> std::path::PathBuf {
@@ -560,5 +635,106 @@ mod tests {
 
         // Both should be in the same parent directory
         assert_eq!(cooldown.parent(), bandit.parent());
+    }
+
+    // =========================================================================
+    // Suggestion reason tests
+    // =========================================================================
+
+    fn make_test_suggestion(is_favorite: bool, contextual_score: f32, pull_count: u64) -> Suggestion {
+        Suggestion {
+            skill_id: "test-skill".to_string(),
+            name: "Test Skill".to_string(),
+            description: "A test skill".to_string(),
+            score: 0.5,
+            breakdown: ScoreBreakdown {
+                contextual_score,
+                thompson_score: 0.5,
+                exploration_bonus: 0.1,
+                personal_boost: 0.0,
+                pull_count,
+                avg_reward: 0.5,
+            },
+            is_discovery: false,
+            is_favorite,
+            tags: vec![],
+        }
+    }
+
+    #[test]
+    fn reason_favorite_only() {
+        let s = make_test_suggestion(true, 0.3, 5);
+        let reason = build_suggestion_reason(&s);
+        assert_eq!(reason, Some("Favorite".to_string()));
+    }
+
+    #[test]
+    fn reason_context_match_only() {
+        let s = make_test_suggestion(false, 0.8, 5);
+        let reason = build_suggestion_reason(&s);
+        assert_eq!(reason, Some("context match 80%".to_string()));
+    }
+
+    #[test]
+    fn reason_historical_only() {
+        let s = make_test_suggestion(false, 0.3, 15);
+        let reason = build_suggestion_reason(&s);
+        assert_eq!(reason, Some("15 prior uses".to_string()));
+    }
+
+    #[test]
+    fn reason_favorite_and_context() {
+        let s = make_test_suggestion(true, 0.7, 5);
+        let reason = build_suggestion_reason(&s);
+        assert_eq!(reason, Some("Favorite, context match 70%".to_string()));
+    }
+
+    #[test]
+    fn reason_all_factors() {
+        let s = make_test_suggestion(true, 0.6, 20);
+        let reason = build_suggestion_reason(&s);
+        assert_eq!(reason, Some("Favorite, context match 60%, 20 prior uses".to_string()));
+    }
+
+    #[test]
+    fn reason_none_when_no_factors() {
+        let s = make_test_suggestion(false, 0.3, 5);
+        let reason = build_suggestion_reason(&s);
+        assert!(reason.is_none());
+    }
+
+    // =========================================================================
+    // Score breakdown tests
+    // =========================================================================
+
+    #[test]
+    fn favorites_boost_applies_to_score() {
+        let mut s = make_test_suggestion(true, 0.5, 5);
+        let original_score = s.score;
+
+        // Apply the same boost logic as in the main function
+        if s.is_favorite {
+            let favorites_boost = 0.25;
+            s.breakdown.personal_boost += favorites_boost;
+            s.score = (s.score + favorites_boost).clamp(0.0, 1.0);
+        }
+
+        assert!(s.score > original_score);
+        assert_eq!(s.breakdown.personal_boost, 0.25);
+        assert_eq!(s.score, 0.75);
+    }
+
+    #[test]
+    fn favorites_boost_clamps_to_max() {
+        let mut s = make_test_suggestion(true, 0.5, 5);
+        s.score = 0.9; // High base score
+
+        if s.is_favorite {
+            let favorites_boost = 0.25;
+            s.breakdown.personal_boost += favorites_boost;
+            s.score = (s.score + favorites_boost).clamp(0.0, 1.0);
+        }
+
+        assert_eq!(s.score, 1.0); // Clamped to max
     }
 }

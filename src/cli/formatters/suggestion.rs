@@ -5,6 +5,60 @@ use serde::Serialize;
 
 use crate::cli::output::{Formattable, OutputFormat};
 
+/// Percentage breakdown of signal contributions to a suggestion score
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ScorePercentageBreakdown {
+    /// Project/context match percentage
+    pub context_pct: f32,
+    /// Historical usage percentage
+    pub history_pct: f32,
+    /// Exploration bonus percentage
+    pub exploration_pct: f32,
+    /// Favorites boost percentage
+    pub favorites_pct: f32,
+}
+
+impl ScorePercentageBreakdown {
+    /// Calculate percentages from raw score components
+    pub fn from_components(
+        contextual_score: f32,
+        thompson_score: f32,
+        exploration_bonus: f32,
+        personal_boost: f32,
+    ) -> Self {
+        // The final score is approximately: contextual*0.7 + thompson*0.3 + exploration + personal
+        // Normalize to percentages
+        let total = contextual_score * 0.7 + thompson_score * 0.3 + exploration_bonus + personal_boost;
+        if total <= 0.0 {
+            return Self::default();
+        }
+
+        // Calculate contribution percentages
+        let context_raw = contextual_score * 0.7;
+        let history_raw = thompson_score * 0.3; // Thompson includes history signal
+        let exploration_raw = exploration_bonus;
+        let favorites_raw = personal_boost;
+
+        let sum = context_raw + history_raw + exploration_raw + favorites_raw;
+        if sum <= 0.0 {
+            return Self::default();
+        }
+
+        Self {
+            context_pct: (context_raw / sum * 100.0).round(),
+            history_pct: (history_raw / sum * 100.0).round(),
+            exploration_pct: (exploration_raw / sum * 100.0).round(),
+            favorites_pct: (favorites_raw / sum * 100.0).round(),
+        }
+    }
+
+    /// Check if any meaningful breakdown is available
+    pub fn has_breakdown(&self) -> bool {
+        self.context_pct > 0.0 || self.history_pct > 0.0
+            || self.exploration_pct > 0.0 || self.favorites_pct > 0.0
+    }
+}
+
 /// A skill suggestion with confidence and explanation
 #[derive(Debug, Clone)]
 pub struct SuggestionItem {
@@ -22,6 +76,8 @@ pub struct SuggestionItem {
     pub is_discovery: bool,
     /// Tags for the skill
     pub tags: Vec<String>,
+    /// Percentage breakdown of score components (for --explain)
+    pub breakdown: Option<ScorePercentageBreakdown>,
 }
 
 /// Context information for suggestions
@@ -63,6 +119,8 @@ struct SuggestionJson {
     reason: Option<String>,
     is_discovery: bool,
     tags: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    breakdown: Option<ScorePercentageBreakdown>,
 }
 
 /// Serializable suggestion response for JSON output
@@ -116,6 +174,7 @@ impl SuggestionOutput {
             reason: item.reason.clone(),
             is_discovery: item.is_discovery,
             tags: item.tags.clone(),
+            breakdown: item.breakdown.clone(),
         }
     }
 
@@ -180,6 +239,37 @@ impl SuggestionOutput {
                 // Reason
                 if let Some(ref reason) = suggestion.reason {
                     out.push_str(&format!("   {}\n", style(reason).dim()));
+                }
+
+                // Percentage breakdown (when --explain is used)
+                if let Some(ref breakdown) = suggestion.breakdown {
+                    if breakdown.has_breakdown() {
+                        // Format: "  - [80%] Context match"
+                        if breakdown.context_pct > 0.0 {
+                            out.push_str(&format!(
+                                "   {} Context/project match\n",
+                                style(format!("[{:.0}%]", breakdown.context_pct)).cyan()
+                            ));
+                        }
+                        if breakdown.history_pct > 0.0 {
+                            out.push_str(&format!(
+                                "   {} Historical usage patterns\n",
+                                style(format!("[{:.0}%]", breakdown.history_pct)).cyan()
+                            ));
+                        }
+                        if breakdown.exploration_pct > 0.0 {
+                            out.push_str(&format!(
+                                "   {} Exploration bonus\n",
+                                style(format!("[{:.0}%]", breakdown.exploration_pct)).cyan()
+                            ));
+                        }
+                        if breakdown.favorites_pct > 0.0 {
+                            out.push_str(&format!(
+                                "   {} Favorites boost\n",
+                                style(format!("[{:.0}%]", breakdown.favorites_pct)).magenta()
+                            ));
+                        }
+                    }
                 }
 
                 // Tags
@@ -302,6 +392,7 @@ mod tests {
             reason: Some("Recent git activity detected".to_string()),
             is_discovery: false,
             tags: vec!["git".to_string(), "vcs".to_string()],
+            breakdown: None,
         }
     }
 

@@ -131,6 +131,56 @@ impl UserHistory {
         // Exponential decay with half-life of 7 days
         (-days_ago / 7.0).exp()
     }
+
+    /// Record that a skill was loaded.
+    pub fn record_skill_load(&mut self, skill_id: &str) {
+        let now = chrono::Utc::now();
+
+        // Update total loads
+        self.total_skill_loads += 1;
+
+        // Update per-skill count
+        *self.skill_load_counts.entry(skill_id.to_string()).or_insert(0) += 1;
+
+        // Update last load timestamp
+        self.skill_last_load.insert(skill_id.to_string(), now);
+
+        // Update days_since_last_use (now 0 since we just loaded something)
+        self.days_since_last_use = Some(0);
+    }
+
+    /// Load user history from a file.
+    ///
+    /// Returns default history if file doesn't exist or is invalid.
+    #[must_use]
+    pub fn load(path: &std::path::Path) -> Self {
+        if !path.exists() {
+            return Self::default();
+        }
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    /// Save user history to a file.
+    ///
+    /// Creates parent directories if they don't exist.
+    pub fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let json = serde_json::to_string_pretty(self)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        std::fs::write(path, json)
+    }
+
+    /// Get the default path for user history storage.
+    #[must_use]
+    pub fn default_path() -> std::path::PathBuf {
+        let base = dirs::data_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+        base.join("ms").join("user_history.json")
+    }
 }
 
 /// Trait for extracting features from context.
@@ -388,5 +438,79 @@ mod tests {
 
         // All project type features should be 0
         assert!(features.project_type.iter().all(|f| *f < 0.001));
+    }
+
+    #[test]
+    fn test_user_history_record_skill_load() {
+        let mut history = UserHistory::default();
+
+        history.record_skill_load("rust-errors");
+        assert_eq!(history.total_skill_loads, 1);
+        assert_eq!(history.skill_load_counts.get("rust-errors"), Some(&1));
+        assert!(history.skill_last_load.contains_key("rust-errors"));
+        assert_eq!(history.days_since_last_use, Some(0));
+
+        // Load same skill again
+        history.record_skill_load("rust-errors");
+        assert_eq!(history.total_skill_loads, 2);
+        assert_eq!(history.skill_load_counts.get("rust-errors"), Some(&2));
+
+        // Load different skill
+        history.record_skill_load("python-async");
+        assert_eq!(history.total_skill_loads, 3);
+        assert_eq!(history.skill_load_counts.get("python-async"), Some(&1));
+    }
+
+    #[test]
+    fn test_user_history_persistence() {
+        use std::fs;
+
+        // Create a temp directory for the test
+        let temp_dir = std::env::temp_dir().join("ms_test_user_history");
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+        let test_path = temp_dir.join("user_history.json");
+
+        // Create and save a history
+        let mut history = UserHistory::default();
+        history.record_skill_load("test-skill-1");
+        history.record_skill_load("test-skill-2");
+        history.record_skill_load("test-skill-1");
+        history.save(&test_path).unwrap();
+
+        // Load it back
+        let loaded = UserHistory::load(&test_path);
+        assert_eq!(loaded.total_skill_loads, 3);
+        assert_eq!(loaded.skill_load_counts.get("test-skill-1"), Some(&2));
+        assert_eq!(loaded.skill_load_counts.get("test-skill-2"), Some(&1));
+
+        // Cleanup
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_user_history_load_nonexistent() {
+        let path = std::path::PathBuf::from("/nonexistent/path/history.json");
+        let history = UserHistory::load(&path);
+
+        // Should return default
+        assert_eq!(history.total_skill_loads, 0);
+        assert!(history.skill_load_counts.is_empty());
+    }
+
+    #[test]
+    fn test_user_history_frequency_after_loads() {
+        let mut history = UserHistory::default();
+
+        // Load skills with different frequencies
+        for _ in 0..5 {
+            history.record_skill_load("frequent-skill");
+        }
+        history.record_skill_load("rare-skill");
+
+        // frequent-skill: 5/6 = 0.833
+        // rare-skill: 1/6 = 0.167
+        assert!(history.skill_frequency("frequent-skill") > 0.8);
+        assert!(history.skill_frequency("rare-skill") < 0.2);
     }
 }
