@@ -9,6 +9,7 @@ use clap::{Parser, Subcommand};
 pub mod colors;
 pub mod commands;
 pub mod output;
+pub mod progress;
 
 /// Meta Skill - Mine CASS sessions to generate Claude Code skills
 #[derive(Parser, Debug)]
