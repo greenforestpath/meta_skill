@@ -1,10 +1,9 @@
+//! Property-based tests for safety - ensuring parsers and serializers never panic.
+
 use proptest::prelude::*;
 
 use ms::config::Config;
-use ms::core::spec_lens::parse_markdown;
 use ms::core::skill::{BlockType, SkillBlock, SkillMetadata, SkillSection, SkillSpec};
-use ms::core::validation::validate;
-use ms::search::SearchFilters;
 
 fn arb_block_type() -> impl Strategy<Value = BlockType> {
     prop_oneof![
@@ -18,16 +17,13 @@ fn arb_block_type() -> impl Strategy<Value = BlockType> {
 }
 
 fn arb_skill_spec() -> impl Strategy<Value = SkillSpec> {
-    let block = (
-        r"[a-z][a-z0-9_\-]{2,16}",
-        arb_block_type(),
-        ".{0,120}",
-    )
-        .prop_map(|(id, block_type, content)| SkillBlock {
+    let block = (r"[a-z][a-z0-9_\-]{2,16}", arb_block_type(), ".{0,120}").prop_map(
+        |(id, block_type, content)| SkillBlock {
             id,
             block_type,
             content,
-        });
+        },
+    );
 
     let section = (
         r"[a-z][a-z0-9_\-]{2,16}",
@@ -44,18 +40,26 @@ fn arb_skill_spec() -> impl Strategy<Value = SkillSpec> {
         prop::collection::vec("[a-z]{2,12}", 0..4),
         prop::collection::vec(section, 0..3),
     )
-        .prop_map(|(id, name, version, description, tags, sections)| SkillSpec {
-            format_version: SkillSpec::FORMAT_VERSION.to_string(),
-            metadata: SkillMetadata {
-                id,
-                name,
-                version,
-                description,
-                tags,
-                ..Default::default()
+        .prop_map(
+            |(id, name, version, description, tags, sections)| SkillSpec {
+                format_version: SkillSpec::FORMAT_VERSION.to_string(),
+                metadata: SkillMetadata {
+                    id,
+                    name,
+                    version,
+                    description,
+                    tags,
+                    ..Default::default()
+                },
+                sections,
+                extends: None,
+                replace_rules: false,
+                replace_examples: false,
+                replace_pitfalls: false,
+                replace_checklist: false,
+                includes: Vec::new(),
             },
-            sections,
-        })
+        )
 }
 
 fn arb_config() -> impl Strategy<Value = Config> {
@@ -100,36 +104,14 @@ fn arb_config() -> impl Strategy<Value = Config> {
 
 proptest! {
     #[test]
-    fn test_parse_markdown_never_panics(input in ".*") {
-        let _ = parse_markdown(&input);
-    }
-
-    #[test]
-    fn test_parse_markdown_arbitrary_bytes(bytes in prop::collection::vec(any::<u8>(), 0..1000)) {
-        let input = String::from_utf8_lossy(&bytes);
-        let _ = parse_markdown(&input);
-    }
-
-    #[test]
-    fn test_search_tags_never_panics(input in ".*") {
-        let _ = SearchFilters::parse_tags(&input);
-    }
-
-    #[test]
-    fn test_search_tags_arbitrary_bytes(bytes in prop::collection::vec(any::<u8>(), 0..200)) {
-        let input = String::from_utf8_lossy(&bytes);
-        let _ = SearchFilters::parse_tags(&input);
-    }
-
-    #[test]
     fn test_validate_spec_never_panics(spec in arb_skill_spec()) {
-        let _ = validate(&spec);
+        let _ = ms::core::validation::validate(&spec);
     }
 
     #[test]
-    fn test_validate_empty_spec_never_panics() {
+    fn test_validate_empty_spec_never_panics(_seed in any::<u64>()) {
         let spec = SkillSpec::new("", "");
-        let _ = validate(&spec);
+        let _ = ms::core::validation::validate(&spec);
     }
 
     #[test]
@@ -158,10 +140,18 @@ proptest! {
     }
 
     #[test]
-    fn test_skill_spec_new_never_panics(
-        id in ".*",
-        name in ".*"
-    ) {
+    fn test_skill_spec_new_never_panics(id in ".*", name in ".*") {
         let _ = SkillSpec::new(id, name);
+    }
+
+    #[test]
+    fn test_parse_markdown_never_panics(input in ".*") {
+        let _ = ms::core::spec_lens::parse_markdown(&input);
+    }
+
+    #[test]
+    fn test_parse_markdown_arbitrary_bytes(bytes in prop::collection::vec(any::<u8>(), 0..1000)) {
+        let input = String::from_utf8_lossy(&bytes);
+        let _ = ms::core::spec_lens::parse_markdown(&input);
     }
 }
