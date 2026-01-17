@@ -1719,4 +1719,84 @@ token_budget = 1500
         assert_eq!(config.disclosure.token_budget, 800);
         assert!(config.cache.enabled);
     }
+
+    // =========================================================================
+    // AutoLoadConfig tests
+    // =========================================================================
+
+    #[test]
+    fn auto_load_config_defaults() {
+        let config = AutoLoadConfig::default();
+        assert!(config.learning_enabled);
+        assert!((config.exploration_rate - 0.1).abs() < f32::EPSILON);
+        assert!((config.learning_rate - 0.01).abs() < f32::EPSILON);
+        assert_eq!(config.cold_start_threshold, 10);
+        assert!((config.bandit_blend - 0.3).abs() < f32::EPSILON);
+        assert!(config.persist_state);
+    }
+
+    #[test]
+    fn auto_load_config_serialization() {
+        let config = AutoLoadConfig::default();
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains("\"learning_enabled\":true"));
+        assert!(json.contains("\"exploration_rate\""));
+        assert!(json.contains("\"bandit_blend\""));
+    }
+
+    #[test]
+    fn auto_load_config_merge() {
+        let mut config = AutoLoadConfig::default();
+        let patch = AutoLoadPatch {
+            learning_enabled: Some(false),
+            exploration_rate: Some(0.2),
+            learning_rate: None,
+            cold_start_threshold: Some(20),
+            bandit_blend: None,
+            persist_state: Some(false),
+        };
+
+        config.merge(patch);
+
+        assert!(!config.learning_enabled);
+        assert!((config.exploration_rate - 0.2).abs() < f32::EPSILON);
+        assert!((config.learning_rate - 0.01).abs() < f32::EPSILON); // unchanged
+        assert_eq!(config.cold_start_threshold, 20);
+        assert!((config.bandit_blend - 0.3).abs() < f32::EPSILON); // unchanged
+        assert!(!config.persist_state);
+    }
+
+    #[test]
+    fn auto_load_config_in_full_config() {
+        let config = Config::default();
+        // Verify auto_load is part of the main config
+        assert!(config.auto_load.learning_enabled);
+        assert!((config.auto_load.bandit_blend - 0.3).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn config_load_with_auto_load_override() {
+        let temp = TempDir::new().unwrap();
+        let ms_root = temp.path().join(".ms");
+        std::fs::create_dir_all(&ms_root).unwrap();
+
+        let project_config = ms_root.join("config.toml");
+        std::fs::write(
+            &project_config,
+            r#"
+[auto_load]
+learning_enabled = false
+bandit_blend = 0.5
+cold_start_threshold = 50
+"#,
+        )
+        .unwrap();
+
+        let config = Config::load(None, &ms_root).unwrap();
+        assert!(!config.auto_load.learning_enabled);
+        assert!((config.auto_load.bandit_blend - 0.5).abs() < f32::EPSILON);
+        assert_eq!(config.auto_load.cold_start_threshold, 50);
+        // Other fields should remain default
+        assert!((config.auto_load.exploration_rate - 0.1).abs() < f32::EPSILON);
+    }
 }
