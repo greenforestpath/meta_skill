@@ -3,18 +3,39 @@ name: Benchmarks
 on:
   push:
     branches: [main]
+    paths:
+      - '**.rs'
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - 'benches/**'
+      - '.github/workflows/bench.yml'
   pull_request:
     branches: [main]
+    paths:
+      - '**.rs'
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - 'benches/**'
+      - '.github/workflows/bench.yml'
   workflow_dispatch:
+
+# Cancel in-progress runs for the same branch
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
 
 jobs:
   benchmark:
     name: Run Benchmarks
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: write
 
     steps:
       - uses: actions/checkout@v4
@@ -23,10 +44,62 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Download baseline (if exists)
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          workflow: bench.yml
+          branch: main
+          name: benchmark-baseline
+          path: baseline
+        continue-on-error: true
 
       - name: Run Criterion benchmarks
-        run: cargo bench --bench '*' -- --noplot 2>&1 | tee bench-output.log
+        run: |
+          cargo bench --bench '*' -- --noplot 2>&1 | tee bench-output.log
         continue-on-error: true
+
+      - name: Parse benchmark results
+        id: parse
+        run: |
+          # Extract timing data for comparison
+          echo "## Benchmark Results" > bench-summary.md
+          echo "" >> bench-summary.md
+
+          if [ -f bench-output.log ]; then
+            # Parse benchmark names and times
+            echo '```' >> bench-summary.md
+            grep -E "^(test |Benchmarking|time:)" bench-output.log | head -100 >> bench-summary.md || echo "Benchmarks completed" >> bench-summary.md
+            echo '```' >> bench-summary.md
+
+            # Check for regressions (if baseline exists)
+            if [ -f baseline/bench-output.log ]; then
+              echo "" >> bench-summary.md
+              echo "### Comparison with baseline" >> bench-summary.md
+              echo "" >> bench-summary.md
+
+              # Simple comparison - look for "regressed" or "improved"
+              if grep -q "regressed" bench-output.log 2>/dev/null; then
+                echo ":warning: **Performance regressions detected**" >> bench-summary.md
+                grep "regressed" bench-output.log >> bench-summary.md || true
+              else
+                echo ":white_check_mark: No performance regressions detected" >> bench-summary.md
+              fi
+            fi
+          else
+            echo "No benchmark output found" >> bench-summary.md
+          fi
+
+          cat bench-summary.md >> $GITHUB_STEP_SUMMARY
+
+      - name: Comment on PR
+        if: github.event_name == 'pull_request'
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: benchmarks
+          path: bench-summary.md
 
       - name: Upload benchmark results
         uses: actions/upload-artifact@v4
@@ -34,33 +107,15 @@ jobs:
           name: benchmark-results
           path: |
             bench-output.log
+            bench-summary.md
             target/criterion/
           retention-days: 14
 
-  # Optional: Compare benchmarks against baseline
-  compare:
-    name: Compare Benchmarks
-    runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
-    needs: benchmark
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Download benchmark results
-        uses: actions/download-artifact@v4
+      - name: Save baseline (main branch only)
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: actions/upload-artifact@v4
         with:
-          name: benchmark-results
-          path: current-bench
-
-      - name: Parse benchmark results
-        run: |
-          echo "## Benchmark Results" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          if [ -f current-bench/bench-output.log ]; then
-            echo '```' >> $GITHUB_STEP_SUMMARY
-            grep -E "(time:|thrpt:)" current-bench/bench-output.log | head -50 >> $GITHUB_STEP_SUMMARY || echo "No timing results found" >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
-          else
-            echo "No benchmark output found" >> $GITHUB_STEP_SUMMARY
-          fi
+          name: benchmark-baseline
+          path: bench-output.log
+          retention-days: 90
+          overwrite: true

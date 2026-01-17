@@ -9,14 +9,71 @@ on:
       version:
         description: 'Release version (e.g., 0.1.0)'
         required: true
+      dry_run:
+        description: 'Dry run (build only, no release)'
+        required: false
+        default: 'false'
+        type: boolean
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
   BINARY_NAME: ms
 
 jobs:
+  # Validate version before building
+  validate:
+    name: Validate Release
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      is_prerelease: ${{ steps.version.outputs.is_prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine version
+        id: version
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION="${GITHUB_REF#refs/tags/v}"
+          fi
+
+          # Validate semver format
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$ ]]; then
+            echo "::error::Invalid version format: $VERSION"
+            exit 1
+          fi
+
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+          # Check if prerelease
+          if [[ "$VERSION" == *"-"* ]]; then
+            echo "is_prerelease=true" >> $GITHUB_OUTPUT
+          else
+            echo "is_prerelease=false" >> $GITHUB_OUTPUT
+          fi
+
+          echo "## Release Validation" >> $GITHUB_STEP_SUMMARY
+          echo "- **Version**: $VERSION" >> $GITHUB_STEP_SUMMARY
+          echo "- **Prerelease**: $([[ "$VERSION" == *"-"* ]] && echo "Yes" || echo "No")" >> $GITHUB_STEP_SUMMARY
+
+      - name: Verify Cargo.toml version matches
+        run: |
+          CARGO_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          RELEASE_VERSION="${{ steps.version.outputs.version }}"
+
+          # Strip prerelease suffix for comparison
+          RELEASE_BASE=$(echo "$RELEASE_VERSION" | sed 's/-.*//')
+
+          if [[ "$CARGO_VERSION" != "$RELEASE_BASE" ]]; then
+            echo "::warning::Cargo.toml version ($CARGO_VERSION) does not match release version ($RELEASE_BASE)"
+          fi
+
   build:
     name: Build ${{ matrix.target }}
+    needs: validate
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -25,21 +82,27 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             archive: tar.gz
+            cross: false
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
             archive: tar.gz
+            cross: false
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             archive: tar.gz
+            cross: true
           - target: x86_64-apple-darwin
-            os: macos-latest
+            os: macos-13
             archive: tar.gz
+            cross: false
           - target: aarch64-apple-darwin
             os: macos-latest
             archive: tar.gz
+            cross: false
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             archive: zip
+            cross: false
 
     steps:
       - uses: actions/checkout@v4
@@ -51,13 +114,15 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.target }}
+          key: release-${{ matrix.target }}
+          cache-on-failure: true
 
       - name: Install cross-compilation tools (Linux ARM)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
 
       - name: Install musl tools (Linux musl)
         if: matrix.target == 'x86_64-unknown-linux-musl'
@@ -66,15 +131,36 @@ jobs:
           sudo apt-get install -y musl-tools
 
       - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --target ${{ matrix.target }} --locked
+
+      - name: Strip binary (Unix)
+        if: matrix.os != 'windows-latest'
+        run: |
+          if [[ "${{ matrix.target }}" == "aarch64-unknown-linux-gnu" ]]; then
+            aarch64-linux-gnu-strip target/${{ matrix.target }}/release/${{ env.BINARY_NAME }} || true
+          else
+            strip target/${{ matrix.target }}/release/${{ env.BINARY_NAME }} || true
+          fi
+
+      - name: Verify binary
+        shell: bash
+        run: |
+          if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+            ls -la target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}.exe
+            file target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}.exe || true
+          else
+            ls -la target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}
+            file target/${{ matrix.target }}/release/${{ env.BINARY_NAME }} || true
+          fi
 
       - name: Create archive (Unix)
         if: matrix.os != 'windows-latest'
         run: |
           mkdir -p dist
           cp target/${{ matrix.target }}/release/${{ env.BINARY_NAME }} dist/
+          cp README.md LICENSE dist/ 2>/dev/null || true
           cd dist
-          tar -czvf ../${{ env.BINARY_NAME }}-${{ matrix.target }}.tar.gz *
+          tar -czvf ../${{ env.BINARY_NAME }}-${{ needs.validate.outputs.version }}-${{ matrix.target }}.tar.gz *
 
       - name: Create archive (Windows)
         if: matrix.os == 'windows-latest'
@@ -82,25 +168,32 @@ jobs:
         run: |
           mkdir dist
           cp target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}.exe dist/
-          Compress-Archive -Path dist/* -DestinationPath ${{ env.BINARY_NAME }}-${{ matrix.target }}.zip
+          if (Test-Path README.md) { cp README.md dist/ }
+          if (Test-Path LICENSE) { cp LICENSE dist/ }
+          Compress-Archive -Path dist/* -DestinationPath ${{ env.BINARY_NAME }}-${{ needs.validate.outputs.version }}-${{ matrix.target }}.zip
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.BINARY_NAME }}-${{ matrix.target }}
-          path: ${{ env.BINARY_NAME }}-${{ matrix.target }}.${{ matrix.archive }}
+          path: ${{ env.BINARY_NAME }}-${{ needs.validate.outputs.version }}-${{ matrix.target }}.${{ matrix.archive }}
           retention-days: 7
+          if-no-files-found: error
 
   release:
     name: Create Release
-    needs: build
+    needs: [validate, build]
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    if: (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch') && github.event.inputs.dry_run != 'true'
     permissions:
       contents: write
+      id-token: write
+      attestations: write
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -111,6 +204,7 @@ jobs:
         run: |
           mkdir -p release
           find artifacts -type f \( -name "*.tar.gz" -o -name "*.zip" \) -exec mv {} release/ \;
+          ls -la release/
 
       - name: Generate checksums
         run: |
@@ -118,74 +212,126 @@ jobs:
           sha256sum * > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
-      - name: Determine version
-        id: version
+      - name: Generate artifact attestations
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: 'release/*'
+
+      - name: Generate changelog
+        id: changelog
         run: |
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+          # Get previous tag
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+
+          echo "## What's Changed" > CHANGELOG.md
+          echo "" >> CHANGELOG.md
+
+          if [ -n "$PREV_TAG" ]; then
+            echo "Changes since $PREV_TAG:" >> CHANGELOG.md
+            echo "" >> CHANGELOG.md
+            git log --pretty=format:"- %s (%h)" $PREV_TAG..HEAD >> CHANGELOG.md || true
           else
-            echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+            echo "Initial release" >> CHANGELOG.md
           fi
 
+          echo "" >> CHANGELOG.md
+
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
-          tag_name: v${{ steps.version.outputs.version }}
-          name: Release v${{ steps.version.outputs.version }}
+          tag_name: v${{ needs.validate.outputs.version }}
+          name: Release v${{ needs.validate.outputs.version }}
           draft: false
-          prerelease: ${{ contains(steps.version.outputs.version, '-') }}
+          prerelease: ${{ needs.validate.outputs.is_prerelease == 'true' }}
           files: release/*
+          generate_release_notes: true
           body: |
-            ## ms v${{ steps.version.outputs.version }}
+            ## ms v${{ needs.validate.outputs.version }}
 
             ### Checksums
-            See `SHA256SUMS.txt` for file checksums.
+            ```
+            $(cat release/SHA256SUMS.txt)
+            ```
+
+            ### Verification
+
+            All release artifacts include build provenance attestations. Verify with:
+            ```bash
+            gh attestation verify ms-${{ needs.validate.outputs.version }}-<target>.tar.gz --repo ${{ github.repository }}
+            ```
 
             ### Installation
 
             **Linux (x86_64)**
             ```bash
-            curl -LO https://github.com/${{ github.repository }}/releases/download/v${{ steps.version.outputs.version }}/ms-x86_64-unknown-linux-gnu.tar.gz
-            tar -xzf ms-x86_64-unknown-linux-gnu.tar.gz
+            curl -LO https://github.com/${{ github.repository }}/releases/download/v${{ needs.validate.outputs.version }}/ms-${{ needs.validate.outputs.version }}-x86_64-unknown-linux-gnu.tar.gz
+            tar -xzf ms-${{ needs.validate.outputs.version }}-x86_64-unknown-linux-gnu.tar.gz
+            sudo mv ms /usr/local/bin/
+            ```
+
+            **Linux (musl/Alpine)**
+            ```bash
+            curl -LO https://github.com/${{ github.repository }}/releases/download/v${{ needs.validate.outputs.version }}/ms-${{ needs.validate.outputs.version }}-x86_64-unknown-linux-musl.tar.gz
+            tar -xzf ms-${{ needs.validate.outputs.version }}-x86_64-unknown-linux-musl.tar.gz
             sudo mv ms /usr/local/bin/
             ```
 
             **macOS (Apple Silicon)**
             ```bash
-            curl -LO https://github.com/${{ github.repository }}/releases/download/v${{ steps.version.outputs.version }}/ms-aarch64-apple-darwin.tar.gz
-            tar -xzf ms-aarch64-apple-darwin.tar.gz
+            curl -LO https://github.com/${{ github.repository }}/releases/download/v${{ needs.validate.outputs.version }}/ms-${{ needs.validate.outputs.version }}-aarch64-apple-darwin.tar.gz
+            tar -xzf ms-${{ needs.validate.outputs.version }}-aarch64-apple-darwin.tar.gz
+            sudo mv ms /usr/local/bin/
+            ```
+
+            **macOS (Intel)**
+            ```bash
+            curl -LO https://github.com/${{ github.repository }}/releases/download/v${{ needs.validate.outputs.version }}/ms-${{ needs.validate.outputs.version }}-x86_64-apple-darwin.tar.gz
+            tar -xzf ms-${{ needs.validate.outputs.version }}-x86_64-apple-darwin.tar.gz
             sudo mv ms /usr/local/bin/
             ```
 
             **Windows**
-            Download `ms-x86_64-pc-windows-msvc.zip` and extract to your PATH.
+            Download `ms-${{ needs.validate.outputs.version }}-x86_64-pc-windows-msvc.zip` and extract to your PATH.
+
+            **Homebrew** (macOS/Linux)
+            ```bash
+            brew install Dicklesworthstone/tap/ms
+            ```
+
+            **Scoop** (Windows)
+            ```powershell
+            scoop bucket add dicklesworthstone https://github.com/Dicklesworthstone/scoop-bucket
+            scoop install ms
+            ```
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Release summary
+        run: |
+          echo "## Release Created" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Version**: v${{ needs.validate.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Prerelease**: ${{ needs.validate.outputs.is_prerelease }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Artifacts" >> $GITHUB_STEP_SUMMARY
+          ls -1 release/ | while read f; do echo "- \`$f\`" >> $GITHUB_STEP_SUMMARY; done
 
   # Trigger Homebrew tap update
   update-homebrew:
     name: Trigger Homebrew Tap Update
-    needs: release
+    needs: [validate, release]
     runs-on: ubuntu-latest
-    if: success()
+    if: success() && needs.validate.outputs.is_prerelease != 'true'
 
     steps:
-      - name: Determine version
-        id: version
-        run: |
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
-          else
-            echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
-          fi
-
       - name: Trigger Homebrew tap update
         uses: peter-evans/repository-dispatch@v3
         with:
           token: ${{ secrets.TAP_UPDATE_TOKEN }}
           repository: Dicklesworthstone/homebrew-tap
           event-type: release
-          client-payload: '{"version": "${{ steps.version.outputs.version }}"}'
+          client-payload: '{"version": "${{ needs.validate.outputs.version }}", "repository": "${{ github.repository }}"}'
+        continue-on-error: true
 
       - name: Summary
         run: |
@@ -193,7 +339,7 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "A repository dispatch event has been sent to update the Homebrew tap formula." >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- **Version**: ${{ steps.version.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Version**: ${{ needs.validate.outputs.version }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Target**: Dicklesworthstone/homebrew-tap" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "Check the [homebrew-tap repository](https://github.com/Dicklesworthstone/homebrew-tap/actions) for the update PR." >> $GITHUB_STEP_SUMMARY
@@ -201,27 +347,19 @@ jobs:
   # Trigger Scoop bucket update
   update-scoop:
     name: Trigger Scoop Bucket Update
-    needs: release
+    needs: [validate, release]
     runs-on: ubuntu-latest
-    if: success()
+    if: success() && needs.validate.outputs.is_prerelease != 'true'
 
     steps:
-      - name: Determine version
-        id: version
-        run: |
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
-          else
-            echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
-          fi
-
       - name: Trigger Scoop bucket update
         uses: peter-evans/repository-dispatch@v3
         with:
           token: ${{ secrets.BUCKET_UPDATE_TOKEN }}
           repository: Dicklesworthstone/scoop-bucket
           event-type: release
-          client-payload: '{"version": "${{ steps.version.outputs.version }}"}'
+          client-payload: '{"version": "${{ needs.validate.outputs.version }}", "repository": "${{ github.repository }}"}'
+        continue-on-error: true
 
       - name: Summary
         run: |
@@ -229,7 +367,17 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "A repository dispatch event has been sent to update the Scoop bucket manifest." >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- **Version**: ${{ steps.version.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Version**: ${{ needs.validate.outputs.version }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Target**: Dicklesworthstone/scoop-bucket" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "Check the [scoop-bucket repository](https://github.com/Dicklesworthstone/scoop-bucket/actions) for the update PR." >> $GITHUB_STEP_SUMMARY
+
+  # Announce release (optional - can be enabled with a Slack/Discord webhook)
+  # announce:
+  #   name: Announce Release
+  #   needs: [validate, release]
+  #   runs-on: ubuntu-latest
+  #   if: success() && needs.validate.outputs.is_prerelease != 'true'
+  #   steps:
+  #     - name: Send announcement
+  #       run: echo "Add webhook notification here"
