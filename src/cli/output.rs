@@ -3,7 +3,7 @@ use clap::ValueEnum;
 use console::style;
 use serde::Serialize;
 
-use crate::error::{MsError, Result};
+use crate::error::{ErrorCode, MsError, Result, StructuredError};
 
 /// Legacy output mode (Human/Robot)
 #[derive(Debug, Clone, Copy)]
@@ -69,8 +69,37 @@ pub struct RobotResponse<T> {
 #[serde(rename_all = "snake_case")]
 pub enum RobotStatus {
     Ok,
-    Error { code: String, message: String },
-    Partial { completed: usize, failed: usize },
+    /// Simple error with just code and message (legacy)
+    Error {
+        code: String,
+        message: String,
+    },
+    /// Rich error with structured information
+    #[serde(rename = "error")]
+    StructuredError {
+        /// Error code enum value (e.g., "SKILL_NOT_FOUND")
+        code: ErrorCode,
+        /// Numeric error code (e.g., 101)
+        numeric_code: u16,
+        /// Human-readable error message
+        message: String,
+        /// Actionable suggestion for recovery
+        suggestion: String,
+        /// Additional context for debugging
+        #[serde(skip_serializing_if = "Option::is_none")]
+        context: Option<serde_json::Value>,
+        /// Whether this error is recoverable by the user
+        recoverable: bool,
+        /// Error category (e.g., "skill", "config")
+        category: String,
+        /// URL to documentation about this error
+        #[serde(skip_serializing_if = "Option::is_none")]
+        help_url: Option<String>,
+    },
+    Partial {
+        completed: usize,
+        failed: usize,
+    },
 }
 
 pub fn robot_ok<T: Serialize>(data: T) -> RobotResponse<T> {
@@ -83,6 +112,7 @@ pub fn robot_ok<T: Serialize>(data: T) -> RobotResponse<T> {
     }
 }
 
+/// Create a robot error response (legacy format with string code/message).
 pub fn robot_error(
     code: impl Into<String>,
     message: impl Into<String>,
@@ -96,6 +126,80 @@ pub fn robot_error(
         version: env!("CARGO_PKG_VERSION").to_string(),
         data: serde_json::Value::Null,
         warnings: Vec::new(),
+    }
+}
+
+/// Create a robot error response from an MsError with structured information.
+///
+/// This includes error codes, suggestions, context, and recovery hints.
+pub fn robot_error_structured(err: &MsError) -> RobotResponse<serde_json::Value> {
+    let structured = err.to_structured();
+    RobotResponse {
+        status: RobotStatus::StructuredError {
+            code: structured.code,
+            numeric_code: structured.numeric_code,
+            message: structured.message,
+            suggestion: structured.suggestion,
+            context: structured.context,
+            recoverable: structured.recoverable,
+            category: structured.category,
+            help_url: structured.help_url,
+        },
+        timestamp: Utc::now(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        data: serde_json::Value::Null,
+        warnings: Vec::new(),
+    }
+}
+
+/// Create a robot error response from a StructuredError.
+pub fn robot_error_from_structured(err: StructuredError) -> RobotResponse<serde_json::Value> {
+    RobotResponse {
+        status: RobotStatus::StructuredError {
+            code: err.code,
+            numeric_code: err.numeric_code,
+            message: err.message,
+            suggestion: err.suggestion,
+            context: err.context,
+            recoverable: err.recoverable,
+            category: err.category,
+            help_url: err.help_url,
+        },
+        timestamp: Utc::now(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        data: serde_json::Value::Null,
+        warnings: Vec::new(),
+    }
+}
+
+impl From<&MsError> for RobotStatus {
+    fn from(err: &MsError) -> Self {
+        let structured = err.to_structured();
+        RobotStatus::StructuredError {
+            code: structured.code,
+            numeric_code: structured.numeric_code,
+            message: structured.message,
+            suggestion: structured.suggestion,
+            context: structured.context,
+            recoverable: structured.recoverable,
+            category: structured.category,
+            help_url: structured.help_url,
+        }
+    }
+}
+
+impl From<StructuredError> for RobotStatus {
+    fn from(err: StructuredError) -> Self {
+        RobotStatus::StructuredError {
+            code: err.code,
+            numeric_code: err.numeric_code,
+            message: err.message,
+            suggestion: err.suggestion,
+            context: err.context,
+            recoverable: err.recoverable,
+            category: err.category,
+            help_url: err.help_url,
+        }
     }
 }
 
@@ -283,5 +387,85 @@ mod tests {
     #[test]
     fn output_format_default_is_human() {
         assert_eq!(OutputFormat::default(), OutputFormat::Human);
+    }
+
+    #[test]
+    fn robot_error_structured_includes_all_fields() {
+        let err = MsError::SkillNotFound("test-skill".into());
+        let response = robot_error_structured(&err);
+
+        match response.status {
+            RobotStatus::StructuredError {
+                code,
+                numeric_code,
+                message,
+                suggestion,
+                recoverable,
+                category,
+                ..
+            } => {
+                assert_eq!(code, ErrorCode::SkillNotFound);
+                assert_eq!(numeric_code, 101);
+                assert!(message.contains("test-skill"));
+                assert!(!suggestion.is_empty());
+                assert!(recoverable);
+                assert_eq!(category, "skill");
+            }
+            _ => panic!("Expected StructuredError status"),
+        }
+    }
+
+    #[test]
+    fn robot_status_from_ms_error() {
+        let err = MsError::Config("bad config".into());
+        let status: RobotStatus = (&err).into();
+
+        match status {
+            RobotStatus::StructuredError {
+                code,
+                numeric_code,
+                category,
+                ..
+            } => {
+                assert_eq!(code, ErrorCode::ConfigInvalid);
+                assert_eq!(numeric_code, 302);
+                assert_eq!(category, "config");
+            }
+            _ => panic!("Expected StructuredError status"),
+        }
+    }
+
+    #[test]
+    fn robot_error_structured_serialization() {
+        let err = MsError::SkillNotFound("my-skill".into());
+        let response = robot_error_structured(&err);
+        let json = serde_json::to_string(&response).unwrap();
+
+        // Check key fields are present in serialized output
+        assert!(json.contains("SKILL_NOT_FOUND"));
+        assert!(json.contains("\"numeric_code\":101"));
+        assert!(json.contains("\"recoverable\":true"));
+        assert!(json.contains("\"category\":\"skill\""));
+        assert!(json.contains("\"suggestion\":"));
+    }
+
+    #[test]
+    fn robot_error_from_structured_error() {
+        let structured = StructuredError::new(ErrorCode::NetworkTimeout, "Connection timed out");
+        let response = robot_error_from_structured(structured);
+
+        match response.status {
+            RobotStatus::StructuredError {
+                code,
+                numeric_code,
+                recoverable,
+                ..
+            } => {
+                assert_eq!(code, ErrorCode::NetworkTimeout);
+                assert_eq!(numeric_code, 502);
+                assert!(recoverable);
+            }
+            _ => panic!("Expected StructuredError status"),
+        }
     }
 }
