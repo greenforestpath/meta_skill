@@ -9,6 +9,7 @@ use colored::Colorize;
 use serde::Deserialize;
 
 use crate::app::AppContext;
+use crate::cli::output::OutputFormat;
 use crate::context::collector::{ContextCollector, ContextCollectorConfig, CollectedContext};
 use crate::context::scoring::{RankedSkill, RelevanceScorer, WorkingContext};
 use crate::core::dependencies::{
@@ -189,20 +190,20 @@ pub fn run(ctx: &AppContext, args: &LoadArgs) -> Result<()> {
 
     // First try to load as meta-skill
     if let Some(meta_result) = try_load_meta_skill(ctx, args, skill_ref)? {
-        return if ctx.robot_mode {
-            output_robot_meta(ctx, &meta_result, args)
-        } else {
-            output_human_meta(ctx, &meta_result, args)
+        return match ctx.output_format {
+            OutputFormat::Json | OutputFormat::Jsonl => output_robot_meta(ctx, &meta_result, args),
+            _ => output_human_meta(ctx, &meta_result, args),
         };
     }
 
     // Fall back to regular skill loading
     let result = load_skill(ctx, args, skill_ref)?;
 
-    if ctx.robot_mode {
-        output_robot(ctx, &result, args)
-    } else {
-        output_human(ctx, &result, args)
+    match ctx.output_format {
+        OutputFormat::Json | OutputFormat::Jsonl => output_robot(ctx, &result, args),
+        OutputFormat::Plain => output_plain(&result),
+        OutputFormat::Tsv => output_tsv(&result),
+        OutputFormat::Human => output_human(ctx, &result, args),
     }
 }
 
@@ -243,18 +244,21 @@ fn run_auto_load(ctx: &AppContext, args: &LoadArgs) -> Result<()> {
     let skills = get_all_skill_metadata(ctx)?;
 
     if skills.is_empty() {
-        if ctx.robot_mode {
-            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                "status": "ok",
-                "data": {
-                    "context": context_summary_to_json(&context_summary),
-                    "candidates": [],
-                    "loaded": [],
-                    "message": "No skills indexed"
-                }
-            }))?);
-        } else {
-            println!("{}", "No skills indexed. Run 'ms index' first.".yellow());
+        match ctx.output_format {
+            OutputFormat::Json | OutputFormat::Jsonl => {
+                println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                    "status": "ok",
+                    "data": {
+                        "context": context_summary_to_json(&context_summary),
+                        "candidates": [],
+                        "loaded": [],
+                        "message": "No skills indexed"
+                    }
+                }))?);
+            }
+            _ => {
+                println!("{}", "No skills indexed. Run 'ms index' first.".yellow());
+            }
         }
         return Ok(());
     }
@@ -264,19 +268,22 @@ fn run_auto_load(ctx: &AppContext, args: &LoadArgs) -> Result<()> {
     let candidates = scorer.above_threshold(&skills, &scoring_context, args.threshold);
 
     if candidates.is_empty() {
-        if ctx.robot_mode {
-            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                "status": "ok",
-                "data": {
-                    "context": context_summary_to_json(&context_summary),
-                    "candidates": [],
-                    "loaded": [],
-                    "message": format!("No skills match threshold {}", args.threshold)
-                }
-            }))?);
-        } else {
-            println!("{}", format!("No skills match threshold {}.", args.threshold).yellow());
-            println!("Try lowering the threshold with --threshold 0.1");
+        match ctx.output_format {
+            OutputFormat::Json | OutputFormat::Jsonl => {
+                println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                    "status": "ok",
+                    "data": {
+                        "context": context_summary_to_json(&context_summary),
+                        "candidates": [],
+                        "loaded": [],
+                        "message": format!("No skills match threshold {}", args.threshold)
+                    }
+                }))?);
+            }
+            _ => {
+                println!("{}", format!("No skills match threshold {}.", args.threshold).yellow());
+                println!("Try lowering the threshold with --threshold 0.1");
+            }
         }
         return Ok(());
     }
@@ -292,8 +299,8 @@ fn run_auto_load(ctx: &AppContext, args: &LoadArgs) -> Result<()> {
     let mut total_tokens = 0usize;
 
     for candidate in &candidates {
-        // Confirm mode: ask user before each load
-        if args.confirm && !ctx.robot_mode {
+        // Confirm mode: ask user before each load (only for human-readable output)
+        if args.confirm && ctx.output_format == OutputFormat::Human {
             print!(
                 "Load {} (score: {:.2})? [Y/n] ",
                 candidate.skill_id.cyan(),
@@ -334,10 +341,9 @@ fn run_auto_load(ctx: &AppContext, args: &LoadArgs) -> Result<()> {
         total_tokens,
     };
 
-    if ctx.robot_mode {
-        output_auto_robot(ctx, &auto_result, args)
-    } else {
-        output_auto_human(ctx, &auto_result, args)
+    match ctx.output_format {
+        OutputFormat::Json | OutputFormat::Jsonl => output_auto_robot(ctx, &auto_result, args),
+        _ => output_auto_human(ctx, &auto_result, args),
     }
 }
 
@@ -438,58 +444,72 @@ fn output_dry_run(
     candidates: &[RankedSkill],
     args: &LoadArgs,
 ) -> Result<()> {
-    if ctx.robot_mode {
-        let output = serde_json::json!({
-            "status": "ok",
-            "dry_run": true,
-            "data": {
-                "context": context_summary_to_json(context_summary),
-                "would_load": candidates.iter().map(|c| {
-                    serde_json::json!({
-                        "skill_id": c.skill_id,
-                        "name": c.skill_name,
-                        "score": c.score,
-                        "breakdown": {
-                            "project_type": c.breakdown.project_type,
-                            "file_patterns": c.breakdown.file_patterns,
-                            "tools": c.breakdown.tools,
-                            "signals": c.breakdown.signals
-                        }
-                    })
-                }).collect::<Vec<_>>(),
-                "threshold": args.threshold
-            }
-        });
-        println!("{}", serde_json::to_string_pretty(&output)?);
-    } else {
-        println!("{}", "Would load skills:".bold());
-        println!();
-
-        for (i, candidate) in candidates.iter().enumerate() {
-            println!(
-                "  {}. {} (score: {:.2})",
-                i + 1,
-                candidate.skill_id.cyan(),
-                candidate.score
-            );
-            if ctx.verbosity > 0 {
-                println!(
-                    "     {} project: {:.2}, files: {:.2}, tools: {:.2}",
-                    "├".dimmed(),
-                    candidate.breakdown.project_type,
-                    candidate.breakdown.file_patterns,
-                    candidate.breakdown.tools
-                );
+    match ctx.output_format {
+        OutputFormat::Json | OutputFormat::Jsonl => {
+            let output = serde_json::json!({
+                "status": "ok",
+                "dry_run": true,
+                "data": {
+                    "context": context_summary_to_json(context_summary),
+                    "would_load": candidates.iter().map(|c| {
+                        serde_json::json!({
+                            "skill_id": c.skill_id,
+                            "name": c.skill_name,
+                            "score": c.score,
+                            "breakdown": {
+                                "project_type": c.breakdown.project_type,
+                                "file_patterns": c.breakdown.file_patterns,
+                                "tools": c.breakdown.tools,
+                                "signals": c.breakdown.signals
+                            }
+                        })
+                    }).collect::<Vec<_>>(),
+                    "threshold": args.threshold
+                }
+            });
+            println!("{}", serde_json::to_string_pretty(&output)?);
+        }
+        OutputFormat::Plain => {
+            for candidate in candidates {
+                println!("{}", candidate.skill_id);
             }
         }
+        OutputFormat::Tsv => {
+            println!("skill_id\tname\tscore");
+            for candidate in candidates {
+                println!("{}\t{}\t{:.2}", candidate.skill_id, candidate.skill_name, candidate.score);
+            }
+        }
+        OutputFormat::Human => {
+            println!("{}", "Would load skills:".bold());
+            println!();
 
-        println!();
-        println!(
-            "{} {} skills would be loaded (threshold: {})",
-            "Total:".dimmed(),
-            candidates.len(),
-            args.threshold
-        );
+            for (i, candidate) in candidates.iter().enumerate() {
+                println!(
+                    "  {}. {} (score: {:.2})",
+                    i + 1,
+                    candidate.skill_id.cyan(),
+                    candidate.score
+                );
+                if ctx.verbosity > 0 {
+                    println!(
+                        "     {} project: {:.2}, files: {:.2}, tools: {:.2}",
+                        "├".dimmed(),
+                        candidate.breakdown.project_type,
+                        candidate.breakdown.file_patterns,
+                        candidate.breakdown.tools
+                    );
+                }
+            }
+
+            println!();
+            println!(
+                "{} {} skills would be loaded (threshold: {})",
+                "Total:".dimmed(),
+                candidates.len(),
+                args.threshold
+            );
+        }
     }
 
     Ok(())
@@ -1318,6 +1338,22 @@ pub(crate) fn output_human(
 fn output_robot(_ctx: &AppContext, result: &LoadResult, args: &LoadArgs) -> Result<()> {
     let output = build_robot_payload(result, args);
     println!("{}", serde_json::to_string_pretty(&output)?);
+    Ok(())
+}
+
+fn output_plain(result: &LoadResult) -> Result<()> {
+    println!("{}", result.skill_id);
+    Ok(())
+}
+
+fn output_tsv(result: &LoadResult) -> Result<()> {
+    println!(
+        "{}\t{}\t{}\t{}",
+        result.skill_id,
+        result.name,
+        result.disclosed.level.name(),
+        result.disclosed.token_estimate
+    );
     Ok(())
 }
 
