@@ -288,4 +288,336 @@ mod tests {
         assert_eq!(tags.len(), 1, "Tags should be normalized and deduped");
         assert_eq!(tags[0], "rust");
     }
+
+    // =========================================
+    // parse_meta Tests
+    // =========================================
+
+    #[test]
+    fn test_parse_meta_empty_string() {
+        let meta = parse_meta("");
+        assert!(meta.tags.is_empty());
+        assert!(meta.requires.is_empty());
+        assert!(meta.provides.is_empty());
+    }
+
+    #[test]
+    fn test_parse_meta_empty_object() {
+        let meta = parse_meta("{}");
+        assert!(meta.tags.is_empty());
+        assert!(meta.requires.is_empty());
+        assert!(meta.provides.is_empty());
+    }
+
+    #[test]
+    fn test_parse_meta_invalid_json() {
+        let meta = parse_meta("not valid json");
+        assert!(meta.tags.is_empty());
+        assert!(meta.requires.is_empty());
+        assert!(meta.provides.is_empty());
+    }
+
+    #[test]
+    fn test_parse_meta_partial_fields() {
+        let meta = parse_meta(r#"{"tags": ["foo"], "provides": ["bar"]}"#);
+        assert_eq!(meta.tags, vec!["foo"]);
+        assert!(meta.requires.is_empty());
+        assert_eq!(meta.provides, vec!["bar"]);
+    }
+
+    #[test]
+    fn test_parse_meta_all_fields() {
+        let meta = parse_meta(r#"{"tags": ["a", "b"], "requires": ["c"], "provides": ["d", "e"]}"#);
+        assert_eq!(meta.tags, vec!["a", "b"]);
+        assert_eq!(meta.requires, vec!["c"]);
+        assert_eq!(meta.provides, vec!["d", "e"]);
+    }
+
+    #[test]
+    fn test_parse_meta_non_array_values() {
+        // If tags/requires/provides aren't arrays, should return empty
+        let meta = parse_meta(r#"{"tags": "not-an-array", "requires": 123}"#);
+        assert!(meta.tags.is_empty());
+        assert!(meta.requires.is_empty());
+    }
+
+    // =========================================
+    // parse_list Tests
+    // =========================================
+
+    #[test]
+    fn test_parse_list_empty_array() {
+        let value: serde_json::Value = serde_json::json!({"items": []});
+        let list = parse_list(&value, "items");
+        assert!(list.is_empty());
+    }
+
+    #[test]
+    fn test_parse_list_missing_key() {
+        let value: serde_json::Value = serde_json::json!({"other": ["a"]});
+        let list = parse_list(&value, "items");
+        assert!(list.is_empty());
+    }
+
+    #[test]
+    fn test_parse_list_non_array_value() {
+        let value: serde_json::Value = serde_json::json!({"items": "string"});
+        let list = parse_list(&value, "items");
+        assert!(list.is_empty());
+    }
+
+    #[test]
+    fn test_parse_list_mixed_types() {
+        // Only string items should be kept
+        let value: serde_json::Value = serde_json::json!({"items": ["a", 123, "b", null, "c"]});
+        let list = parse_list(&value, "items");
+        assert_eq!(list, vec!["a", "b", "c"]);
+    }
+
+    // =========================================
+    // quality_to_priority Tests
+    // =========================================
+
+    #[test]
+    fn test_quality_to_priority_p0() {
+        assert_eq!(quality_to_priority(0.95), 0);
+        assert_eq!(quality_to_priority(0.90), 0);
+        assert_eq!(quality_to_priority(1.0), 0);
+    }
+
+    #[test]
+    fn test_quality_to_priority_p1() {
+        assert_eq!(quality_to_priority(0.89), 1);
+        assert_eq!(quality_to_priority(0.70), 1);
+        assert_eq!(quality_to_priority(0.75), 1);
+    }
+
+    #[test]
+    fn test_quality_to_priority_p2() {
+        assert_eq!(quality_to_priority(0.69), 2);
+        assert_eq!(quality_to_priority(0.50), 2);
+        assert_eq!(quality_to_priority(0.55), 2);
+    }
+
+    #[test]
+    fn test_quality_to_priority_p3() {
+        assert_eq!(quality_to_priority(0.49), 3);
+        assert_eq!(quality_to_priority(0.30), 3);
+        assert_eq!(quality_to_priority(0.35), 3);
+    }
+
+    #[test]
+    fn test_quality_to_priority_p4() {
+        assert_eq!(quality_to_priority(0.29), 4);
+        assert_eq!(quality_to_priority(0.10), 4);
+        assert_eq!(quality_to_priority(0.0), 4);
+    }
+
+    // =========================================
+    // skill_status Tests
+    // =========================================
+
+    #[test]
+    fn test_skill_status_active() {
+        let skill = record_with_meta("test", &serde_json::json!({}));
+        assert_eq!(skill_status(&skill), IssueStatus::Open);
+    }
+
+    #[test]
+    fn test_skill_status_deprecated() {
+        let mut skill = record_with_meta("test", &serde_json::json!({}));
+        skill.is_deprecated = true;
+        assert_eq!(skill_status(&skill), IssueStatus::Closed);
+    }
+
+    // =========================================
+    // skills_to_issues Edge Cases
+    // =========================================
+
+    #[test]
+    fn test_skills_to_issues_empty_input() {
+        let issues = skills_to_issues(&[]).unwrap();
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn test_skills_to_issues_no_dependencies() {
+        let skill = record_with_meta("standalone", &serde_json::json!({}));
+        let issues = skills_to_issues(&[skill]).unwrap();
+        assert_eq!(issues.len(), 1);
+        assert!(issues[0].dependencies.is_empty());
+    }
+
+    #[test]
+    fn test_skills_to_issues_self_reference_filtered() {
+        // A skill requiring a capability it provides itself shouldn't depend on itself
+        let skill = record_with_meta(
+            "self-sufficient",
+            &serde_json::json!({
+                "requires": ["cap-a"],
+                "provides": ["cap-a"],
+            }),
+        );
+        let issues = skills_to_issues(&[skill]).unwrap();
+        assert!(issues[0].dependencies.is_empty(), "Self-dependencies should be filtered");
+    }
+
+    #[test]
+    fn test_skills_to_issues_unresolved_dependency() {
+        // Requiring something no one provides
+        let skill = record_with_meta(
+            "needs-unknown",
+            &serde_json::json!({
+                "requires": ["unknown-capability"],
+            }),
+        );
+        let issues = skills_to_issues(&[skill]).unwrap();
+        // Should have no dependencies since nothing provides unknown-capability
+        assert!(issues[0].dependencies.is_empty());
+    }
+
+    #[test]
+    fn test_skills_to_issues_multiple_providers() {
+        // Multiple skills provide the same capability
+        let skill_a = record_with_meta(
+            "skill-a",
+            &serde_json::json!({ "provides": ["logging"] }),
+        );
+        let skill_b = record_with_meta(
+            "skill-b",
+            &serde_json::json!({ "provides": ["logging"] }),
+        );
+        let skill_c = record_with_meta(
+            "skill-c",
+            &serde_json::json!({ "requires": ["logging"] }),
+        );
+
+        let issues = skills_to_issues(&[skill_a, skill_b, skill_c]).unwrap();
+        let issue_c = issues.iter().find(|i| i.id == "skill-c").unwrap();
+
+        // skill-c should depend on both skill-a and skill-b
+        assert_eq!(issue_c.dependencies.len(), 2);
+        let dep_ids: Vec<_> = issue_c.dependencies.iter().map(|d| d.id.as_str()).collect();
+        assert!(dep_ids.contains(&"skill-a"));
+        assert!(dep_ids.contains(&"skill-b"));
+    }
+
+    #[test]
+    fn test_skills_to_issues_direct_id_match() {
+        // Can depend on skill directly by ID, not just capability
+        let skill_a = record_with_meta("skill-a", &serde_json::json!({}));
+        let skill_b = record_with_meta(
+            "skill-b",
+            &serde_json::json!({ "requires": ["skill-a"] }),
+        );
+
+        let issues = skills_to_issues(&[skill_a, skill_b]).unwrap();
+        let issue_b = issues.iter().find(|i| i.id == "skill-b").unwrap();
+        assert_eq!(issue_b.dependencies.len(), 1);
+        assert_eq!(issue_b.dependencies[0].id, "skill-a");
+    }
+
+    #[test]
+    fn test_skills_to_issues_extra_fields() {
+        let mut skill = record_with_meta("test", &serde_json::json!({}));
+        skill.version = Some("1.2.3".to_string());
+        skill.quality_score = 0.85;
+
+        let issues = skills_to_issues(&[skill]).unwrap();
+        let extra = &issues[0].extra;
+
+        assert_eq!(extra.get("skill_version").unwrap(), "1.2.3");
+        assert_eq!(extra.get("quality_score").unwrap(), 0.85);
+    }
+
+    #[test]
+    fn test_skills_to_issues_default_version() {
+        let mut skill = record_with_meta("test", &serde_json::json!({}));
+        skill.version = None;
+
+        let issues = skills_to_issues(&[skill]).unwrap();
+        let extra = &issues[0].extra;
+
+        assert_eq!(extra.get("skill_version").unwrap(), "0.1.0");
+    }
+
+    #[test]
+    fn test_skills_to_issues_owner_preserved() {
+        let mut skill = record_with_meta("test", &serde_json::json!({}));
+        skill.author = Some("alice".to_string());
+
+        let issues = skills_to_issues(&[skill]).unwrap();
+        assert_eq!(issues[0].owner, Some("alice".to_string()));
+    }
+
+    #[test]
+    fn test_skills_to_issues_layer_label() {
+        let mut skill = record_with_meta("test", &serde_json::json!({}));
+        skill.source_layer = "global".to_string();
+
+        let issues = skills_to_issues(&[skill]).unwrap();
+        assert!(issues[0].labels.contains(&"layer:global".to_string()));
+    }
+
+    #[test]
+    fn test_skills_to_issues_issue_type() {
+        let skill = record_with_meta("test", &serde_json::json!({}));
+        let issues = skills_to_issues(&[skill]).unwrap();
+        assert_eq!(issues[0].issue_type, IssueType::Task);
+    }
+
+    #[test]
+    fn test_skills_to_issues_dependency_titles() {
+        let skill_a = record_with_meta("skill-a", &serde_json::json!({ "provides": ["cap"] }));
+        let skill_b = record_with_meta("skill-b", &serde_json::json!({ "requires": ["cap"] }));
+
+        let issues = skills_to_issues(&[skill_a, skill_b]).unwrap();
+        let issue_b = issues.iter().find(|i| i.id == "skill-b").unwrap();
+
+        assert_eq!(issue_b.dependencies[0].title, "Skill skill-a");
+    }
+
+    #[test]
+    fn test_skills_to_issues_dependency_status() {
+        let mut skill_a = record_with_meta("skill-a", &serde_json::json!({ "provides": ["cap"] }));
+        skill_a.is_deprecated = true;
+        let skill_b = record_with_meta("skill-b", &serde_json::json!({ "requires": ["cap"] }));
+
+        let issues = skills_to_issues(&[skill_a, skill_b]).unwrap();
+        let issue_b = issues.iter().find(|i| i.id == "skill-b").unwrap();
+
+        assert_eq!(issue_b.dependencies[0].status, Some(IssueStatus::Closed));
+    }
+
+    // =========================================
+    // SkillMeta Tests
+    // =========================================
+
+    #[test]
+    fn test_skill_meta_default() {
+        let meta = SkillMeta::default();
+        assert!(meta.tags.is_empty());
+        assert!(meta.requires.is_empty());
+        assert!(meta.provides.is_empty());
+    }
+
+    #[test]
+    fn test_skill_meta_clone() {
+        let meta = SkillMeta {
+            tags: vec!["a".to_string()],
+            requires: vec!["b".to_string()],
+            provides: vec!["c".to_string()],
+        };
+        let cloned = meta.clone();
+        assert_eq!(cloned.tags, meta.tags);
+        assert_eq!(cloned.requires, meta.requires);
+        assert_eq!(cloned.provides, meta.provides);
+    }
+
+    #[test]
+    fn test_skill_meta_debug() {
+        let meta = SkillMeta::default();
+        let debug_str = format!("{:?}", meta);
+        assert!(debug_str.contains("SkillMeta"));
+    }
 }
