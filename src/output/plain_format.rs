@@ -9,24 +9,27 @@
 //! # Output Formats
 //!
 //! ## Search Results
-//! ```text
-//! # Tab-separated, one result per line
-//! # Format: SCORE<TAB>NAME<TAB>TYPE<TAB>DESCRIPTION
-//! 0.95	my-skill	tool	A helpful tool for...
-//! 0.87	another-skill	template	Template for...
-//! ```
+//!
+//! Tab-separated, one result per line.
+//! Format: `SCORE<TAB>NAME<TAB>TYPE<TAB>DESCRIPTION`
+//!
+//! Example:
+//! - `0.95    my-skill    tool    A helpful tool for...`
+//! - `0.87    another-skill    template    Template for...`
 //!
 //! ## List Results
-//! ```text
-//! # Tab-separated, one skill per line
-//! # Format: NAME<TAB>LAYER<TAB>TAGS<TAB>UPDATED
-//! my-skill	user	cli,rust	2024-01-15
-//! another-skill	project	python,web	2024-01-10
-//! ```
+//!
+//! Tab-separated, one skill per line.
+//! Format: `NAME<TAB>LAYER<TAB>TAGS<TAB>UPDATED`
+//!
+//! Example:
+//! - `my-skill    user    cli,rust    2024-01-15`
+//! - `another-skill    project    python,web    2024-01-10`
 //!
 //! ## Show Output
+//!
+//! YAML-like key-value format:
 //! ```text
-//! # YAML-like key-value format
 //! name: my-skill
 //! type: tool
 //! version: 1.0.0
@@ -39,24 +42,26 @@
 //! ```
 //!
 //! ## Suggestion Output
-//! ```text
-//! # One suggestion per line with score
-//! 0.92	skill-name-1
-//! 0.85	skill-name-2
-//! 0.78	skill-name-3
-//! ```
+//!
+//! One suggestion per line with score (tab-separated):
+//! - `0.92    skill-name-1`
+//! - `0.85    skill-name-2`
 //!
 //! ## Doctor Output
+//!
+//! Status line per check (tab-separated: STATUS, NAME, MESSAGE):
+//! - `OK    database    Database connection healthy`
+//! - `WARN    index    Index may be stale (3 days old)`
+//! - `FAIL    config    Missing required field: api_key`
+//!
+//! Followed by summary:
 //! ```text
-//! # Status line per check
-//! OK	database	Database connection healthy
-//! WARN	index	Index may be stale (3 days old)
-//! FAIL	config	Missing required field: api_key
 //! ---
 //! SUMMARY: 1 OK, 1 WARN, 1 FAIL
 //! ```
 //!
 //! ## Error Format (all commands)
+//!
 //! ```text
 //! ERROR: [error_code] error message
 //!   at: file:line (if applicable)
@@ -64,6 +69,7 @@
 //! ```
 //!
 //! ## Progress Format (all commands)
+//!
 //! ```text
 //! PROGRESS: 50/100 Processing file.md
 //! DONE: Processed 100 files in 2.3s
