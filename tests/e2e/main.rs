@@ -5,6 +5,7 @@ mod cass_workflow;
 mod fixture;
 mod fresh_install;
 mod layer_conflict;
+mod search_workflow;
 mod safety_workflow;
 mod skill_creation;
 mod skill_discovery;

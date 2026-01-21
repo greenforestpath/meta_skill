@@ -324,12 +324,27 @@ pub fn generate_skill_md_for_project(project_root: &Path) -> std::io::Result<std
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn test_skill_md_contains_version() {
         let generator = SkillMdGenerator::new();
         let content = generator.generate();
         assert!(content.contains(env!("CARGO_PKG_VERSION")));
+    }
+
+    #[test]
+    fn test_skill_md_header_title() {
+        let generator = SkillMdGenerator::new();
+        let content = generator.generate();
+        assert!(content.starts_with("# ms — Meta Skill CLI"));
+    }
+
+    #[test]
+    fn test_skill_md_header_description() {
+        let generator = SkillMdGenerator::new();
+        let content = generator.generate();
+        assert!(content.contains("Local-first skill management platform for AI coding agents"));
     }
 
     #[test]
@@ -340,6 +355,22 @@ mod tests {
         assert!(content.contains("load"));
         assert!(content.contains("suggest"));
         assert!(content.contains("lint"));
+    }
+
+    #[test]
+    fn test_skill_md_contains_capabilities_section() {
+        let generator = SkillMdGenerator::new();
+        let content = generator.generate();
+        assert!(content.contains("## Capabilities"));
+        assert!(content.contains("### Core Commands"));
+    }
+
+    #[test]
+    fn test_skill_md_contains_robot_mode_section() {
+        let generator = SkillMdGenerator::new();
+        let content = generator.generate();
+        assert!(content.contains("### Robot Mode"));
+        assert!(content.contains("```bash"));
     }
 
     #[test]
@@ -362,11 +393,84 @@ mod tests {
     }
 
     #[test]
+    fn test_skill_md_robot_mode_examples_include_all() {
+        let generator = SkillMdGenerator::new();
+        let content = generator.generate();
+        for (_, example) in [
+            ("search", "ms search \"query\" -O json"),
+            ("load", "ms load skill-name -O json --level overview"),
+            ("suggest", "ms suggest -O json"),
+            ("list", "ms list -O json"),
+        ] {
+            assert!(content.contains(example));
+        }
+    }
+
+    #[test]
     fn test_skill_md_mcp_section() {
         let generator = SkillMdGenerator::new();
         let content = generator.generate();
         assert!(content.contains("### Available MCP Tools"));
         assert!(content.contains("ms mcp serve"));
+    }
+
+    #[test]
+    fn test_skill_md_mcp_section_examples_present() {
+        let generator = SkillMdGenerator::new();
+        let content = generator.generate();
+        assert!(content.contains("ms mcp serve --tcp-port 8080"));
+    }
+
+    #[test]
+    fn test_skill_md_context_section_present() {
+        let generator = SkillMdGenerator::new();
+        let content = generator.generate();
+        assert!(content.contains("## Context Integration"));
+        assert!(content.contains("Reads `.ms/config.toml`"));
+        assert!(content.contains("Respects `NO_COLOR`"));
+        assert!(content.contains("Auto-detects project type"));
+    }
+
+    #[test]
+    fn test_skill_md_examples_section_present() {
+        let generator = SkillMdGenerator::new();
+        let content = generator.generate();
+        assert!(content.contains("## Examples"));
+    }
+
+    #[test]
+    fn test_skill_md_examples_include_search() {
+        let generator = SkillMdGenerator::new();
+        let content = generator.generate();
+        assert!(content.contains("ms search \"rust error handling\""));
+    }
+
+    #[test]
+    fn test_skill_md_examples_include_load() {
+        let generator = SkillMdGenerator::new();
+        let content = generator.generate();
+        assert!(content.contains("ms load rust-error-patterns --level full"));
+    }
+
+    #[test]
+    fn test_skill_md_examples_include_suggest() {
+        let generator = SkillMdGenerator::new();
+        let content = generator.generate();
+        assert!(content.contains("ms suggest --explain"));
+    }
+
+    #[test]
+    fn test_skill_md_examples_include_lint() {
+        let generator = SkillMdGenerator::new();
+        let content = generator.generate();
+        assert!(content.contains("ms lint SKILL.md"));
+    }
+
+    #[test]
+    fn test_skill_md_examples_include_doctor() {
+        let generator = SkillMdGenerator::new();
+        let content = generator.generate();
+        assert!(content.contains("ms doctor"));
     }
 
     #[test]
@@ -378,11 +482,67 @@ mod tests {
     }
 
     #[test]
+    fn test_mcp_tools_collection_unique_names() {
+        let tools = collect_mcp_tools();
+        let mut names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), tools.len());
+    }
+
+    #[test]
+    fn test_mcp_tools_have_descriptions() {
+        let tools = collect_mcp_tools();
+        assert!(tools.iter().all(|t| !t.description.trim().is_empty()));
+    }
+
+    #[test]
+    fn test_skill_md_includes_all_mcp_tool_lines() {
+        let generator = SkillMdGenerator::new();
+        let content = generator.generate();
+        for tool in collect_mcp_tools() {
+            let line = format!("- `{}` - {}", tool.name, tool.description);
+            assert!(content.contains(&line));
+        }
+    }
+
+    #[test]
     fn test_commands_collection() {
         let commands = collect_command_info();
         assert!(!commands.is_empty());
         assert!(commands.iter().any(|c| c.name == "search"));
         assert!(commands.iter().any(|c| c.name == "setup"));
+    }
+
+    #[test]
+    fn test_commands_collection_unique_names() {
+        let commands = collect_command_info();
+        let mut names: Vec<&str> = commands.iter().map(|c| c.name.as_str()).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), commands.len());
+    }
+
+    #[test]
+    fn test_commands_have_descriptions() {
+        let commands = collect_command_info();
+        assert!(commands.iter().all(|c| !c.description.trim().is_empty()));
+    }
+
+    #[test]
+    fn test_commands_all_robot_mode_true() {
+        let commands = collect_command_info();
+        assert!(commands.iter().all(|c| c.robot_mode));
+    }
+
+    #[test]
+    fn test_skill_md_includes_all_command_lines() {
+        let generator = SkillMdGenerator::new();
+        let content = generator.generate();
+        for cmd in collect_command_info() {
+            let line = format!("- **{}**: {}", cmd.name, cmd.description);
+            assert!(content.contains(&line));
+        }
     }
 
     #[test]
@@ -397,5 +557,32 @@ mod tests {
     fn test_generator_default() {
         let generator = SkillMdGenerator::default();
         assert!(!generator.version().is_empty());
+    }
+
+    #[test]
+    fn test_write_to_file_writes_content() {
+        let generator = SkillMdGenerator::new();
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("SKILL.md");
+        generator.write_to_file(&path).expect("write");
+        let contents = std::fs::read_to_string(&path).expect("read");
+        assert_eq!(contents, generator.generate());
+    }
+
+    #[test]
+    fn test_generate_skill_md_for_project_creates_file() {
+        let dir = tempdir().expect("tempdir");
+        let path = generate_skill_md_for_project(dir.path()).expect("generate");
+        assert_eq!(path, dir.path().join("SKILL.md"));
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn test_generate_skill_md_for_project_content_matches_generator() {
+        let dir = tempdir().expect("tempdir");
+        let path = generate_skill_md_for_project(dir.path()).expect("generate");
+        let contents = std::fs::read_to_string(&path).expect("read");
+        let generator = SkillMdGenerator::new();
+        assert_eq!(contents, generator.generate());
     }
 }

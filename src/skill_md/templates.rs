@@ -69,4 +69,34 @@ mod tests {
     fn test_robot_mode_examples_not_empty() {
         assert!(!ROBOT_MODE_EXAMPLES.is_empty());
     }
+
+    #[test]
+    fn test_header_template_contains_heading() {
+        assert!(HEADER_TEMPLATE.starts_with("# {name}"));
+    }
+
+    #[test]
+    fn test_mcp_section_template_contains_commands() {
+        assert!(MCP_SECTION_TEMPLATE.contains("ms mcp serve"));
+        assert!(MCP_SECTION_TEMPLATE.contains("--tcp-port 8080"));
+    }
+
+    #[test]
+    fn test_context_section_contains_expected_bullets() {
+        assert!(CONTEXT_SECTION.contains("Reads `.ms/config.toml`"));
+        assert!(CONTEXT_SECTION.contains("Respects `NO_COLOR`"));
+        assert!(CONTEXT_SECTION.contains("Auto-detects project type"));
+    }
+
+    #[test]
+    fn test_example_commands_have_text() {
+        assert!(EXAMPLE_COMMANDS.iter().all(|(label, cmd)| !label.is_empty() && !cmd.is_empty()));
+    }
+
+    #[test]
+    fn test_robot_mode_examples_include_json_flag() {
+        assert!(ROBOT_MODE_EXAMPLES
+            .iter()
+            .all(|(_, cmd)| cmd.contains("-O json")));
+    }
 }
