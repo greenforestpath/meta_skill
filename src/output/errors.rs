@@ -140,8 +140,8 @@ impl<'a> ErrorRenderer<'a> {
             OutputMode::Json => {
                 // Include snippet in JSON output
                 let mut json_error = self.build_json_error(&structured);
-                if let serde_json::Value::Object(ref mut obj) = json_error {
-                    if let Some(serde_json::Value::Object(ref mut err)) = obj.get_mut("error") {
+                if let serde_json::Value::Object(obj) = &mut json_error {
+                    if let Some(serde_json::Value::Object(err)) = obj.get_mut("error") {
                         err.insert("snippet".to_string(), serde_json::json!(snippet));
                         err.insert("snippet_language".to_string(), serde_json::json!(language));
                         if let Some(line) = line_number {
@@ -296,8 +296,8 @@ impl<'a> ErrorRenderer<'a> {
         let mut value = serde_json::to_value(&json_error).unwrap_or(serde_json::json!({}));
 
         // Add extra fields from StructuredError
-        if let serde_json::Value::Object(ref mut obj) = value {
-            if let Some(serde_json::Value::Object(ref mut err)) = obj.get_mut("error") {
+        if let serde_json::Value::Object(obj) = &mut value {
+            if let Some(serde_json::Value::Object(err)) = obj.get_mut("error") {
                 err.insert("numeric_code".to_string(), serde_json::json!(error.numeric_code));
                 err.insert("category".to_string(), serde_json::json!(error.category));
                 err.insert("recoverable".to_string(), serde_json::json!(error.recoverable));
