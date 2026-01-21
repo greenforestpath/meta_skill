@@ -37,6 +37,8 @@ pub struct Config {
     pub safety: SafetyConfig,
     #[serde(default)]
     pub auto_load: AutoLoadConfig,
+    #[serde(default)]
+    pub output: OutputConfig,
 }
 
 
@@ -132,6 +134,9 @@ impl Config {
         }
         if let Some(patch) = patch.auto_load {
             self.auto_load.merge(patch);
+        }
+        if let Some(patch) = patch.output {
+            self.output.merge(patch);
         }
     }
 
@@ -923,6 +928,79 @@ impl AutoLoadConfig {
     }
 }
 
+// =============================================================================
+// Output Config
+// =============================================================================
+
+/// Configuration for terminal output styling and behavior.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutputConfig {
+    /// Theme preset name: "default", "minimal", "vibrant", "monochrome", "light", "auto".
+    #[serde(default = "default_theme")]
+    pub theme: String,
+
+    /// Force light mode for dark-on-light terminals.
+    #[serde(default)]
+    pub light_mode: bool,
+
+    /// Force plain output (no colors, no Unicode box drawing).
+    #[serde(default)]
+    pub plain: bool,
+
+    /// Force rich output even when not a terminal.
+    #[serde(default)]
+    pub force_rich: bool,
+
+    /// Disable Unicode characters, use ASCII fallbacks.
+    #[serde(default)]
+    pub no_unicode: bool,
+}
+
+fn default_theme() -> String {
+    "auto".to_string()
+}
+
+impl Default for OutputConfig {
+    fn default() -> Self {
+        Self {
+            theme: default_theme(),
+            light_mode: false,
+            plain: false,
+            force_rich: false,
+            no_unicode: false,
+        }
+    }
+}
+
+impl OutputConfig {
+    fn merge(&mut self, patch: OutputPatch) {
+        if let Some(value) = patch.theme {
+            self.theme = value;
+        }
+        if let Some(value) = patch.light_mode {
+            self.light_mode = value;
+        }
+        if let Some(value) = patch.plain {
+            self.plain = value;
+        }
+        if let Some(value) = patch.force_rich {
+            self.force_rich = value;
+        }
+        if let Some(value) = patch.no_unicode {
+            self.no_unicode = value;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct OutputPatch {
+    pub theme: Option<String>,
+    pub light_mode: Option<bool>,
+    pub plain: Option<bool>,
+    pub force_rich: Option<bool>,
+    pub no_unicode: Option<bool>,
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 struct ConfigPatch {
     pub skill_paths: Option<SkillPathsPatch>,
@@ -939,6 +1017,7 @@ struct ConfigPatch {
     pub security: Option<SecurityPatch>,
     pub safety: Option<SafetyPatch>,
     pub auto_load: Option<AutoLoadPatch>,
+    pub output: Option<OutputPatch>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

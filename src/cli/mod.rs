@@ -29,6 +29,18 @@ pub struct Cli {
     #[arg(long, short = 'O', global = true, value_enum)]
     pub output_format: Option<OutputFormat>,
 
+    /// Force plain output (no colors, no Unicode)
+    #[arg(long, global = true)]
+    pub plain: bool,
+
+    /// Color mode: auto, always, never
+    #[arg(long, global = true, value_name = "WHEN")]
+    pub color: Option<ColorMode>,
+
+    /// Theme preset: auto, default, minimal, vibrant, monochrome, light
+    #[arg(long, global = true)]
+    pub theme: Option<String>,
+
     /// Increase verbosity (-v, -vv, -vvv)
     #[arg(short, long, action = clap::ArgAction::Count, global = true)]
     pub verbose: u8,
@@ -45,11 +57,38 @@ pub struct Cli {
     pub command: Commands,
 }
 
+/// Color output mode
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ColorMode {
+    /// Auto-detect based on terminal
+    Auto,
+    /// Always use colors
+    Always,
+    /// Never use colors
+    Never,
+}
+
 impl Cli {
     /// Get the effective output format, considering --robot flag for backward compatibility
     #[must_use]
     pub fn output_format(&self) -> OutputFormat {
+        // --plain takes precedence
+        if self.plain {
+            return OutputFormat::Plain;
+        }
         OutputFormat::from_args(self.robot, self.output_format)
+    }
+
+    /// Check if plain mode is forced via CLI flags or color mode.
+    #[must_use]
+    pub fn force_plain(&self) -> bool {
+        self.plain || self.color == Some(ColorMode::Never)
+    }
+
+    /// Check if rich mode is forced via CLI flags.
+    #[must_use]
+    pub fn force_rich(&self) -> bool {
+        self.color == Some(ColorMode::Always)
     }
 }
 

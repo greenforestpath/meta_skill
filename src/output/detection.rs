@@ -248,6 +248,30 @@ pub fn should_use_rich_output(output_format: OutputFormat, robot_mode: bool) -> 
     OutputDetector::new(output_format, robot_mode).should_use_rich()
 }
 
+/// Determine if rich output should be used, considering CLI flags.
+///
+/// This is the preferred entry point when you have access to CLI flags.
+#[must_use]
+pub fn should_use_rich_with_flags(
+    output_format: OutputFormat,
+    robot_mode: bool,
+    force_plain: bool,
+    force_rich: bool,
+) -> bool {
+    // CLI --plain or --color=never takes precedence
+    if force_plain {
+        return false;
+    }
+
+    // CLI --color=always forces rich
+    if force_rich {
+        return true;
+    }
+
+    // Fall back to normal detection
+    OutputDetector::new(output_format, robot_mode).should_use_rich()
+}
+
 fn env_flag(key: &str) -> bool {
     std::env::var_os(key).is_some()
 }

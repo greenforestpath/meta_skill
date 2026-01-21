@@ -47,7 +47,7 @@ use tracing::trace;
 use crate::cli::output::OutputFormat;
 use crate::config::Config;
 
-use super::detection::{OutputDecision, OutputDetector};
+use super::detection::{OutputDecision, OutputDetector, OutputEnvironment};
 use super::theme::{detect_terminal_capabilities, BoxStyle, Theme};
 
 // =============================================================================
@@ -181,7 +181,41 @@ impl RichOutput {
     /// - Terminal detection
     #[must_use]
     pub fn new(config: &Config, format: &OutputFormat, robot_mode: bool) -> Self {
-        let detector = OutputDetector::new(*format, robot_mode);
+        Self::with_flags(config, format, robot_mode, false, false)
+    }
+
+    /// Create a new `RichOutput` with explicit CLI flags for forcing modes.
+    ///
+    /// This is the preferred constructor when you have CLI arguments available.
+    ///
+    /// # Arguments
+    /// * `config` - Application config with theme settings
+    /// * `format` - Output format (Human, JSON, Plain, etc.)
+    /// * `robot_mode` - Whether --robot flag is set
+    /// * `force_plain` - Whether --plain or --color=never is set
+    /// * `force_rich` - Whether --color=always is set
+    #[must_use]
+    pub fn with_flags(
+        config: &Config,
+        format: &OutputFormat,
+        robot_mode: bool,
+        force_plain: bool,
+        force_rich: bool,
+    ) -> Self {
+        // CLI --plain or --color=never takes immediate precedence
+        if force_plain {
+            trace!("RichOutput: force_plain flag set, using plain mode");
+            return Self::plain();
+        }
+
+        // Build environment with potential force_rich override
+        let mut env = OutputEnvironment::from_env();
+        if force_rich {
+            trace!("RichOutput: force_rich flag set, overriding environment");
+            env.force_rich = true;
+        }
+
+        let detector = OutputDetector::with_env(*format, robot_mode, env);
         let decision = detector.decide();
 
         trace!(
@@ -189,6 +223,8 @@ impl RichOutput {
             reason = ?decision.reason,
             format = ?format,
             robot = robot_mode,
+            force_plain = force_plain,
+            force_rich = force_rich,
             "RichOutput mode decision"
         );
 

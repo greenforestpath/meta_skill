@@ -320,6 +320,7 @@ pub fn arb_config() -> impl Strategy<Value = Config> {
                     security,
                     safety,
                     auto_load: crate::config::AutoLoadConfig::default(),
+                    output: crate::config::OutputConfig::default(),
                 }
             },
         )
