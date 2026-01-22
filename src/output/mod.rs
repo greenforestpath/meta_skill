@@ -42,6 +42,7 @@ pub mod builders;
 pub mod detection;
 pub mod errors;
 pub mod plain_format;
+pub mod progress;
 pub mod rich_output;
 pub mod theme;
 
@@ -93,3 +94,9 @@ pub use errors::{
 pub mod plain_utils {
     pub use super::plain_format::utils::*;
 }
+
+// Re-export progress types
+pub use progress::{
+    BarStyle, MultiProgress, MultiProgressHandle, ProgressBar, ProgressEvent, ProgressEventType,
+    ProgressGuard, Spinner, SpinnerStyle,
+};
