@@ -628,13 +628,17 @@ impl SyncEngine {
         // Push in batches of 50
         const BATCH_SIZE: usize = 50;
         for chunk in push_items.chunks(BATCH_SIZE) {
-            let items: Vec<_> = chunk.iter().map(|(_, item, ..)| item.clone()).collect();
+            let items: Vec<JfpPushItem> = chunk
+                .iter()
+                .map(|entry: &(String, JfpPushItem, JfpChangeType, Option<i64>, bool)| entry.1.clone())
+                .collect();
             let push_response = match client.push_changes(items, options.dry_run) {
                 Ok(response) => response,
                 Err(err) => {
                     report.errors.push(format!("JFP Cloud push failed: {}", err));
                     if !options.dry_run {
-                        for (skill_id, item, change_type, base_revision_id, _) in chunk {
+                        for entry in chunk {
+                            let (skill_id, item, change_type, base_revision_id, _) = entry;
                             next_pending.push(JfpPendingChange {
                                 skill_id: skill_id.clone(),
                                 change_type: *change_type,
@@ -649,9 +653,8 @@ impl SyncEngine {
             };
 
             // Process results
-            for (result, (skill_id, item, change_type, base_revision_id, _from_queue)) in
-                push_response.results.iter().zip(chunk.iter())
-            {
+            for (result, entry) in push_response.results.iter().zip(chunk.iter()) {
+                let (skill_id, _item, _change_type, _base_revision_id, _from_queue) = entry;
                 match result.status {
                     JfpPushStatus::Applied => {
                         report.pushed.push(skill_id.clone());
