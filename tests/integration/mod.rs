@@ -1,10 +1,11 @@
 mod agent_compat_tests;
 mod agent_detection_tests;
 mod auto_load_tests;
-mod fixture;
+mod bundle_fixture_tests;
 mod cli_tests;
 mod db_state_tests;
 mod error_handling_tests;
+mod fixture;
 mod fixture_tests;
 mod output_format_tests;
 mod security_tests;

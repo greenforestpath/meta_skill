@@ -2,6 +2,33 @@
 //!
 //! Provides a test server that simulates GitHub API responses for bundle
 //! publish/install operations without requiring network access.
+//!
+//! # When to Use This Module
+//!
+//! This module is for testing **GitHub API interactions** (releases, assets,
+//! authentication). For testing **bundle format parsing and installation**,
+//! use the file-based fixtures in `tests/fixtures/bundles/` instead.
+//!
+//! ## Recommended Approach
+//!
+//! | Test Type | Use |
+//! |-----------|-----|
+//! | Bundle parsing/serialization | `tests/integration/bundle_fixture_tests.rs` |
+//! | Bundle installation | File-based fixtures + tempdir |
+//! | GitHub release API | This module (MockRegistryServer) |
+//! | GitHub asset download | This module (MockAsset) |
+//!
+//! ## File-Based Testing (Preferred)
+//!
+//! Most bundle tests should use generated `.msb` fixture files:
+//!
+//! ```ignore
+//! let bytes = std::fs::read("tests/fixtures/bundles/minimal.msb").unwrap();
+//! let package = BundlePackage::from_bytes(&bytes).unwrap();
+//! package.verify().unwrap();
+//! ```
+//!
+//! This approach is faster, more reliable, and doesn't require httpmock.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
