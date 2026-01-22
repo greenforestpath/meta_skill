@@ -12,3 +12,4 @@ mod safety_workflow;
 mod search_workflow;
 mod skill_creation;
 mod skill_discovery;
+mod sync_workflow;
