@@ -75,9 +75,10 @@ impl std::str::FromStr for IssueStatus {
 }
 
 /// Issue type classification.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum IssueType {
+    #[default]
     Task,
     Bug,
     Feature,
@@ -164,6 +165,7 @@ pub struct Issue {
     pub priority: Priority,
 
     /// Issue type classification
+    #[serde(default)]
     pub issue_type: IssueType,
 
     /// Assigned owner (email or username)

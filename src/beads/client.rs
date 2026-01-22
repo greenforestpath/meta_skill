@@ -229,7 +229,8 @@ impl BeadsClient {
     pub fn create(&self, req: &CreateIssueRequest) -> Result<Issue> {
         let mut args = vec!["create".to_string()];
 
-        args.push(format!("--title={}", req.title));
+        // Title is passed as a positional argument, not a flag
+        args.push(req.title.clone());
 
         if let Some(ref desc) = req.description {
             args.push(format!("--description={desc}"));
@@ -243,8 +244,8 @@ impl BeadsClient {
             args.push(format!("--priority={priority}"));
         }
 
-        for label in &req.labels {
-            args.push(format!("--label={label}"));
+        if !req.labels.is_empty() {
+            args.push(format!("--labels={}", req.labels.join(",")));
         }
 
         if let Some(ref parent) = req.parent {

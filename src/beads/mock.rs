@@ -4,7 +4,44 @@
 //! for unit testing code that depends on beads operations without spawning
 //! subprocesses or requiring bd to be installed.
 //!
-//! # Usage
+//! # When to Use This Module
+//!
+//! This module is for testing code that **calls BeadsOperations methods** when
+//! you need fast, isolated unit tests without subprocess spawning. For testing
+//! **actual beads/bd behavior**, use real `BeadsClient` with `BEADS_DB` isolation.
+//!
+//! ## Recommended Approach
+//!
+//! | Test Type | Use |
+//! |-----------|-----|
+//! | Unit tests for code using BeadsOperations | `MockBeadsClient` (this module) |
+//! | Error injection / edge case testing | `MockBeadsClient` with `inject_error()` |
+//! | Real bd command behavior | `BeadsClient` + isolated `BEADS_DB` |
+//! | Concurrent access / WAL safety | `BeadsClient` + isolated `BEADS_DB` |
+//! | Integration tests | `tests/integration/beads_real_tests.rs` |
+//!
+//! ## Real BeadsClient Testing (Preferred for behavior verification)
+//!
+//! Most beads behavior tests should use real `BeadsClient` with database isolation:
+//!
+//! ```ignore
+//! use tempfile::TempDir;
+//! let temp = TempDir::new().unwrap();
+//! let db_path = temp.path().join("test.db");
+//! let client = BeadsClient::new()
+//!     .with_work_dir(temp.path())
+//!     .with_env("BEADS_DB", db_path.to_string_lossy());
+//! // Initialize and test with real bd commands
+//! ```
+//!
+//! This approach tests actual subprocess behavior, WAL safety, and concurrent access.
+//!
+//! ## MockBeadsClient Usage (For unit tests only)
+//!
+//! Use `MockBeadsClient` when you need:
+//! - Fast tests without subprocess overhead
+//! - Controlled error injection
+//! - Tests that don't require `bd` to be installed
 //!
 //! ```rust,ignore
 //! use meta_skill::beads::{MockBeadsClient, BeadsOperations, Issue, IssueStatus};

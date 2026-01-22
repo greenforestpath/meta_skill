@@ -2,6 +2,7 @@ mod agent_compat_tests;
 mod agent_detection_tests;
 mod auto_load_tests;
 mod backup_tests;
+mod beads_real_tests;
 mod bundle_fixture_tests;
 mod cli_tests;
 mod composition_tests;
