@@ -17,9 +17,12 @@ use crate::storage::{Database, GitArchive, TxManager};
 use super::SyncConfig;
 use super::config::{ConflictStrategy, RemoteAuth, RemoteConfig, RemoteType, validate_remote_name};
 use super::jfp::{
-    JfpCloudClient, JfpCloudState, JfpDeviceInfo, JfpPushStatus, JfpSkillPayload,
-    create_push_item, payload_to_skill_spec,
+    JfpChangeType, JfpCloudClient, JfpCloudState, JfpDeviceInfo, JfpPendingChange, JfpPushItem,
+    JfpPushStatus, JfpSkillPayload, create_push_item, payload_to_skill_spec,
 };
+
+/// Type alias for the tuple used in push operations.
+type PushItemTuple = (String, JfpPushItem, JfpChangeType, Option<i64>, bool);
 use super::machine::MachineIdentity;
 use super::ru::{RuClient, RuExitCode, RuSyncOptions};
 use super::state::{SkillSyncState, SkillSyncStatus, SyncState};
@@ -630,7 +633,7 @@ impl SyncEngine {
         for chunk in push_items.chunks(BATCH_SIZE) {
             let items: Vec<JfpPushItem> = chunk
                 .iter()
-                .map(|entry: &(String, JfpPushItem, JfpChangeType, Option<i64>, bool)| entry.1.clone())
+                .map(|(_, item, _, _, _): &PushItemTuple| item.clone())
                 .collect();
             let push_response = match client.push_changes(items, options.dry_run) {
                 Ok(response) => response,
@@ -638,7 +641,7 @@ impl SyncEngine {
                     report.errors.push(format!("JFP Cloud push failed: {}", err));
                     if !options.dry_run {
                         for entry in chunk {
-                            let (skill_id, item, change_type, base_revision_id, _) = entry;
+                            let (skill_id, item, change_type, base_revision_id, _): &PushItemTuple = entry;
                             next_pending.push(JfpPendingChange {
                                 skill_id: skill_id.clone(),
                                 change_type: *change_type,
@@ -654,7 +657,7 @@ impl SyncEngine {
 
             // Process results
             for (result, entry) in push_response.results.iter().zip(chunk.iter()) {
-                let (skill_id, _item, _change_type, _base_revision_id, _from_queue) = entry;
+                let (skill_id, item, change_type, base_revision_id, _from_queue): &PushItemTuple = entry;
                 match result.status {
                     JfpPushStatus::Applied => {
                         report.pushed.push(skill_id.clone());

@@ -6,6 +6,12 @@
 //!
 //! All utilities in this module are compiled only in test mode (`#[cfg(test)]`).
 //!
+//! # Safety Note
+//!
+//! This module uses `env::set_var` and `env::remove_var` which require unsafe in Rust 2024.
+//! These are safe when tests run with `--test-threads=1` to prevent races.
+#![allow(unsafe_code)]
+//!
 //! # Examples
 //!
 //! ## Environment Variable Manipulation

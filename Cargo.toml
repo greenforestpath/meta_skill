@@ -143,7 +143,9 @@ debug = true
 strip = false
 
 [lints.rust]
-unsafe_code = "forbid"
+# Changed from "forbid" to "deny" to allow test modules to use unsafe for
+# env::set_var/remove_var (required by Rust 2024 edition). Tests use #[allow(unsafe_code)].
+unsafe_code = "deny"
 
 [lints.clippy]
 all = "warn"
