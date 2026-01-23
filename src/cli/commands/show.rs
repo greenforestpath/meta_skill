@@ -234,8 +234,69 @@ fn show_json(skill: &SkillRecord, args: &ShowArgs, pretty: bool) -> Result<()> {
     Ok(())
 }
 
+/// Format as plain YAML-like key-value (bd-olwb spec).
+///
+/// Output format:
+/// ```text
+/// name: my-skill
+/// type: tool
+/// version: 1.0.0
+/// description: A helpful tool...
+/// tags: cli, rust
+/// layer: user
+/// created: 2024-01-01
+/// updated: 2024-01-15
+/// ---
+/// [content blocks follow]
+/// ```
 fn show_plain(skill: &SkillRecord) -> Result<()> {
-    println!("{}", skill.id);
+    // Extract tags from metadata
+    let tags = if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&skill.metadata_json) {
+        meta.get("tags")
+            .and_then(|t| t.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    // Extract skill type from metadata
+    let skill_type =
+        if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&skill.metadata_json) {
+            meta.get("type")
+                .and_then(|t| t.as_str())
+                .unwrap_or("skill")
+                .to_string()
+        } else {
+            "skill".to_string()
+        };
+
+    println!("name: {}", skill.name);
+    println!("type: {}", skill_type);
+    println!(
+        "version: {}",
+        skill.version.as_deref().unwrap_or("-")
+    );
+
+    // Description - escape newlines for single-line output
+    let desc = skill.description.replace('\n', " ").replace('\r', "");
+    println!("description: {}", desc);
+
+    println!("tags: {}", tags);
+    println!("layer: {}", skill.source_layer);
+    println!("updated: {}", format_date(&skill.modified_at));
+
+    // Separator before content
+    println!("---");
+
+    // Body content
+    println!("{}", skill.body);
+
     Ok(())
 }
 

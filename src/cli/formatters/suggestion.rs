@@ -317,14 +317,17 @@ impl SuggestionOutput {
         out
     }
 
+    /// Format as plain TSV (bd-olwb spec: SCORE<TAB>SKILL_NAME).
+    ///
+    /// No headers, just data rows for easy parsing.
     fn format_plain(&self) -> String {
         let mut lines = Vec::new();
 
         for s in &self.suggestions {
-            lines.push(s.skill_id.clone());
+            lines.push(format!("{:.2}\t{}", s.confidence, s.name));
         }
         for s in &self.discovery_suggestions {
-            lines.push(s.skill_id.clone());
+            lines.push(format!("{:.2}\t{}", s.confidence, s.name));
         }
 
         lines.join("\n")
@@ -422,13 +425,22 @@ mod tests {
     }
 
     #[test]
-    fn suggestion_output_plain_ids_only() {
+    fn suggestion_output_plain_score_name() {
         let mut output = SuggestionOutput::new();
         output.add_suggestion(test_suggestion());
 
         let formatted = output.format(OutputFormat::Plain);
 
-        assert_eq!(formatted.trim(), "git-commit");
+        // bd-olwb spec: SCORE<TAB>SKILL_NAME
+        assert!(formatted.contains("0.85"));
+        assert!(formatted.contains("Git Commit"));
+        assert!(formatted.contains('\t'));
+
+        // Verify format: "0.85\tGit Commit"
+        let parts: Vec<&str> = formatted.trim().split('\t').collect();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0], "0.85");
+        assert_eq!(parts[1], "Git Commit");
     }
 
     #[test]

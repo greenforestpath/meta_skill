@@ -196,10 +196,24 @@ impl SearchResults {
         out
     }
 
+    /// Format as plain TSV (bd-olwb spec: SCORE<TAB>NAME<TAB>LAYER<TAB>DESCRIPTION).
+    ///
+    /// No headers, just data rows for easy parsing with cut/awk.
     fn format_plain(&self) -> String {
+        use crate::output::plain_utils::{escape_tsv, format_score};
+
         self.results
             .iter()
-            .map(|r| format!("{}: {:.2}", r.skill.id, r.score))
+            .map(|r| {
+                let desc = escape_tsv(&r.skill.description);
+                format!(
+                    "{}\t{}\t{}\t{}",
+                    format_score(r.score),
+                    r.skill.name,
+                    r.skill.source_layer,
+                    desc
+                )
+            })
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -330,8 +344,18 @@ mod tests {
 
         let output = results.format(OutputFormat::Plain);
 
-        assert!(output.contains("skill-1"));
+        // bd-olwb spec: SCORE<TAB>NAME<TAB>LAYER<TAB>DESCRIPTION
         assert!(output.contains("0.95"));
+        assert!(output.contains("Skill skill-1")); // name format from test_skill
+        assert!(output.contains("user")); // layer
+        assert!(output.contains('\t')); // tab-separated
+
+        // Verify no headers (unlike TSV)
+        assert!(!output.starts_with("score\t"));
+
+        // Verify tab-separated structure
+        let fields: Vec<&str> = output.lines().next().unwrap().split('\t').collect();
+        assert_eq!(fields.len(), 4, "Plain format should have 4 fields: score, name, layer, description");
     }
 
     #[test]

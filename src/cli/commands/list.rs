@@ -149,8 +149,33 @@ fn display_list(ctx: &AppContext, skills: &[SkillRecord], args: &ListArgs) -> Re
             Ok(())
         }
         OutputFormat::Plain => {
+            // bd-olwb spec: NAME<TAB>LAYER<TAB>TAGS<TAB>UPDATED (no headers)
             for skill in skills {
-                println!("{}", skill.id);
+                // Extract tags from metadata_json
+                let tags = if let Ok(meta) =
+                    serde_json::from_str::<serde_json::Value>(&skill.metadata_json)
+                {
+                    meta.get("tags")
+                        .and_then(|t| t.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str())
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        })
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                };
+
+                // Format date - just date part
+                let updated = skill
+                    .modified_at
+                    .split('T')
+                    .next()
+                    .unwrap_or(&skill.modified_at);
+
+                println!("{}\t{}\t{}\t{}", skill.name, skill.source_layer, tags, updated);
             }
             Ok(())
         }

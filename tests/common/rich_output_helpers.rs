@@ -1,3 +1,6 @@
+// Allow unsafe code for env::set_var/remove_var which are unsafe in Rust 2024
+#![allow(unsafe_code)]
+
 //! Rich output test helpers for integration tests.
 //!
 //! This module provides standalone utilities for testing rich terminal output
