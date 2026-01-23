@@ -41,8 +41,8 @@
 //! ```
 
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::{Mutex, RwLock};
@@ -53,9 +53,9 @@ use rich_rust::style::Style;
 use serde::Serialize;
 use tracing::trace;
 
+use super::OutputMode;
 use super::detection::is_agent_environment;
 use super::theme::{ProgressStyle, Theme};
-use super::OutputMode;
 
 // ============================================================================
 // Progress Bar Style

@@ -12,8 +12,8 @@ use std::io::{self, Write};
 use std::time::{Duration, Instant};
 
 use crate::app::AppContext;
-use crate::auth::{self, device_code, token_storage, JfpAuthClient, JfpAuthConfig};
-use crate::cli::output::{emit_human, emit_json, HumanLayout, OutputFormat};
+use crate::auth::{self, JfpAuthClient, JfpAuthConfig, device_code, token_storage};
+use crate::cli::output::{HumanLayout, OutputFormat, emit_human, emit_json};
 use crate::error::{MsError, Result};
 
 #[derive(Args, Debug)]
@@ -115,16 +115,12 @@ fn login(ctx: &AppContext, args: &LoginArgs) -> Result<()> {
     println!("  │                                                     │");
     println!("  │   And enter the code:                               │");
     println!("  │                                                     │");
-    println!(
-        "  │        ┌─────────────────────┐                      │"
-    );
+    println!("  │        ┌─────────────────────┐                      │");
     println!(
         "  │        │     {}     │                      │",
         device_code.user_code
     );
-    println!(
-        "  │        └─────────────────────┘                      │"
-    );
+    println!("  │        └─────────────────────┘                      │");
     println!("  │                                                     │");
     println!("  ╰─────────────────────────────────────────────────────╯");
     println!();
@@ -325,8 +321,13 @@ mod tests {
 
     #[test]
     fn parse_auth_login_with_url() {
-        let args =
-            crate::cli::Cli::parse_from(["ms", "auth", "login", "--api-url", "http://localhost:3000"]);
+        let args = crate::cli::Cli::parse_from([
+            "ms",
+            "auth",
+            "login",
+            "--api-url",
+            "http://localhost:3000",
+        ]);
         if let crate::cli::Commands::Auth(auth) = args.command {
             if let AuthCommand::Login(login) = auth.command {
                 assert_eq!(login.api_url, Some("http://localhost:3000".to_string()));

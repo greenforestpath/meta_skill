@@ -29,7 +29,8 @@ static DISALLOWED_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
 static SENSITIVE_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     vec![
         Regex::new("(?i)\\bapi[-_\\s]+key\\b").expect("ACIP: invalid regex for 'api key'"),
-        Regex::new("(?i)\\baccess[-_\\s]+token\\b").expect("ACIP: invalid regex for 'access token'"),
+        Regex::new("(?i)\\baccess[-_\\s]+token\\b")
+            .expect("ACIP: invalid regex for 'access token'"),
         Regex::new("(?i)\\bsecret\\b").expect("ACIP: invalid regex for 'secret'"),
         Regex::new("(?i)\\bpassword\\b").expect("ACIP: invalid regex for 'password'"),
         Regex::new("(?i)\\bprivate[-_\\s]+key\\b").expect("ACIP: invalid regex for 'private key'"),

@@ -184,9 +184,7 @@ impl FallbackRenderer {
                     "{} {} {}",
                     line_char.to_string().repeat(padding),
                     t,
-                    line_char
-                        .to_string()
-                        .repeat(width - padding - t.len() - 2)
+                    line_char.to_string().repeat(width - padding - t.len() - 2)
                 );
             }
             None => {
@@ -246,7 +244,11 @@ impl FallbackRenderer {
 
         // Top border
         if let Some(t) = title {
-            println!("+-- {} {}", t, "-".repeat(width.saturating_sub(t.len() + 5)));
+            println!(
+                "+-- {} {}",
+                t,
+                "-".repeat(width.saturating_sub(t.len() + 5))
+            );
         } else {
             println!("+{}", "-".repeat(width));
         }

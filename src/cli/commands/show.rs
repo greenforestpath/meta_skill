@@ -278,10 +278,7 @@ fn show_plain(skill: &SkillRecord) -> Result<()> {
 
     println!("name: {}", skill.name);
     println!("type: {}", skill_type);
-    println!(
-        "version: {}",
-        skill.version.as_deref().unwrap_or("-")
-    );
+    println!("version: {}", skill.version.as_deref().unwrap_or("-"));
 
     // Description - escape newlines for single-line output
     let desc = skill.description.replace('\n', " ").replace('\r', "");

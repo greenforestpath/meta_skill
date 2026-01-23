@@ -355,7 +355,11 @@ mod tests {
 
         // Verify tab-separated structure
         let fields: Vec<&str> = output.lines().next().unwrap().split('\t').collect();
-        assert_eq!(fields.len(), 4, "Plain format should have 4 fields: score, name, layer, description");
+        assert_eq!(
+            fields.len(),
+            4,
+            "Plain format should have 4 fields: score, name, layer, description"
+        );
     }
 
     #[test]

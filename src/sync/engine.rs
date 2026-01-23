@@ -263,10 +263,8 @@ impl SyncEngine {
         })?;
 
         // Create device info from machine identity
-        let device = JfpDeviceInfo::from_system(
-            &self.machine.machine_id,
-            &self.machine.machine_name,
-        );
+        let device =
+            JfpDeviceInfo::from_system(&self.machine.machine_id, &self.machine.machine_name);
 
         // Create client
         let base_url = if remote.url.is_empty() {
@@ -302,13 +300,7 @@ impl SyncEngine {
 
         // Push changes if allowed
         if allow_push && !options.pull_only {
-            self.jfp_push_changes(
-                &mut client,
-                remote,
-                &mut cloud_state,
-                options,
-                report,
-            )?;
+            self.jfp_push_changes(&mut client, remote, &mut cloud_state, options, report)?;
         }
 
         // Save cloud state
@@ -438,9 +430,10 @@ impl SyncEngine {
                             let mut spec = match payload_to_skill_spec(payload) {
                                 Ok(spec) => spec,
                                 Err(e) => {
-                                    report
-                                        .errors
-                                        .push(format!("Failed to process skill {}: {}", skill_id, e));
+                                    report.errors.push(format!(
+                                        "Failed to process skill {}: {}",
+                                        skill_id, e
+                                    ));
                                     continue;
                                 }
                             };
@@ -587,7 +580,9 @@ impl SyncEngine {
             let spec = match self.git.read_skill(skill_id) {
                 Ok(s) => s,
                 Err(e) => {
-                    report.errors.push(format!("Failed to read skill {}: {}", skill_id, e));
+                    report
+                        .errors
+                        .push(format!("Failed to read skill {}: {}", skill_id, e));
                     continue;
                 }
             };
@@ -619,7 +614,10 @@ impl SyncEngine {
                     false,
                 )),
                 Err(e) => {
-                    report.errors.push(format!("Failed to create push item for {}: {}", skill_id, e));
+                    report.errors.push(format!(
+                        "Failed to create push item for {}: {}",
+                        skill_id, e
+                    ));
                 }
             }
         }
@@ -638,10 +636,13 @@ impl SyncEngine {
             let push_response = match client.push_changes(items, options.dry_run) {
                 Ok(response) => response,
                 Err(err) => {
-                    report.errors.push(format!("JFP Cloud push failed: {}", err));
+                    report
+                        .errors
+                        .push(format!("JFP Cloud push failed: {}", err));
                     if !options.dry_run {
                         for entry in chunk {
-                            let (skill_id, item, change_type, base_revision_id, _): &PushItemTuple = entry;
+                            let (skill_id, item, change_type, base_revision_id, _): &PushItemTuple =
+                                entry;
                             next_pending.push(JfpPendingChange {
                                 skill_id: skill_id.clone(),
                                 change_type: *change_type,
@@ -657,7 +658,8 @@ impl SyncEngine {
 
             // Process results
             for (result, entry) in push_response.results.iter().zip(chunk.iter()) {
-                let (skill_id, item, change_type, base_revision_id, _from_queue): &PushItemTuple = entry;
+                let (skill_id, item, change_type, base_revision_id, _from_queue): &PushItemTuple =
+                    entry;
                 match result.status {
                     JfpPushStatus::Applied => {
                         report.pushed.push(skill_id.clone());
@@ -687,7 +689,9 @@ impl SyncEngine {
                             .remote_hashes
                             .insert(remote.name.clone(), item.content_hash.clone());
                         state_entry.status = SkillSyncStatus::Synced;
-                        self.state.skill_states.insert(skill_id.clone(), state_entry);
+                        self.state
+                            .skill_states
+                            .insert(skill_id.clone(), state_entry);
                     }
                     JfpPushStatus::Skipped => {
                         report.skipped.push(skill_id.clone());
@@ -708,8 +712,10 @@ impl SyncEngine {
                     }
                 }
 
-                if matches!(result.status, JfpPushStatus::Conflict | JfpPushStatus::Rejected)
-                    && !options.dry_run
+                if matches!(
+                    result.status,
+                    JfpPushStatus::Conflict | JfpPushStatus::Rejected
+                ) && !options.dry_run
                 {
                     // Do not requeue conflicts or rejected items.
                     continue;
@@ -774,7 +780,9 @@ impl SyncEngine {
             state_entry.local_modified = self.local_skill_modified_at(skill_id);
         }
         state_entry.status = SkillSyncStatus::Synced;
-        self.state.skill_states.insert(skill_id.clone(), state_entry);
+        self.state
+            .skill_states
+            .insert(skill_id.clone(), state_entry);
 
         Ok(())
     }
@@ -1462,8 +1470,7 @@ fn save_jfp_cloud_state(path: &Path, state: &JfpCloudState) -> Result<()> {
     }
     let json = serde_json::to_string_pretty(state)
         .map_err(|e| MsError::Config(format!("serialize jfp state: {e}")))?;
-    std::fs::write(path, json)
-        .map_err(|e| MsError::Config(format!("write jfp state: {e}")))?;
+    std::fs::write(path, json).map_err(|e| MsError::Config(format!("write jfp state: {e}")))?;
     Ok(())
 }
 

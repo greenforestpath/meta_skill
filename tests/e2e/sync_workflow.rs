@@ -360,7 +360,10 @@ fn test_sync_status_check() -> Result<()> {
 
     println!("[STATUS] Output: {}", output.stdout);
     let json = output.json();
-    println!("[STATUS] JSON: {}", serde_json::to_string_pretty(&json).unwrap_or_default());
+    println!(
+        "[STATUS] JSON: {}",
+        serde_json::to_string_pretty(&json).unwrap_or_default()
+    );
     fixture.checkpoint("post_status");
 
     // Verify status output contains expected fields
@@ -429,7 +432,8 @@ fn test_remote_management() -> Result<()> {
     let list_output = &output.stdout;
     let json_output = output.json();
     assert!(
-        list_output.contains("managed-remote") || json_output.to_string().contains("managed-remote"),
+        list_output.contains("managed-remote")
+            || json_output.to_string().contains("managed-remote"),
         "Remote should appear in list"
     );
     fixture.checkpoint("post_list");

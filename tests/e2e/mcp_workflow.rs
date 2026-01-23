@@ -9,7 +9,7 @@
 
 use super::fixture::E2EFixture;
 use ms::error::Result;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -117,7 +117,11 @@ impl McpClient {
             .current_dir(&fixture.root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(if debug { Stdio::inherit() } else { Stdio::null() });
+            .stderr(if debug {
+                Stdio::inherit()
+            } else {
+                Stdio::null()
+            });
 
         if debug {
             cmd.arg("--debug");
@@ -448,10 +452,7 @@ fn test_mcp_tool_list() -> Result<()> {
     let tools = result["tools"].as_array().expect("Should have tools array");
 
     // Verify expected tools are present
-    let tool_names: Vec<&str> = tools
-        .iter()
-        .filter_map(|t| t["name"].as_str())
-        .collect();
+    let tool_names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
 
     assert!(tool_names.contains(&"search"), "search tool should exist");
     assert!(tool_names.contains(&"load"), "load tool should exist");
@@ -710,7 +711,10 @@ fn test_mcp_doctor_tool() -> Result<()> {
 
     // Doctor output should contain health check info
     assert!(
-        text.contains("health") || text.contains("ok") || text.contains("check") || text.contains("status"),
+        text.contains("health")
+            || text.contains("ok")
+            || text.contains("check")
+            || text.contains("status"),
         "Doctor output should contain health-related information"
     );
 

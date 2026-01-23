@@ -12,10 +12,10 @@
 
 use ms::cli::output::OutputFormat;
 use ms::output::detection::{
-    is_agent_environment, is_ci_environment, is_ide_environment, maybe_print_debug_output,
-    should_use_rich_output, should_use_rich_with_flags, OutputDecision, OutputDecisionReason,
-    OutputDetector, OutputEnvironment, OutputModeReport, AGENT_ENV_VARS, CI_ENV_VARS,
-    IDE_ENV_VARS,
+    AGENT_ENV_VARS, CI_ENV_VARS, IDE_ENV_VARS, OutputDecision, OutputDecisionReason,
+    OutputDetector, OutputEnvironment, OutputModeReport, is_agent_environment, is_ci_environment,
+    is_ide_environment, maybe_print_debug_output, should_use_rich_output,
+    should_use_rich_with_flags,
 };
 
 // =============================================================================
@@ -423,7 +423,7 @@ mod robot_mode {
     fn robot_mode_takes_precedence_over_terminal() {
         let detector = OutputDetector::with_env(
             OutputFormat::Human,
-            true, // robot mode
+            true,                                              // robot mode
             OutputEnvironment::new(false, false, false, true), // terminal = true
         );
         assert!(!detector.should_use_rich());
@@ -433,8 +433,8 @@ mod robot_mode {
     fn robot_mode_takes_precedence_over_force_rich() {
         let detector = OutputDetector::with_env(
             OutputFormat::Human,
-            true,                                              // robot mode
-            OutputEnvironment::new(false, false, true, true),  // force_rich = true
+            true,                                             // robot mode
+            OutputEnvironment::new(false, false, true, true), // force_rich = true
         );
         assert!(!detector.should_use_rich());
         assert_eq!(detector.decide().reason, OutputDecisionReason::RobotMode);
@@ -789,13 +789,25 @@ mod env_var_constants {
         use std::collections::HashSet;
 
         let agent_set: HashSet<_> = AGENT_ENV_VARS.iter().collect();
-        assert_eq!(agent_set.len(), AGENT_ENV_VARS.len(), "AGENT_ENV_VARS has duplicates");
+        assert_eq!(
+            agent_set.len(),
+            AGENT_ENV_VARS.len(),
+            "AGENT_ENV_VARS has duplicates"
+        );
 
         let ci_set: HashSet<_> = CI_ENV_VARS.iter().collect();
-        assert_eq!(ci_set.len(), CI_ENV_VARS.len(), "CI_ENV_VARS has duplicates");
+        assert_eq!(
+            ci_set.len(),
+            CI_ENV_VARS.len(),
+            "CI_ENV_VARS has duplicates"
+        );
 
         let ide_set: HashSet<_> = IDE_ENV_VARS.iter().collect();
-        assert_eq!(ide_set.len(), IDE_ENV_VARS.len(), "IDE_ENV_VARS has duplicates");
+        assert_eq!(
+            ide_set.len(),
+            IDE_ENV_VARS.len(),
+            "IDE_ENV_VARS has duplicates"
+        );
     }
 
     #[test]

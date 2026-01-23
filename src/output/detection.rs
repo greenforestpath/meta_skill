@@ -732,7 +732,10 @@ mod tests {
         let _guard = guard_clear_env();
         let report = OutputModeReport::generate(OutputFormat::Json, false);
         assert!(!report.decision.use_rich);
-        assert_eq!(report.decision.reason, OutputDecisionReason::MachineReadableFormat);
+        assert_eq!(
+            report.decision.reason,
+            OutputDecisionReason::MachineReadableFormat
+        );
         assert_eq!(report.format, "Json");
     }
 
@@ -781,9 +784,7 @@ mod tests {
     #[test]
     fn test_agent_env_takes_priority_over_ci_env() {
         let _lock = ENV_LOCK.lock().unwrap();
-        let _guard = guard_clear_env()
-            .set("CLAUDE_CODE", "1")
-            .set("CI", "true");
+        let _guard = guard_clear_env().set("CLAUDE_CODE", "1").set("CI", "true");
 
         let detector = OutputDetector::new(OutputFormat::Human, false);
         let decision = detector.decide();
@@ -840,11 +841,7 @@ mod tests {
             let detector = OutputDetector::new(OutputFormat::Human, false);
             let decision = detector.decide();
 
-            assert!(
-                !decision.use_rich,
-                "{} should trigger plain output",
-                ci_var
-            );
+            assert!(!decision.use_rich, "{} should trigger plain output", ci_var);
             assert_eq!(
                 decision.reason,
                 OutputDecisionReason::CiEnvironment,

@@ -175,7 +175,10 @@ fn display_list(ctx: &AppContext, skills: &[SkillRecord], args: &ListArgs) -> Re
                     .next()
                     .unwrap_or(&skill.modified_at);
 
-                println!("{}\t{}\t{}\t{}", skill.name, skill.source_layer, tags, updated);
+                println!(
+                    "{}\t{}\t{}\t{}",
+                    skill.name, skill.source_layer, tags, updated
+                );
             }
             Ok(())
         }

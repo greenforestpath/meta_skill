@@ -25,7 +25,12 @@ fn setup_fixture(scenario: &str) -> Result<E2EFixture> {
     fixture.assert_success(&output, "init");
 
     fixture.log_step("Configure skill paths");
-    let output = fixture.run_ms(&["--robot", "config", "skill_paths.project", r#"[\"./skills\"]"#]);
+    let output = fixture.run_ms(&[
+        "--robot",
+        "config",
+        "skill_paths.project",
+        r#"[\"./skills\"]"#,
+    ]);
     fixture.assert_success(&output, "config skill_paths.project");
 
     fixture.log_step("Create sample skill");
@@ -72,7 +77,10 @@ fn test_agent_env_robot_json_is_plain() -> Result<()> {
     let output = fixture.run_ms_with_env(&["--robot", "list"], &[("CLAUDE_CODE", "1")]);
     fixture.assert_success(&output, "list --robot (agent)");
     let json = output.json();
-    assert!(json.get("status").is_some(), "robot output should have status");
+    assert!(
+        json.get("status").is_some(),
+        "robot output should have status"
+    );
     assert_plain_output(&output.stdout, "agent robot list stdout");
 
     Ok(())
@@ -92,7 +100,10 @@ fn test_multiple_agent_envs_robot_json_plain() -> Result<()> {
         let output = fixture.run_ms_with_env(&["--robot", "list"], &[(env_var, "1")]);
         fixture.assert_success(&output, &format!("list --robot {name}"));
         let json = output.json();
-        assert!(json.get("status").is_some(), "robot output should have status");
+        assert!(
+            json.get("status").is_some(),
+            "robot output should have status"
+        );
         assert_plain_output(&output.stdout, &format!("agent {name} robot list stdout"));
     }
 
@@ -107,7 +118,10 @@ fn test_robot_flag_emits_valid_json() -> Result<()> {
     let output = fixture.run_ms(&["--robot", "list"]);
     fixture.assert_success(&output, "list --robot");
     let json = output.json();
-    assert!(json.get("status").is_some(), "robot output should have status");
+    assert!(
+        json.get("status").is_some(),
+        "robot output should have status"
+    );
     assert_plain_output(&output.stdout, "robot mode list stdout");
 
     Ok(())
@@ -121,7 +135,10 @@ fn test_no_color_env_robot_json() -> Result<()> {
     let output = fixture.run_ms_with_env(&["--robot", "list"], &[("NO_COLOR", "1")]);
     fixture.assert_success(&output, "list --robot NO_COLOR");
     let json = output.json();
-    assert!(json.get("status").is_some(), "robot output should have status");
+    assert!(
+        json.get("status").is_some(),
+        "robot output should have status"
+    );
     assert_plain_output(&output.stdout, "NO_COLOR robot list stdout");
 
     Ok(())
@@ -135,7 +152,10 @@ fn test_ci_env_robot_json() -> Result<()> {
     let output = fixture.run_ms_with_env(&["--robot", "list"], &[("CI", "true")]);
     fixture.assert_success(&output, "list --robot CI");
     let json = output.json();
-    assert!(json.get("status").is_some(), "robot output should have status");
+    assert!(
+        json.get("status").is_some(),
+        "robot output should have status"
+    );
     assert_plain_output(&output.stdout, "CI robot list stdout");
 
     Ok(())
@@ -415,7 +435,9 @@ fn test_all_agent_env_vars_robot_json_plain() -> Result<()> {
     let mut fixture = setup_fixture("rich_output_all_agents")?;
 
     for (env_var, name) in agent_vars {
-        fixture.log_step(&format!("List with --robot and agent env {name} ({env_var})"));
+        fixture.log_step(&format!(
+            "List with --robot and agent env {name} ({env_var})"
+        ));
         let output = fixture.run_ms_with_env(&["--robot", "list"], &[(env_var, "1")]);
         fixture.assert_success(&output, &format!("list --robot {name}"));
         let json = output.json();
@@ -605,7 +627,11 @@ fn test_agent_and_ci_combined_plain() -> Result<()> {
     fixture.log_step("List with --robot, agent env, and CI env");
     let output = fixture.run_ms_with_env(
         &["--robot", "list"],
-        &[("CLAUDE_CODE", "1"), ("CI", "true"), ("GITHUB_ACTIONS", "true")],
+        &[
+            ("CLAUDE_CODE", "1"),
+            ("CI", "true"),
+            ("GITHUB_ACTIONS", "true"),
+        ],
     );
     fixture.assert_success(&output, "list --robot agent+ci");
     assert_plain_output(&output.stdout, "agent+ci combined robot list stdout");

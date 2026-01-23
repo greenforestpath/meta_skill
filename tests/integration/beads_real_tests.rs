@@ -237,7 +237,9 @@ fn test_real_beads_list_and_ready() {
     }
 
     // List all
-    let all = client.list(&WorkFilter::default()).expect("List should work");
+    let all = client
+        .list(&WorkFilter::default())
+        .expect("List should work");
     assert!(!all.is_empty(), "Should find some issues");
 
     // Ready should only return open issues
@@ -553,7 +555,10 @@ fn test_real_beads_wal_integrity() {
     let wal_path = db_dir.join("beads.db-wal");
     if wal_path.exists() {
         let wal_size = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
-        assert!(wal_size < 100_000_000, "WAL file should not grow unboundedly");
+        assert!(
+            wal_size < 100_000_000,
+            "WAL file should not grow unboundedly"
+        );
     }
 }
 
@@ -613,7 +618,10 @@ fn test_real_beads_sync_persistence() {
         .list(&WorkFilter::default())
         .expect("Fresh client should be able to list");
 
-    let found = issues.iter().filter(|i| i.title.contains("Sync Test")).count();
+    let found = issues
+        .iter()
+        .filter(|i| i.title.contains("Sync Test"))
+        .count();
     assert!(found > 0, "Should find persisted issues");
 }
 

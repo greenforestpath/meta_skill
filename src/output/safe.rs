@@ -446,11 +446,7 @@ impl SafeRichOutput {
         let fallback = &self.fallback;
         let msg = message.to_string();
 
-        self.render_or_fallback(
-            "info",
-            move || inner.info(&msg),
-            || fallback.info(message),
-        );
+        self.render_or_fallback("info", move || inner.info(&msg), || fallback.info(message));
     }
 
     /// Print a hint message with fallback.
@@ -459,11 +455,7 @@ impl SafeRichOutput {
         let fallback = &self.fallback;
         let msg = message.to_string();
 
-        self.render_or_fallback(
-            "hint",
-            move || inner.hint(&msg),
-            || fallback.hint(message),
-        );
+        self.render_or_fallback("hint", move || inner.hint(&msg), || fallback.hint(message));
     }
 
     // =========================================================================
@@ -726,10 +718,14 @@ impl SafeRichOutput {
     /// Clear the current status line.
     pub fn clear_status(&self) {
         let inner = &self.inner;
-        self.render_or_fallback("clear_status", || inner.clear_status(), || {
-            eprint!("\r{:80}\r", "");
-            let _ = io::stderr().flush();
-        });
+        self.render_or_fallback(
+            "clear_status",
+            || inner.clear_status(),
+            || {
+                eprint!("\r{:80}\r", "");
+                let _ = io::stderr().flush();
+            },
+        );
     }
 }
 

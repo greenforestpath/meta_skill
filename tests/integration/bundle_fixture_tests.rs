@@ -156,10 +156,7 @@ fn generate_invalid_checksum_bytes() -> Vec<u8> {
     let mut bytes = generate_minimal_bundle_bytes();
     // Find and corrupt the checksum in the manifest
     // The checksum is near the end of the manifest section
-    if let Some(pos) = bytes
-        .windows(7)
-        .position(|w| w == b"sha256:")
-    {
+    if let Some(pos) = bytes.windows(7).position(|w| w == b"sha256:") {
         // Corrupt a few bytes of the checksum
         if pos + 10 < bytes.len() {
             bytes[pos + 7] = b'0';
@@ -307,10 +304,7 @@ fn test_bundle_roundtrip() {
     reparsed.verify().unwrap();
 
     // Should be identical
-    assert_eq!(
-        package.manifest.bundle.id,
-        reparsed.manifest.bundle.id
-    );
+    assert_eq!(package.manifest.bundle.id, reparsed.manifest.bundle.id);
     assert_eq!(package.blobs.len(), reparsed.blobs.len());
 }
 
@@ -375,12 +369,8 @@ fn test_install_selective_skills() {
     let package = BundlePackage::from_bytes(&bytes).unwrap();
 
     let install_dir = tempdir().unwrap();
-    let report = ms::bundler::install(
-        &package,
-        install_dir.path(),
-        &["skill-one".to_string()],
-    )
-    .unwrap();
+    let report =
+        ms::bundler::install(&package, install_dir.path(), &["skill-one".to_string()]).unwrap();
 
     assert_eq!(report.installed, vec!["skill-one"]);
     assert_eq!(report.skipped.len(), 2);

@@ -173,7 +173,10 @@ impl<'a> ErrorRenderer<'a> {
     fn render_rich(&self, error: &StructuredError) {
         let title = format!(
             "{} Error [{}]",
-            self.output.theme().icons.get("error", self.output.use_unicode()),
+            self.output
+                .theme()
+                .icons
+                .get("error", self.output.use_unicode()),
             error.code
         );
 
@@ -199,7 +202,10 @@ impl<'a> ErrorRenderer<'a> {
         // Add suggestion
         content.push_str(&format!(
             "\n\n{} {}",
-            self.output.theme().icons.get("hint", self.output.use_unicode()),
+            self.output
+                .theme()
+                .icons
+                .get("hint", self.output.use_unicode()),
             error.suggestion
         ));
 
@@ -235,9 +241,9 @@ impl<'a> ErrorRenderer<'a> {
 
             let content = format!("{}\n\nSuggestion: {}", cause.message, cause.suggestion);
 
-            let panel = Panel::from_text(&content)
-                .title(title)
-                .border_style(Style::new().color(Color::parse("yellow").unwrap_or(Color::default())));
+            let panel = Panel::from_text(&content).title(title).border_style(
+                Style::new().color(Color::parse("yellow").unwrap_or(Color::default())),
+            );
 
             eprintln!("{}", panel.render_plain(self.width.saturating_sub(2)));
         }
@@ -290,17 +296,23 @@ impl<'a> ErrorRenderer<'a> {
     }
 
     fn build_json_error(&self, error: &StructuredError) -> serde_json::Value {
-        let json_error = JsonError::new(error.code.to_string(), &error.message)
-            .with_hint(&error.suggestion);
+        let json_error =
+            JsonError::new(error.code.to_string(), &error.message).with_hint(&error.suggestion);
 
         let mut value = serde_json::to_value(&json_error).unwrap_or(serde_json::json!({}));
 
         // Add extra fields from StructuredError
         if let serde_json::Value::Object(obj) = &mut value {
             if let Some(serde_json::Value::Object(err)) = obj.get_mut("error") {
-                err.insert("numeric_code".to_string(), serde_json::json!(error.numeric_code));
+                err.insert(
+                    "numeric_code".to_string(),
+                    serde_json::json!(error.numeric_code),
+                );
                 err.insert("category".to_string(), serde_json::json!(error.category));
-                err.insert("recoverable".to_string(), serde_json::json!(error.recoverable));
+                err.insert(
+                    "recoverable".to_string(),
+                    serde_json::json!(error.recoverable),
+                );
 
                 if let Some(ref ctx) = error.context {
                     err.insert("context".to_string(), ctx.clone());
@@ -440,14 +452,21 @@ impl<'a> WarningRenderer<'a> {
     // =========================================================================
 
     fn render_rich(&self, message: &str, suggestion: Option<&str>) {
-        let icon = self.output.theme().icons.get("warning", self.output.use_unicode());
+        let icon = self
+            .output
+            .theme()
+            .icons
+            .get("warning", self.output.use_unicode());
         let title = format!("{} Warning", icon);
 
         let content = match suggestion {
             Some(s) => format!(
                 "{}\n\n{} {}",
                 message,
-                self.output.theme().icons.get("hint", self.output.use_unicode()),
+                self.output
+                    .theme()
+                    .icons
+                    .get("hint", self.output.use_unicode()),
                 s
             ),
             None => message.to_string(),
@@ -461,14 +480,21 @@ impl<'a> WarningRenderer<'a> {
     }
 
     fn render_rich_titled(&self, title: &str, message: &str, suggestion: Option<&str>) {
-        let icon = self.output.theme().icons.get("warning", self.output.use_unicode());
+        let icon = self
+            .output
+            .theme()
+            .icons
+            .get("warning", self.output.use_unicode());
         let full_title = format!("{} {}", icon, title);
 
         let content = match suggestion {
             Some(s) => format!(
                 "{}\n\n{} {}",
                 message,
-                self.output.theme().icons.get("hint", self.output.use_unicode()),
+                self.output
+                    .theme()
+                    .icons
+                    .get("hint", self.output.use_unicode()),
                 s
             ),
             None => message.to_string(),
@@ -482,15 +508,17 @@ impl<'a> WarningRenderer<'a> {
     }
 
     fn render_list_rich(&self, warnings: &[WarningItem]) {
-        let icon = self.output.theme().icons.get("warning", self.output.use_unicode());
+        let icon = self
+            .output
+            .theme()
+            .icons
+            .get("warning", self.output.use_unicode());
 
         let items: Vec<String> = warnings
             .iter()
-            .map(|w| {
-                match &w.suggestion {
-                    Some(s) => format!("• {} (hint: {})", w.message, s),
-                    None => format!("• {}", w.message),
-                }
+            .map(|w| match &w.suggestion {
+                Some(s) => format!("• {} (hint: {})", w.message, s),
+                None => format!("• {}", w.message),
             })
             .collect();
 
@@ -705,8 +733,8 @@ pub fn render_warning(output: &RichOutput, message: &str, suggestion: Option<&st
 /// Returns `None` if serialization fails.
 #[must_use]
 pub fn error_to_json(error: &StructuredError) -> Option<String> {
-    let json_error = JsonError::new(error.code.to_string(), &error.message)
-        .with_hint(&error.suggestion);
+    let json_error =
+        JsonError::new(error.code.to_string(), &error.message).with_hint(&error.suggestion);
 
     serde_json::to_string_pretty(&json_error).ok()
 }
@@ -714,8 +742,8 @@ pub fn error_to_json(error: &StructuredError) -> Option<String> {
 /// Format an error as a plain text string.
 #[must_use]
 pub fn error_to_plain(error: &StructuredError) -> String {
-    let plain_error = PlainError::new(error.code.to_string(), &error.message)
-        .with_hint(&error.suggestion);
+    let plain_error =
+        PlainError::new(error.code.to_string(), &error.message).with_hint(&error.suggestion);
     plain_error.format_plain()
 }
 

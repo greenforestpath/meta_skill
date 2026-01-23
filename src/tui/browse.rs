@@ -1013,9 +1013,8 @@ mod tests {
 
     #[test]
     fn test_parse_special_filters_extracts_filters() {
-        let (query, filters) = Filters::parse_special_filters(
-            "layer:base tag:rust tag:cli quality:>0.8 remaining",
-        );
+        let (query, filters) =
+            Filters::parse_special_filters("layer:base tag:rust tag:cli quality:>0.8 remaining");
 
         assert_eq!(query, "remaining");
         assert_eq!(filters.layer.as_deref(), Some("base"));

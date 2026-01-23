@@ -107,7 +107,9 @@ impl EnvGuard {
     /// Configure for NO_COLOR mode (disables all styling).
     #[must_use]
     pub fn no_color(self) -> Self {
-        self.set("NO_COLOR", "1").unset("COLORTERM").unset("MS_FORCE_RICH")
+        self.set("NO_COLOR", "1")
+            .unset("COLORTERM")
+            .unset("MS_FORCE_RICH")
     }
 
     /// Configure for forced rich output.
@@ -251,8 +253,7 @@ pub fn assert_has_ansi(s: &str, context: &str) {
 /// Check if string contains box drawing characters (U+2500-U+257F).
 #[must_use]
 pub fn contains_box_drawing(s: &str) -> bool {
-    s.chars()
-        .any(|c| (0x2500..=0x257F).contains(&(c as u32)))
+    s.chars().any(|c| (0x2500..=0x257F).contains(&(c as u32)))
 }
 
 /// Check if string contains emoji characters.
@@ -397,10 +398,7 @@ impl MsCommandResult {
 
     /// Assert output is robot-friendly (no rich formatting).
     pub fn assert_robot_output(&self) {
-        assert_plain_output(
-            &self.stdout,
-            &format!("robot output of `{}`", self.command),
-        );
+        assert_plain_output(&self.stdout, &format!("robot output of `{}`", self.command));
     }
 }
 
@@ -675,7 +673,8 @@ impl OutputScenario {
                  ANSI codes: {:?}\n\
                  Stripped: {}",
                 self.name,
-                extract_ansi_codes(&result.stdout)[..5.min(extract_ansi_codes(&result.stdout).len())]
+                extract_ansi_codes(&result.stdout)
+                    [..5.min(extract_ansi_codes(&result.stdout).len())]
                     .to_vec(),
                 strip_ansi(&result.stdout[..result.stdout.len().min(300)])
             );
@@ -689,17 +688,12 @@ impl OutputScenario {
 pub fn standard_output_scenarios() -> Vec<OutputScenario> {
     vec![
         // Plain output scenarios
-        OutputScenario::plain("robot_flag", &["--robot", "list"])
-            .with_env(&[]),
-        OutputScenario::plain("no_color_env", &["list"])
-            .with_env(&[("NO_COLOR", "1")]),
-        OutputScenario::plain("plain_output_env", &["list"])
-            .with_env(&[("MS_PLAIN_OUTPUT", "1")]),
-        OutputScenario::plain("json_format", &["--output", "json", "list"])
-            .with_env(&[]),
+        OutputScenario::plain("robot_flag", &["--robot", "list"]).with_env(&[]),
+        OutputScenario::plain("no_color_env", &["list"]).with_env(&[("NO_COLOR", "1")]),
+        OutputScenario::plain("plain_output_env", &["list"]).with_env(&[("MS_PLAIN_OUTPUT", "1")]),
+        OutputScenario::plain("json_format", &["--output", "json", "list"]).with_env(&[]),
         // Rich output scenarios (when terminal is available)
-        OutputScenario::rich("force_rich", &["list"])
-            .with_env(&[("MS_FORCE_RICH", "1")]),
+        OutputScenario::rich("force_rich", &["list"]).with_env(&[("MS_FORCE_RICH", "1")]),
     ]
 }
 

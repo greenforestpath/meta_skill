@@ -228,10 +228,7 @@ impl JfpAuthClient {
             expires_at: chrono::Utc::now().timestamp()
                 + body["expires_in"].as_i64().unwrap_or(86400),
             email: creds.email,
-            tier: body["tier"]
-                .as_str()
-                .unwrap_or(&creds.tier)
-                .to_string(),
+            tier: body["tier"].as_str().unwrap_or(&creds.tier).to_string(),
             user_id: creds.user_id,
         };
 
@@ -243,8 +240,9 @@ impl JfpAuthClient {
 
     /// Get valid credentials, refreshing if necessary.
     pub fn get_valid_credentials(&self) -> Result<JfpCredentials> {
-        let creds = token_storage::load_credentials()?
-            .ok_or_else(|| MsError::AuthError("Not authenticated. Run 'ms auth login' first.".to_string()))?;
+        let creds = token_storage::load_credentials()?.ok_or_else(|| {
+            MsError::AuthError("Not authenticated. Run 'ms auth login' first.".to_string())
+        })?;
 
         if creds.needs_refresh() {
             tracing::debug!("Access token needs refresh");

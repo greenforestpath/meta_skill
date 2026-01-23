@@ -56,7 +56,7 @@ impl ContextModifier {
         const LEARNING_RATE: f64 = 0.05;
 
         let bonus = self.probability_bonus.entry(signal).or_insert(0.0);
-        
+
         match reward {
             crate::suggestions::bandit::Reward::Success => {
                 *bonus += LEARNING_RATE;

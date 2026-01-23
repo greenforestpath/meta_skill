@@ -1126,7 +1126,10 @@ mod tests {
 
         let detail = tui.get_selected_detail();
         assert_eq!(detail.lines.len(), 1);
-        assert_eq!(detail.lines[0].spans[0].content, "Select an item to view details");
+        assert_eq!(
+            detail.lines[0].spans[0].content,
+            "Select an item to view details"
+        );
     }
 
     #[test]

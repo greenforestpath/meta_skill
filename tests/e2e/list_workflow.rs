@@ -261,10 +261,7 @@ fn test_list_all() -> Result<()> {
     assert_eq!(skills.len(), 4, "Skills array should have 4 entries");
 
     // Verify all expected skills are present
-    let skill_ids: Vec<&str> = skills
-        .iter()
-        .filter_map(|s| s["id"].as_str())
-        .collect();
+    let skill_ids: Vec<&str> = skills.iter().filter_map(|s| s["id"].as_str()).collect();
 
     assert!(
         skill_ids.contains(&"rust-error-handling"),
@@ -312,10 +309,7 @@ fn test_list_by_tag() -> Result<()> {
 
     assert_eq!(count, 2, "Should find 2 skills with 'rust' tag");
 
-    let skill_ids: Vec<&str> = skills
-        .iter()
-        .filter_map(|s| s["id"].as_str())
-        .collect();
+    let skill_ids: Vec<&str> = skills.iter().filter_map(|s| s["id"].as_str()).collect();
 
     assert!(skill_ids.contains(&"rust-error-handling"));
     assert!(skill_ids.contains(&"rust-async"));
@@ -365,10 +359,7 @@ fn test_list_by_layer() -> Result<()> {
 
     // Note: The global_skills path may map to "global" or "org" layer
     // depending on how the config path is interpreted
-    assert!(
-        count >= 0,
-        "Should find skills in org/global layer"
-    );
+    assert!(count >= 0, "Should find skills in org/global layer");
 
     fixture.generate_report();
     Ok(())
@@ -385,10 +376,7 @@ fn test_list_sort_name() -> Result<()> {
     let json = output.json();
     let skills = json["skills"].as_array().expect("skills array");
 
-    let names: Vec<&str> = skills
-        .iter()
-        .filter_map(|s| s["name"].as_str())
-        .collect();
+    let names: Vec<&str> = skills.iter().filter_map(|s| s["name"].as_str()).collect();
 
     // Verify names are in alphabetical order
     let mut sorted_names = names.clone();
@@ -475,13 +463,14 @@ fn test_list_pagination() -> Result<()> {
     let json_offset = output.json();
     let skills_offset = json_offset["skills"].as_array().expect("skills array");
 
-    assert_eq!(skills_offset.len(), 5, "Should return 5 skills starting from offset 5");
+    assert_eq!(
+        skills_offset.len(),
+        5,
+        "Should return 5 skills starting from offset 5"
+    );
 
     // Verify no overlap between pages
-    let first_page_ids: Vec<&str> = skills
-        .iter()
-        .filter_map(|s| s["id"].as_str())
-        .collect();
+    let first_page_ids: Vec<&str> = skills.iter().filter_map(|s| s["id"].as_str()).collect();
     let second_page_ids: Vec<&str> = skills_offset
         .iter()
         .filter_map(|s| s["id"].as_str())
@@ -620,10 +609,7 @@ fn test_list_plain_output() -> Result<()> {
     let lines: Vec<&str> = output.stdout.lines().collect();
 
     // Should have output lines (no header in plain mode per bd-olwb spec)
-    assert!(
-        !lines.is_empty(),
-        "Plain output should have lines"
-    );
+    assert!(!lines.is_empty(), "Plain output should have lines");
 
     // Each line should be tab-separated
     for line in &lines {

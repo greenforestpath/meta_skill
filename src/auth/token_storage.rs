@@ -208,9 +208,7 @@ fn clear_from_keychain() -> Result<()> {
     match entry.delete_credential() {
         Ok(()) => Ok(()),
         Err(keyring::Error::NoEntry) => Ok(()), // Already deleted
-        Err(e) => Err(MsError::AuthError(format!(
-            "Failed to clear keychain: {e}"
-        ))),
+        Err(e) => Err(MsError::AuthError(format!("Failed to clear keychain: {e}"))),
     }
 }
 

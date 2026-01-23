@@ -3,10 +3,10 @@
 //! Handles communication with the JeffreysPrompts Premium Cloud API for skill synchronization.
 //! Supports push/pull operations, conflict resolution, tombstones, and idempotency keys.
 
-use std::collections::HashMap;
-use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::time::Duration;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -321,17 +321,16 @@ pub struct JfpCloudClient {
 
 impl JfpCloudClient {
     /// Create a new JFP Cloud client.
-    pub fn new(
-        base_url: Option<&str>,
-        token: &str,
-        device: JfpDeviceInfo,
-    ) -> Result<Self> {
+    pub fn new(base_url: Option<&str>, token: &str, device: JfpDeviceInfo) -> Result<Self> {
         let base_url = base_url.unwrap_or(JFP_DEFAULT_BASE_URL).to_string();
         let http_client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
             .map_err(|e| MsError::Config(format!("HTTP client error: {e}")))?;
-        let request_id = format!("ms-{}", Uuid::new_v4().to_string().split('-').next().unwrap_or("0"));
+        let request_id = format!(
+            "ms-{}",
+            Uuid::new_v4().to_string().split('-').next().unwrap_or("0")
+        );
 
         Ok(Self {
             base_url,
@@ -345,7 +344,10 @@ impl JfpCloudClient {
 
     /// Generate a new request ID.
     fn new_request_id(&mut self) -> String {
-        self.request_id = format!("ms-{}", Uuid::new_v4().to_string().split('-').next().unwrap_or("0"));
+        self.request_id = format!(
+            "ms-{}",
+            Uuid::new_v4().to_string().split('-').next().unwrap_or("0")
+        );
         self.request_id.clone()
     }
 
@@ -390,7 +392,9 @@ impl JfpCloudClient {
         );
 
         let request = JfpPullRequest {
-            cursor: cursor.map(|v| JfpSyncCursor { value: v.to_string() }),
+            cursor: cursor.map(|v| JfpSyncCursor {
+                value: v.to_string(),
+            }),
             limit,
             if_none_match: if_none_match.map(String::from),
         };
@@ -418,7 +422,11 @@ impl JfpCloudClient {
     ) -> Result<JfpPushResponse> {
         let request_id = self.new_request_id();
         let idempotency_key = format!("ms-push-{}", Uuid::new_v4());
-        let client_txn_id = format!("txn-{}-{}", chrono::Utc::now().timestamp_millis(), &idempotency_key[9..17]);
+        let client_txn_id = format!(
+            "txn-{}-{}",
+            chrono::Utc::now().timestamp_millis(),
+            &idempotency_key[9..17]
+        );
 
         info!(
             request_id = %request_id,
@@ -439,8 +447,16 @@ impl JfpCloudClient {
         let push_response: JfpPushResponse = serde_json::from_str(&response)
             .map_err(|e| MsError::Config(format!("Invalid push response: {e}")))?;
 
-        let applied = push_response.results.iter().filter(|r| r.status == JfpPushStatus::Applied).count();
-        let conflicts = push_response.results.iter().filter(|r| r.status == JfpPushStatus::Conflict).count();
+        let applied = push_response
+            .results
+            .iter()
+            .filter(|r| r.status == JfpPushStatus::Applied)
+            .count();
+        let conflicts = push_response
+            .results
+            .iter()
+            .filter(|r| r.status == JfpPushStatus::Conflict)
+            .count();
 
         info!(
             request_id = %request_id,
@@ -486,7 +502,8 @@ impl JfpCloudClient {
     }
 
     fn do_post<T: Serialize>(&self, url: &str, body: &T) -> Result<String> {
-        let response = self.http_client
+        let response = self
+            .http_client
             .post(url)
             .header("Authorization", format!("Bearer {}", self.token))
             .header("Content-Type", "application/json")
@@ -498,24 +515,27 @@ impl JfpCloudClient {
             .map_err(|e| MsError::Config(format!("HTTP request failed: {e}")))?;
 
         let status = response.status();
-        let body = response.text()
+        let body = response
+            .text()
             .map_err(|e| MsError::Config(format!("Failed to read response: {e}")))?;
 
         if status.is_success() {
             Ok(body)
         } else if status.as_u16() == 429 {
             // Rate limited
-            let error: JfpErrorResponse = serde_json::from_str(&body).ok()
-                .unwrap_or(JfpErrorResponse {
-                    error: JfpError {
-                        code: "rate_limited".to_string(),
-                        message: "Rate limited".to_string(),
-                        retry_after_seconds: Some(30),
-                        details: None,
-                    },
-                    request_id: None,
-                    server_time: None,
-                });
+            let error: JfpErrorResponse =
+                serde_json::from_str(&body)
+                    .ok()
+                    .unwrap_or(JfpErrorResponse {
+                        error: JfpError {
+                            code: "rate_limited".to_string(),
+                            message: "Rate limited".to_string(),
+                            retry_after_seconds: Some(30),
+                            details: None,
+                        },
+                        request_id: None,
+                        server_time: None,
+                    });
             Err(MsError::Config(format!(
                 "Rate limited: {} (retry after {} seconds)",
                 error.error.message,

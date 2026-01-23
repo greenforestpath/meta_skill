@@ -518,11 +518,7 @@ fn unicode_icons_spinner_frames_non_empty() {
     );
     // Verify each frame is non-empty
     for (i, frame) in icons.spinner_frames.iter().enumerate() {
-        assert!(
-            !frame.is_empty(),
-            "Spinner frame {} should not be empty",
-            i
-        );
+        assert!(!frame.is_empty(), "Spinner frame {} should not be empty", i);
     }
 }
 
@@ -857,7 +853,10 @@ fn progress_style_from_str_case_insensitive() {
         ProgressStyle::from_str("BLOCK").unwrap(),
         ProgressStyle::Block
     );
-    assert_eq!(ProgressStyle::from_str("Dots").unwrap(), ProgressStyle::Dots);
+    assert_eq!(
+        ProgressStyle::from_str("Dots").unwrap(),
+        ProgressStyle::Dots
+    );
 }
 
 #[test]
@@ -911,9 +910,11 @@ fn theme_with_empty_spinner_frames_fails_validation() {
     let result = theme.validate();
     assert!(result.is_err());
     let errors = result.unwrap_err();
-    assert!(errors
-        .iter()
-        .any(|e| matches!(e, ThemeError::EmptySpinnerFrames)));
+    assert!(
+        errors
+            .iter()
+            .any(|e| matches!(e, ThemeError::EmptySpinnerFrames))
+    );
 }
 
 // ============================================================================
