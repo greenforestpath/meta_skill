@@ -7,6 +7,8 @@ mod common;
 mod fixture;
 mod fresh_install;
 mod layer_conflict;
+mod list_workflow;
+mod mcp_workflow;
 mod rich_output_workflow;
 mod safety_workflow;
 mod search_workflow;

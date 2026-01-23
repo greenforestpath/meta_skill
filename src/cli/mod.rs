@@ -125,6 +125,9 @@ impl Cli {
 /// Available commands
 #[derive(Subcommand, Debug)]
 pub enum Commands {
+    /// Authenticate with JFP Cloud
+    Auth(commands::auth::AuthArgs),
+
     /// Mine and manage anti-patterns from CASS sessions
     Antipatterns(commands::antipatterns::AntiPatternsArgs),
 

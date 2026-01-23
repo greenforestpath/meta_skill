@@ -15,6 +15,7 @@ use crate::error::Result;
 
 pub mod alias;
 pub mod antipatterns;
+pub mod auth;
 pub mod backup;
 pub mod bandit;
 pub mod browse;
@@ -76,6 +77,7 @@ pub mod validate;
 /// Dispatch a command to its handler
 pub fn run(ctx: &AppContext, command: &Commands) -> Result<()> {
     match command {
+        Commands::Auth(args) => auth::run(ctx, args),
         Commands::Antipatterns(args) => antipatterns::run(ctx, args),
         Commands::Init(args) => init::run(ctx, args),
         Commands::Import(args) => import::run(ctx, args),

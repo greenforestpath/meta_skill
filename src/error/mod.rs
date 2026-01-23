@@ -116,6 +116,9 @@ pub enum MsError {
 
     #[error("Import error: {0}")]
     Import(String),
+
+    #[error("Authentication error: {0}")]
+    AuthError(String),
 }
 
 impl MsError {
@@ -152,6 +155,7 @@ impl MsError {
             Self::CyclicInheritance { .. } => ErrorCode::SkillCyclicDependency,
             Self::ParentSkillNotFound { .. } => ErrorCode::SkillParentNotFound,
             Self::Import(_) => ErrorCode::ImportFailed,
+            Self::AuthError(_) => ErrorCode::AuthenticationFailed,
         }
     }
 

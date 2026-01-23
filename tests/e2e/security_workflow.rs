@@ -42,7 +42,7 @@ fn setup_acip_env(fixture: &E2EFixture) -> Vec<(&'static str, String)> {
 }
 
 /// Convert owned env vars to borrowed references for run_ms_with_env.
-fn to_env_refs(env_vars: &[(&str, String)]) -> Vec<(&str, &str)> {
+fn to_env_refs<'a>(env_vars: &'a [(&'a str, String)]) -> Vec<(&'a str, &'a str)> {
     env_vars
         .iter()
         .map(|(k, v)| (*k, v.as_str()))
