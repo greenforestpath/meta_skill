@@ -3,6 +3,8 @@
 > Auto-generated code structure for AI agents
 > **Updated**: 2026-01-23 | **Commit**: [`0024af0`](../../commit/0024af0)
 
+<!-- TODO: likely will be stale. remote vps does not have repoprompt cli. remove by 2/1/2026. local mac agents can use repoprompt cli directly for codemaps -->
+
 ---
 
 ## Core Modules
