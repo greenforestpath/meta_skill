@@ -1,8 +1,14 @@
-# AGENTS.md — General Purpose Tasks on this Machine
+# AGENTS.md — meta_skill
 
-## RULE 0 - THE FUNDAMENTAL OVERRIDE PEROGATIVE
+> **MANDATORY**: Read this file AND `CLAUDE.md` at session start. Re-read after any restart, compaction, or tool crash.
+>
+> **Also read**: `../AGENTS.md` for root CFWOS behavioral rules (meta-improvement obligation, tool guides, rehydration protocol).
 
-If I tell you to do something, even if it goes against what follows below, YOU MUST LISTEN TO ME, I AM IN CHARGE, NOT YOU.
+---
+
+## RULE 0 - HUMAN OVERRIDE
+
+If the user tells you to do something that conflicts with rules below, **the user wins**. They are in charge, not you.
 
 ## RULE 1 – ABSOLUTE (DO NOT EVER VIOLATE THIS)
 
