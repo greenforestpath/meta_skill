@@ -1,8 +1,5 @@
 # ms
 
-<!-- AGENT-VERSION: 2026-01-23 @ 0024af0 -->
-> **Codemap**: 2026-01-23 | **Commit**: [`0024af0`](../../commit/0024af0)
-
 <div align="center">
   <img src="ms_illustration.webp" alt="ms - Meta Skill CLI: A local-first skill management platform">
 </div>
@@ -802,12 +799,6 @@ Created by **Jeffrey Emanuel** to systematize operational knowledge with the sam
 ## License
 
 MIT - see [LICENSE](LICENSE) for details.
-
----
-
-## Codemap
-
-See [CODEMAP.md](CODEMAP.md) for auto-generated code structure (modules, key types, traits).
 
 ---
 
