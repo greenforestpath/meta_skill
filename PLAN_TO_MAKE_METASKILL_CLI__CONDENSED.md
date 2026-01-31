@@ -2012,7 +2012,7 @@ winning version.
 Learn from sessions across multiple projects to build more comprehensive skills and identify coverage gaps.
 
 **CM (cass-memory) Integration:**
-- Integrate `/data/projects/cass_memory_system` as a shared procedural memory layer.
+- Integrate `/data/projects/cfos_cass_memory_system` as a shared procedural memory layer.
 - Unify rule IDs, confidence decay, and anti-pattern promotion across ms and CM.
 - Provide import/export bridges so CM playbooks and ms skills reinforce each other.
 
